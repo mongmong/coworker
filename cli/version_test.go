@@ -11,6 +11,11 @@ func TestVersionSubcommand(t *testing.T) {
 	rootCmd.SetOut(buf)
 	rootCmd.SetErr(buf)
 	rootCmd.SetArgs([]string{"version"})
+	t.Cleanup(func() {
+		rootCmd.SetOut(nil)
+		rootCmd.SetErr(nil)
+		rootCmd.SetArgs(nil)
+	})
 
 	if err := rootCmd.Execute(); err != nil {
 		t.Fatalf("execute version: %v", err)
