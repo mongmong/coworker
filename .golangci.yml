@@ -1,0 +1,40 @@
+# golangci-lint v1 configuration. If using v2, run `golangci-lint migrate`
+# to convert to the new schema.
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  disable-all: true
+  enable:
+    - govet
+    - staticcheck
+    - errcheck
+    - gosec
+    - gocyclo
+    - gofmt
+    - goimports
+    - ineffassign
+    - unused
+    - misspell
+    - revive
+
+linters-settings:
+  gocyclo:
+    min-complexity: 20
+  gosec:
+    exclude-generated: true
+  revive:
+    rules:
+      - name: package-comments
+      - name: exported
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  exclude-rules:
+    # Allow shorter comments on tests.
+    - path: _test\.go
+      linters:
+        - revive
