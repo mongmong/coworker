@@ -25,6 +25,11 @@ func TestCoreDoesNotImportCoding(t *testing.T) {
 		t.Fatalf("go list failed: %v\n%s", err, out)
 	}
 
+	trimmed := strings.TrimSpace(string(out))
+	if trimmed == "" {
+		t.Fatal("go list matched no packages — is the module path correct?")
+	}
+
 	forbidden := modulePath + "/coding"
 	var violations []string
 	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {

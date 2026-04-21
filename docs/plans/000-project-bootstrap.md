@@ -896,7 +896,26 @@ Expected: `nothing to commit, working tree clean` (ignoring any untracked files 
 
 ### Review 1
 
-- **Date**: YYYY-MM-DD
-- **Reviewer**: (tbd)
-- **PR**: (tbd)
-- **Verdict**: (tbd)
+- **Date**: 2026-04-21
+- **Reviewer**: Claude (final implementation review)
+- **PR**: (pre-PR review)
+- **Verdict**: Approved with suggestions
+
+**Should Fix**
+
+1. `[FIXED]` **CI lint job uses `version: latest` for golangci-lint — non-deterministic and risks v1/v2 config breakage.** `.github/workflows/ci.yml:27`.
+   → Response: Pinned to `v1.62.2` to match the locally-verified version.
+
+2. `[WONTFIX]` **Architecture test only checks direct imports, not transitive ones.** `tests/architecture/imports_test.go:21`.
+   → Response: The test uses `./core/...` which expands to ALL packages under `core/`. If `core/util` directly imports `coding/something`, the test catches it because `core/util` appears in the list. The chain `core/worker → core/util → coding/something` requires `core/util`'s direct imports to include `coding/something`, which the test already checks. External packages can't import our internal `coding/` package. Additionally, `{{.Deps}}` returns a flat list including stdlib, making parsing more complex without adding real detection power.
+
+**Nice to Have**
+
+3. `[FIXED]` **Architecture test is silent when `core/...` matches no packages.** `tests/architecture/imports_test.go:19-42`.
+   → Response: Added empty-output guard: if `trimmed == ""`, test fails with "go list matched no packages".
+
+4. `[WONTFIX]` **`version.go`'s `init()` sets `rootCmd.Version = Version` at package init time, not at `Execute()` time.** `cli/version.go:24`.
+   → Response: Acknowledged. This is idiomatic cobra; ldflags sets the var before init(). No code change needed — noted for future test authors.
+
+5. `[WONTFIX]` **`.gitignore` is missing `.coworker/` runtime entries.** `.gitignore`.
+   → Response: Deferred to Plan 113 (`coworker init`), which creates `.coworker/` and will add the gitignore entries as part of its scaffolding.
