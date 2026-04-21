@@ -64,19 +64,51 @@ Level 1 and Level 2 customization ship in V1 (see spec §Workflow customization)
 #### 001 — Spike: Claude Code persistent + MCP pull
 - **Flavor:** Spike
 - **Blocks on:** 000
-- **Purpose:** Verify orchy-style polling, `orch.job.complete` round-trip, tmux wake reliability.
-- **Process:** Throwaway branch; prototype a minimal MCP server + skill; observe behavior; write report as the plan file's post-exec section.
+- **Plan file:** `docs/plans/001-spike-claude-code.md`
+- **Purpose:** Verify orchy-style polling, `orch.job.complete` round-trip, tmux wake reliability, MCP notification support, and compaction resilience.
+- **Process:** Throwaway branch; prototype a minimal MCP server (Go, official SDK) + skill; observe behavior; write report as the plan file's post-exec section.
 - **Decision output:** Does Claude Code support persistent MCP pull reliably? Result feeds `phase-0-verdict` checkpoint.
+- **Tests:**
+  1. MCP server connection + tool discovery (stdio transport)
+  2. Tool round-trip: `orch_next_dispatch` → execute → `orch_job_complete`
+  3. Skill-driven polling loop in persistent session
+  4. tmux send-keys wake-idle reliability (5 trials, varying idle durations)
+  5. MCP server-to-client notifications (push wake)
+  6. Context-window compaction — polling instruction survival
+  7. `claude -p --output-format stream-json` ephemeral baseline
 
 #### 002 — Spike: Codex persistent + MCP pull
 - **Flavor:** Spike
 - **Blocks on:** 000
-- **Purpose:** Same, for Codex. Verify its MCP client behavior and context-window compaction.
+- **Plan file:** `docs/plans/002-spike-codex.md`
+- **Purpose:** Same questions as 001 for Codex. Additionally: verify `codex exec` ephemeral mode with MCP, `--json` event capture, `--output-schema` for structured output, and sandbox interaction with MCP servers.
+- **Process:** Reuses spike 001 MCP server binary. If persistent polling fails, document why and recommend ephemeral-only.
+- **Decision output:** Codex persistent or ephemeral-only? Result feeds `phase-0-verdict` checkpoint.
+- **Tests:**
+  1. MCP server connection + tool discovery
+  2. `codex exec` tool round-trip
+  3. `codex exec --json` JSONL event capture
+  4. Interactive session persistent polling feasibility
+  5. Session resume with MCP tools
+  6. `--output-schema` structured output enforcement
+  7. Sandbox mode interaction with MCP server file I/O
 
 #### 003 — Spike: OpenCode server dispatch
 - **Flavor:** Spike
 - **Blocks on:** 000
-- **Purpose:** Baseline the HTTP-dispatch path via `opencode serve`. Verify server event stream.
+- **Plan file:** `docs/plans/003-spike-opencode.md`
+- **Purpose:** Baseline the HTTP-dispatch path via `opencode serve`. Verify REST API session/message lifecycle, SSE event stream richness, concurrent sessions, Go SDK viability, and `opencode run --format json` as ephemeral alternative.
+- **Process:** Prototype Go client against the server API; test dispatch cycle end-to-end.
+- **Decision output:** Is HTTP dispatch via `opencode serve` viable? Go SDK usable or raw HTTP? Result feeds `phase-0-verdict` checkpoint.
+- **Tests:**
+  1. Server startup + OpenAPI discovery
+  2. Session creation + message sending via REST
+  3. SSE event stream subscription + real-time updates
+  4. Full dispatch cycle: create → send → capture → close
+  5. `opencode run --format json` ephemeral alternative
+  6. MCP client support (hybrid path)
+  7. Server session lifecycle + concurrency
+  8. Go SDK (`github.com/sst/opencode-sdk-go`) viability
 
 ---
 
