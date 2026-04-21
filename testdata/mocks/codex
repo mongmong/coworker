@@ -1,0 +1,11 @@
+#!/bin/bash
+# Mock codex CLI for testing. Reads stdin (the prompt), writes stream-JSON
+# findings to stdout. Simulates the codex ephemeral execution model.
+
+# Read stdin to consume the prompt (required so the pipe doesn't break).
+cat > /dev/null
+
+# Output findings as stream-JSON (one JSON object per line).
+echo '{"type":"finding","path":"main.go","line":42,"severity":"important","body":"Missing error check on Close()"}'
+echo '{"type":"finding","path":"store.go","line":17,"severity":"minor","body":"Consider using prepared statement"}'
+echo '{"type":"done","exit_code":0}'
