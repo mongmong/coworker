@@ -29,7 +29,7 @@ func (s *EventStore) WriteEventThenRow(ctx context.Context, event *core.Event, a
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	// Auto-assign sequence number.
 	var seq int

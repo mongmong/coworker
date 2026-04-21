@@ -14,12 +14,12 @@ import (
 )
 
 var (
-	invokeDiffPath   string
-	invokeSpecPath   string
-	invokeDBPath     string
-	invokeCliBinary  string
-	invokeRoleDir    string
-	invokePromptDir  string
+	invokeDiffPath  string
+	invokeSpecPath  string
+	invokeDBPath    string
+	invokeCliBinary string
+	invokeRoleDir   string
+	invokePromptDir string
 )
 
 var invokeCmd = &cobra.Command{

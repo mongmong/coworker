@@ -102,7 +102,7 @@ func (s *JobStore) UpdateJobState(ctx context.Context, jobID string, newState co
 			setEndedAt = ", ended_at = '" + now.Format("2006-01-02T15:04:05Z") + "'"
 		}
 		_, err := tx.ExecContext(ctx,
-			"UPDATE jobs SET state = ?"+setEndedAt+" WHERE id = ?",
+			"UPDATE jobs SET state = ?"+setEndedAt+" WHERE id = ?", //nolint:gosec // G202: setEndedAt is an internal timestamp, not user input
 			string(newState), jobID,
 		)
 		return err

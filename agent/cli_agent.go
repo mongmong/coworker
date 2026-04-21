@@ -30,7 +30,7 @@ func NewCliAgent(binaryPath string, args ...string) *CliAgent {
 // Dispatch starts a job by executing the CLI binary with the prompt
 // on stdin. Returns a JobHandle to wait for the result.
 func (a *CliAgent) Dispatch(ctx context.Context, job *core.Job, prompt string) (core.JobHandle, error) {
-	cmd := exec.CommandContext(ctx, a.BinaryPath, a.Args...)
+	cmd := exec.CommandContext(ctx, a.BinaryPath, a.Args...) //nolint:gosec // G204: CliAgent is designed to execute external CLI binaries
 	cmd.Stdin = strings.NewReader(prompt)
 
 	stdout, err := cmd.StdoutPipe()

@@ -10,7 +10,7 @@ type Role struct {
 	PromptTemplate string          `yaml:"prompt_template"` // relative path to .md file
 	Inputs         RoleInputs      `yaml:"inputs"`
 	Outputs        RoleOutputs     `yaml:"outputs"`
-	Sandbox        string          `yaml:"sandbox"`         // "read-only" | "workspace-write" | etc.
+	Sandbox        string          `yaml:"sandbox"` // "read-only" | "workspace-write" | etc.
 	Permissions    RolePermissions `yaml:"permissions"`
 	Budget         RoleBudget      `yaml:"budget"`
 	RetryPolicy    RetryPolicy     `yaml:"retry_policy"`

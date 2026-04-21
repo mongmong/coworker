@@ -52,7 +52,7 @@ func TestLoadRole_MissingFile(t *testing.T) {
 
 func TestLoadRole_InvalidYAML(t *testing.T) {
 	dir := t.TempDir()
-	err := os.WriteFile(filepath.Join(dir, "bad_role.yaml"), []byte(":::not yaml"), 0644)
+	err := os.WriteFile(filepath.Join(dir, "bad_role.yaml"), []byte(":::not yaml"), 0600)
 	if err != nil {
 		t.Fatalf("write test file: %v", err)
 	}
@@ -67,7 +67,7 @@ func TestLoadRole_MissingRequiredFields(t *testing.T) {
 	dir := t.TempDir()
 
 	// Role with missing name.
-	err := os.WriteFile(filepath.Join(dir, "empty.yaml"), []byte("cli: codex\n"), 0644)
+	err := os.WriteFile(filepath.Join(dir, "empty.yaml"), []byte("cli: codex\n"), 0600)
 	if err != nil {
 		t.Fatalf("write test file: %v", err)
 	}
@@ -88,7 +88,7 @@ prompt_template: prompts/test.md
 inputs:
   required: [diff_path]
 `
-	err := os.WriteFile(filepath.Join(dir, "test_role.yaml"), []byte(yaml), 0644)
+	err := os.WriteFile(filepath.Join(dir, "test_role.yaml"), []byte(yaml), 0600)
 	if err != nil {
 		t.Fatalf("write test file: %v", err)
 	}
