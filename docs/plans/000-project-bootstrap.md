@@ -854,23 +854,39 @@ Expected: `nothing to commit, working tree clean` (ignoring any untracked files 
 
 ---
 
-## Post-Execution Report (fill in after shipping)
+## Post-Execution Report
 
 **Implementation details**
-- Any deviations from the task list (e.g., Go version pinned higher, cobra major version bump, lint rules adjusted).
-- Any surprises from the toolchain (golangci-lint v1 vs v2 migration, golangci-lint-action compatibility).
+- Go toolchain: 1.23.5 installed; `go.mod` declares `go 1.23.5`.
+- Cobra: v1.10.2 (latest at time of execution).
+- golangci-lint: v1.62.2 installed via `go install`. Config is v1 format; no migration needed.
+- All 7 tasks completed across 10 commits (3 fixup commits: `go mod tidy`, `t.Cleanup`, parallel CI+import-test).
 
 **Deviations from plan**
-- [List here]
+- Task 2 commit message says "Phase 2" instead of plan-specified "Phase 1" — cosmetic, not functional.
+- Task 3 required a follow-up `go mod tidy` commit after spec review caught cobra marked `// indirect`.
+- Task 3 required a follow-up `t.Cleanup` commit after code review caught test state mutation without reset.
+- Task 5 implementer committed config before running lint (golangci-lint not on PATH); lint verified post-hoc after manual install. Lint passed with zero findings.
+- Tasks 6 and 7 dispatched in parallel (independent directories, no file overlap).
 
 **Known limitations**
 - No test coverage gate yet — intentional. Added in a later plan if/when useful.
 - `internal/` and `testdata/` are empty placeholders. First real content lands in Plan 100.
 - CI doesn't run `make lint` inside the test job; lint is its own job. Matches standard Go project practice.
+- `golangci-lint` not on system PATH by default (`~/go/bin/` not in PATH). CI uses the golangci-lint-action which handles its own install.
+- `.github/` directory exists but no remote is configured yet — CI won't run until the repo is pushed to GitHub.
+
+**Verification results (post-implementation)**
+- `go test ./... -count=1 -timeout 60s` — 2 packages PASS, 7 have no test files yet.
+- `make lint` — zero issues.
+- `make build && ./coworker --version` — binary built, version `df31c00` injected from git.
+- Package layout matches the file-structure diagram.
+- Import discipline test verified both allow and detect modes.
 
 **Follow-up work**
 - When Plan 100 adds the first real `core/` package, re-verify the import discipline test still passes.
 - When a second CLI dependency is added (e.g. viper), re-check lint rules for any needed exclusions.
+- Add `~/go/bin` to PATH in shell profile if golangci-lint is needed locally beyond CI.
 
 ---
 
