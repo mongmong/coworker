@@ -110,6 +110,29 @@ plans:
 
 Non-blocking plans execute concurrently, each on its own feature branch (`feature/plan-NNN-<slug>`). Base branch for a non-blocking plan is `main` at plan-start time (matches human git-flow). The `blocks_on` list is the user's declared file-independence; the runtime trusts it but surfaces merge conflicts if they occur.
 
+### Workspace model
+
+The repo root remains the control checkout. Worktrees apply **only to autopilot runs with `max_parallel_plans > 1`** — two plans can't share one checkout because each needs its own branch active simultaneously. Single-plan runs and freeform sessions use the main checkout directly.
+
+The daemon controls workspace selection, not the worker. Ephemeral jobs are spawned with `cwd` set to the worktree. Persistent workers in parallel mode each get their own tmux pane already cd'd to the plan worktree. The supervisor contract rule `dev_commits_on_feature_branch` catches any commit on the wrong branch as an additional safety net.
+
+For each active parallel plan, Coworker creates:
+
+- Branch: `feature/plan-NNN-<slug>`
+- Worktree: `.coworker/worktrees/plan-NNN-<slug>/`
+
+Jobs for that plan run with cwd set to the plan worktree. File artifacts store repo-relative paths plus the worktree identity. The TUI and CLI display both the logical path and active worktree.
+
+**Worktree lifecycle:**
+
+1. At plan start, create branch and worktree from the configured base branch.
+2. All plan jobs run inside that worktree.
+3. At ready-to-ship, the user approves PR creation from the feature branch.
+4. After ship, keep the worktree by default for inspection.
+5. `coworker cleanup` removes shipped or abandoned worktrees after confirmation.
+
+**Conflict detection:** Before starting a plan, the scheduler compares declared `blocks_on` with other active plans. Overlapping file paths produce a warning or checkpoint according to policy. Path reservations in the manifest are optional and deferred to a later version.
+
 ### `freeform` (interactive session, no PRD)
 
 For ad-hoc work: bug fixes, one-off reviews, manual role invocation. No spec, no plan, no structured phases — just direct role dispatches from the user. `coworker session` is the entry point.
@@ -247,11 +270,24 @@ dispatch(job):
   if role.backing == in_process:       # e.g., supervisor.contract (pure rules)
       run directly, no CLI
   elif registry.has_live(job.role):    # user has a live CLI claimed for this role
-      inject job into that session  →  persistent mode
+      enqueue job for a live worker claim
+      worker receives it by calling orch.next_dispatch()
+                                       →  persistent mode
   else:
       spawn per role.cli, with prompt_template rendered from context
                                        →  ephemeral mode
 ```
+
+Persistent dispatch is a lease-based pull protocol:
+
+1. The scheduler enqueues a dispatch for a role.
+2. A registered worker calls `orch.next_dispatch(handle)`.
+3. The daemon grants a lease and emits `job.leased`.
+4. The worker completes with `orch.job.complete(job_id, outputs)`.
+5. The daemon records completion, releases the lease, and emits `job.completed`.
+6. If the worker heartbeat expires before completion, the lease expires and the job is requeued.
+
+Tmux wakeups may send only an empty Enter key to prompt an idle worker turn. Tmux must never carry job content.
 
 The user controls mode by what they launch. Spawn an architect session → architect jobs go there. Kill it → next architect job is ephemeral. No restart required.
 
@@ -278,7 +314,16 @@ Registry table in SQLite tracks live/stale/evicted state. Heartbeat timeout evic
 | **Contract** | Output shape, git invariants, phase-tag presence, branch correctness, contract-declared fields | Deterministic rules | After **every** job |
 | **Quality** | Adherence to TDD, spec self-consistency, review coverage depth, post-exec report substantiveness | LLM judge (Codex) | At **every checkpoint** |
 
-Both default to **veto** enforcement: contract failure blocks and retries with feedback; quality failure with `block`-severity category blocks the checkpoint. Max-retry ceiling (`supervisor_limits.max_retries_per_job = 3`) prevents oscillation — after 3 failed retries, escalate to human regardless of policy.
+**Enforcement posture:** Contract checks are deterministic and always blocking — failure retries with feedback. Quality checks are **advisory by default in V1**. A quality check may block only when it returns one of the configured block-capable categories:
+
+- `missing_required_tests`
+- `spec_contradiction`
+- `security_sensitive_unreviewed_change`
+- `shipper_report_missing`
+
+All other quality findings are recorded in the adherence report and surfaced at checkpoints without stopping the run. Policy can later allow stricter quality blocking once false-positive rates are known.
+
+Max-retry ceiling (`supervisor_limits.max_retries_per_job = 3`) prevents oscillation — after 3 failed retries, escalate to human regardless of policy.
 
 ### Rule catalog (excerpt)
 
@@ -351,6 +396,49 @@ permissions:
 - `on-failure`: blocks only if the prior step failed or converged poorly
 - `auto` / `never`: proceed without pause
 - `compliance-breach` and `quality-gate` cannot be weakened by policy
+
+---
+
+## Security Model
+
+Coworker is a local single-user tool in V1, but it treats agent execution as untrusted automation. The daemon is the policy authority for every action it can observe or mediate.
+
+### Trust boundaries
+
+- The Coworker daemon and SQLite state are trusted local components.
+- Role YAML, prompt templates, and policy files are trusted only after local validation.
+- External CLI agents are semi-trusted workers: they may be useful, but their requested actions are subject to role contracts, permission policy, and supervisor checks.
+- MCP clients are not trusted merely because they can connect. Tool calls must be associated with a registered worker handle or an explicit user-control session.
+- Repository contents, PRDs, issue text, web content, and model output are untrusted input.
+
+### Enforcement points
+
+Coworker enforces permissions at every boundary it controls:
+
+1. **MCP tools:** validate caller handle, role, run, job, and allowed operation.
+2. **Runtime shell wrappers:** for ephemeral jobs, invoke CLIs through a wrapper that records command, environment, cwd, stdout/stderr, and exit status.
+3. **Plugin hooks:** persistent worker plugins must report tool requests and command execution events when the host CLI exposes them.
+4. **Supervisor contract:** after every job, validate declared output contracts and git invariants.
+
+If a CLI performs an action that Coworker cannot observe, Coworker cannot claim enforcement for that action. The adherence report must mark the job as `partially-observed`.
+
+### Permission matching
+
+Permission strings are structured as: `read`, `write`, `edit`, `network`, `bash:<command>`, `mcp:<tool_name>`.
+
+Shell permission matching is command-based, not substring-based. `bash:git` allows the executable `git`; it does not allow `sh -c "git ..."`. Shell wrappers must capture argv as structured data where possible.
+
+### Default-deny behavior
+
+If an action is not explicitly allowed by the role and not permitted by policy, Coworker records an `attention.permission` item and blocks the job until the user approves, denies, or amends policy.
+
+### Hard deny behavior
+
+Actions matching `never` fail immediately and cannot be approved at runtime. Changing a hard deny requires editing role or policy configuration and starting a new job attempt.
+
+### Environment and path handling
+
+Ephemeral jobs receive a minimized environment. Secrets are not passed unless explicitly named in role configuration. Recorded logs redact configured secret names and common token patterns. File writes are limited to the active workspace or plan worktree. Roles with narrower write scopes (e.g. `architect` writing only under `docs/specs/`) are enforced by path allowlists. Network access is denied unless the role declares `network` or a specific network-requiring action and policy permits it.
 
 ---
 
@@ -429,7 +517,13 @@ user issues "resume"
   → run.mode = "autopilot"
 ```
 
-**User hand-edits are first-class jobs.** When the user edits a file directly, a synthetic `human-edit` job is recorded (commit SHA, diff) so it appears in the adherence report and event log alongside agent-authored work.
+**User hand-edits are first-class jobs.** In V1, `human-edit` jobs are recorded from explicit user actions:
+
+1. `coworker edit <artifact>` — opens `$EDITOR`, records the diff on save.
+2. Commits observed through the Coworker-installed post-commit hook.
+3. Manual `coworker record-human-edit --commit <sha>`.
+
+Filesystem watch events may mark a run as dirty, but they do not create durable `human-edit` jobs by themselves. Uncommitted edits are surfaced as `workspace.dirty` attention items. They become auditable only after commit or explicit recording.
 
 ---
 
@@ -704,9 +798,25 @@ workers(handle, role, pid, session_id, cli, registered_at,
 cost_events(id, job_id, provider, model, tokens_in, tokens_out, usd,
             created_at)
 
--- SSE event log (source of truth for replay)
-events(id, ts, run_id, kind, payload JSON)
+-- SSE event log (authoritative history of a run)
+events(id, run_id, sequence, kind, schema_version,
+       idempotency_key, causation_id, correlation_id,
+       payload JSON, created_at)
 ```
+
+### Event log semantics
+
+The `events` table is the authoritative history of a run. Other tables (`jobs`, `findings`, `checkpoints`, etc.) are projections or indexed convenience state unless explicitly documented otherwise.
+
+- **`sequence`**: monotonic per run — defines strict ordering within a run.
+- **`schema_version`**: event payloads are versioned. Migrations may add projection columns, but old events remain readable. If an event kind changes shape, add a new schema version and decoder.
+- **`idempotency_key`**: external commands that may be retried must provide an idempotency key. Repeating a command with the same key returns the original result or no-ops safely.
+- **`causation_id`**: the command or event that caused this event.
+- **`correlation_id`**: run/job/checkpoint grouping for query convenience.
+
+**Write discipline:** State transitions write the event first, then update projections in the same transaction whenever possible. If a crash occurs between event append and projection update, replay repairs the projection.
+
+**Replay:** Rebuilds projection tables from events for one run or all runs. If existing projection state disagrees with replayed state, replay wins and emits `projection.repaired`.
 
 ### Integrity rules
 
@@ -775,6 +885,36 @@ Specifically verify (both Claude Code and Codex):
 - MCP notification support for turn-wake (push-initiated new turns). If supported → cleaner than tmux-based wake nudges.
 - Context-window compaction behavior across long-running sessions
 - Reliability of `orch.job.complete()` being called — supervisor contract rule enforces it, but the primary path must not depend on scraping
+
+---
+
+## Fan-In Aggregation
+
+When a stage dispatches multiple jobs (e.g., `many` reviewers in parallel), outputs are aggregated according to output type:
+
+- **Findings:** merged by fingerprint; duplicates preserve all source job IDs.
+- **Test results:** aggregated by command and status; any failing required test fails the stage.
+- **Artifacts:** must not write the same artifact path unless the stage declares an artifact merge strategy.
+- **Notes:** appended chronologically and attributed to source job.
+- **Costs:** summed by role, job, stage, plan, and run.
+
+Reviewer disagreement is not discarded. Dedupe removes duplicate findings but keeps conflicting severity or recommendation metadata for human review.
+
+---
+
+## Configuration Layering
+
+Configuration loads in this order, with later layers overriding earlier layers:
+
+1. Built-in defaults (compiled into the daemon).
+2. Global user config (`~/.config/coworker/config.yaml`).
+3. Repository `.coworker/config.yaml`.
+4. Repository `.coworker/policy.yaml`.
+5. Role YAML files (`.coworker/roles/*.yaml`).
+6. Run manifest overrides (per-plan fields in the plan manifest).
+7. CLI flags.
+
+The daemon validates the fully merged config before starting a run. `coworker config inspect` prints the effective config with source annotations for each field.
 
 ---
 

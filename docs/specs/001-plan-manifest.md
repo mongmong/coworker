@@ -87,15 +87,16 @@ Level 1 and Level 2 customization ship in V1 (see spec §Workflow customization)
 - **Blocks on:** 000
 - **Purpose:** Minimum viable product. `coworker invoke reviewer.arch --diff <path> --spec <path>` spawns ephemeral Codex, captures findings JSON, persists via event-log-before-state. Load-bearing invariants introduced here.
 - **Phases:**
-  1. SQLite schema (minimum viable): `runs`, `jobs`, `events`, `findings`, `artifacts`, `schema_migrations`. `store/` package with migration runner.
-  2. Event-first write helper (`store.WriteEventThenRow`) + crash-injection test (kill between event + row; replay reconciles).
-  3. Role loader: YAML schema (Go struct + validator tags), prompt template resolution, ship one role (`reviewer.arch.yaml` + `prompts/reviewer.arch.md`).
-  4. `Agent` protocol in `core/agent/` + `CliAgent` in `agent/` (Codex only for now; `os/exec`, stdout pipe, `json.Decoder` streaming).
-  5. Ephemeral dispatch path: context snapshot assembly → prompt render → `agent.Dispatch` → findings capture → persist.
-  6. Findings fingerprint + immutability (schema constraint — only `resolved_by_job_id` / `resolved_at` mutable; enforced by store layer, tested).
-  7. `coworker invoke` cobra command.
-  8. Tests: unit + Layer 2 mock-CLI harness (shell-script mock under `testdata/mocks/codex`).
-- **Load-bearing invariants introduced:** event-before-state, findings immutable, file artifacts as pointers.
+  1. SQLite schema (minimum viable): `runs`, `jobs`, `events` (with `sequence`, `idempotency_key`, `causation_id`, `correlation_id`, `schema_version` per §Event Log Semantics), `findings`, `artifacts`, `schema_migrations`. `store/` package with migration runner.
+  2. Event-first write helper (`store.WriteEventThenRow`) + crash-injection test (kill between event + row; replay reconciles). Idempotency key support.
+  3. Role loader: YAML schema (Go struct + validator tags), prompt template resolution, permission parsing (§Security Model), ship one role (`reviewer.arch.yaml` + `prompts/reviewer.arch.md`).
+  4. `Agent` protocol in `core/agent/` + `CliAgent` in `agent/` (Codex only for now; `os/exec`, stdout pipe, `json.Decoder` streaming). Ephemeral shell wrapper records command, env, cwd, stdout/stderr, exit status.
+  5. Minimal security primitives: path validation against role write scope, permission matching (command-based), `partially-observed` audit event shape.
+  6. Ephemeral dispatch path: context snapshot assembly → prompt render → `agent.Dispatch` → findings capture → persist.
+  7. Findings fingerprint + immutability (schema constraint — only `resolved_by_job_id` / `resolved_at` mutable; enforced by store layer, tested).
+  8. `coworker invoke` cobra command.
+  9. Tests: unit + Layer 2 mock-CLI harness (shell-script mock under `testdata/mocks/codex`).
+- **Load-bearing invariants introduced:** event-before-state, findings immutable, file artifacts as pointers, event idempotency.
 
 #### 101 — Supervisor contract
 - **Flavor:** Runtime
@@ -130,11 +131,11 @@ Level 1 and Level 2 customization ship in V1 (see spec §Workflow customization)
 - **Blocks on:** 101, 102
 - **Purpose:** Unstructured interactive mode. Attention queue unifying 4 kinds. Policy loader. `human-edit` synthetic jobs.
 - **Phases:**
-  1. `policy.yaml` loader + schema (checkpoints, concurrency bounds, supervisor limits, workflow_overrides — overrides used only after 106).
+  1. `policy.yaml` loader + schema with source tracking (per §Configuration Layering: built-in → global → repo config → policy → role → manifest → CLI flags). `coworker config inspect` command.
   2. `attention` table + API; 4 kinds (permission, subprocess, question, checkpoint). Presented-on / answered-on channel fields.
   3. `Workflow` protocol + `FreeformWorkflow` (minimal: dispatch a role with synthesized run/plan/phase context from CLI args).
   4. Run envelope for session-less work: `coworker session` creates a run ID; subsequent invocations in the same session attach via env var or lock file.
-  5. `human-edit` synthetic jobs via post-commit git hook (shipped with `coworker init` later) + optional fs-watch fallback (`fsnotify`).
+  5. `human-edit` synthetic jobs — commit-based only in V1: post-commit git hook + `coworker edit <artifact>` + manual `coworker record-human-edit --commit <sha>`. No fs-watch for correctness. `workspace.dirty` attention items for uncommitted changes.
   6. `coworker session` + `coworker advance` / `coworker rollback` cobra commands.
   7. Tests (session lifecycle, attention queue flows, synthetic human-edit recording).
 
@@ -146,7 +147,7 @@ Level 1 and Level 2 customization ship in V1 (see spec §Workflow customization)
   1. MCP SDK decision: official Go SDK vs `mark3labs/mcp-go` (based on spike findings). Server skeleton bound to daemon unix socket.
   2. `orch.run.*` tools (status, inspect).
   3. `orch.role.invoke(role, …)` — synchronous dispatch or job handle.
-  4. `orch.next_dispatch()` + `orch.job.complete(job_id, outputs)` — pull model.
+  4. `orch.next_dispatch()` + `orch.job.complete(job_id, outputs)` — lease-based pull protocol (enqueue → pull → lease → complete → release; heartbeat expiry → requeue).
   5. `orch.ask_user(question, options?)` + attention integration.
   6. `orch.attention.*`, `orch.findings.*`, `orch.artifact.read/write`.
   7. Degraded-mode implementation: if spike verdict shrank scope for a CLI, that CLI stays ephemeral-only.
@@ -194,24 +195,44 @@ Level 1 and Level 2 customization ship in V1 (see spec §Workflow customization)
   5. Attention-queue panel with answer affordance.
   6. Snapshot tests (Bubble Tea `teatest` golden-output).
 
-#### 106 — `build-from-prd` workflow
+#### 106 — `build-from-prd` manifest and DAG scheduler
 - **Flavor:** Runtime
 - **Blocks on:** 101, 102
-- **Parallel-safe with:** 103, 104, 105, 107
-- **Purpose:** The PRD-driven autopilot. Architect → plan manifest → DAG scheduler → per-plan tracks → phase loop → shipper.
+- **Parallel-safe with:** 103, 104, 105, 107, 114
+- **Purpose:** First autopilot milestone — scheduling and workspaces, not full phase execution yet.
 - **Phases:**
   1. Plan manifest schema (Go struct) + loader + validator. Matches the shape of *this very document*.
   2. `architect` role YAML + prompt (produces spec + manifest).
   3. `planner` role YAML + prompt (elaborates skeletons).
   4. DAG scheduler (ready plans → parallel tracks, `max_parallel_plans` bound).
-  5. Per-plan feature-branch management (branch at plan-start, non-blocking rebase policy from `policy.yaml`).
-  6. Phase loop: `developer` → `[reviewer.arch ∥ reviewer.frontend ∥ tester]` → dedupe.
-  7. Fan-in finding dedupe by fingerprint.
-  8. Fix-loop with `max_fix_cycles_per_phase` + `phase-clean` checkpoint.
-  9. `shipper` role + `gh pr create --title ... --body ...` invocation.
-  10. `ready-to-ship` checkpoint gating PR creation.
-  11. **Level 1 customization:** named-stage registry + `workflow_overrides` loader.
-  12. Tests.
+  5. Worktree creation per plan (when `max_parallel_plans > 1`).
+  6. Per-plan feature-branch management (branch at plan-start, non-blocking rebase policy from `policy.yaml`).
+  7. Tests (manifest validation, scheduling, worktree lifecycle).
+
+#### 114 — Phase loop and fan-in
+- **Flavor:** Runtime
+- **Blocks on:** 106
+- **Parallel-safe with:** 107, 109, 110
+- **Purpose:** Execute phases within a plan: developer → reviewers/tester → dedupe → fix-loop.
+- **Phases:**
+  1. Phase loop: `developer` → `[reviewer.arch ∥ reviewer.frontend ∥ tester]` → dedupe.
+  2. Fan-in finding dedupe by fingerprint (preserving source metadata per §Fan-In Aggregation).
+  3. Fan-in aggregation for test results, artifacts, notes, costs.
+  4. Fix-loop with `max_fix_cycles_per_phase` + `phase-clean` checkpoint.
+  5. Event snapshot tests for phase execution ordering.
+
+#### 115 — Shipper and workflow customization
+- **Flavor:** Runtime
+- **Blocks on:** 114
+- **Parallel-safe with:** 107
+- **Purpose:** Complete the autopilot path: PR creation + stage customization.
+- **Phases:**
+  1. `shipper` role YAML + prompt.
+  2. `ready-to-ship` checkpoint gating PR creation.
+  3. `gh pr create --title ... --body ...` integration.
+  4. **Level 1 customization:** named-stage registry + `workflow_overrides` loader.
+  5. End-to-end `build-from-prd` smoke test (manifest → schedule → phase → ship).
+  6. Tests.
 
 #### 109 — Codex plugin (worker-only)
 - **Flavor:** Plugin
@@ -251,16 +272,17 @@ Level 1 and Level 2 customization ship in V1 (see spec §Workflow customization)
   6. **Level 2 customization:** `applies_when` predicate DSL + evaluator + `job.skipped` event.
   7. Cross-role integration tests.
 
-#### 112 — Supervisor quality
+#### 112 — Supervisor quality (advisory-first)
 - **Flavor:** Runtime
 - **Blocks on:** 111
-- **Purpose:** LLM judge for checkpoint-time quality adherence.
+- **Purpose:** LLM judge for checkpoint-time quality adherence. Advisory by default; block-capable for a small allowlist of categories.
 - **Phases:**
   1. Quality-rule schema + loader.
   2. LLM judge via Codex (ephemeral) invocation + structured verdict parsing.
-  3. Checkpoint-time hook (runs at every `block` / `on-failure` checkpoint).
-  4. Escalation path (max-retry → `quality-gate` checkpoint).
-  5. Tests.
+  3. Advisory vs block-capable category routing (`missing_required_tests`, `spec_contradiction`, `security_sensitive_unreviewed_change`, `shipper_report_missing`).
+  4. Checkpoint-time hook (runs at every `block` / `on-failure` checkpoint).
+  5. Escalation path (max-retry → `quality-gate` checkpoint).
+  6. Tests.
 
 #### 113 — `coworker init`
 - **Flavor:** Runtime
@@ -277,15 +299,17 @@ Level 1 and Level 2 customization ship in V1 (see spec §Workflow customization)
 
 ## Critical path
 
-`000 → 100 → 101 → 103 → 104 → 105 → 108 → 111 → 112 → 113` — 10 plans sequential. Everything else parallelizes off it.
+`000 → 100 → 101 → 103 → 104 → 105 → 108 → 111 → 112 → 113` — 10 plans sequential on the interactive-dogfood path. The autopilot path adds `106 → 114 → 115` which runs in parallel.
 
 Parallel branches off the critical path:
 - `102` after `100`, alongside `101`
-- `106` after `101 & 102`, alongside `103 → 104 → 105 → 108`
+- `106 → 114 → 115` after `101 & 102`, alongside `103 → 104 → 105 → 108`
 - `107` after `102`, alongside everything through `110`
 - `109, 110` after `104 & 105`, alongside `108`
 
-Expected real-world pace with a single developer working sequentially: the plan count is ~17, but many phases are small (the spikes are <1 day each). The critical path is ~10 plans deep; with parallel tracks a team could shave 3–4 plans of wall time.
+**Total plan count:** 19 (was 17 before splitting 106 into 106/114/115).
+
+Expected real-world pace with a single developer working sequentially: the plan count is ~19, but many phases are small (the spikes are <1 day each). The critical path is ~10 plans deep; with parallel tracks a team could shave 3–4 plans of wall time.
 
 ## Testing discipline
 
@@ -304,10 +328,12 @@ Expected real-world pace with a single developer working sequentially: the plan 
 | Invariant | First enforced in | Enforcement mechanism |
 |---|---|---|
 | Event-log before state update | 100 | crash-injection test (kill between event-write and row-update; replay reconciles) |
+| Event idempotency | 100 | idempotency key on external commands; repeated key = no-op |
 | File artifacts are pointers | 100 | schema constraint + lint rule on `artifacts.path` |
 | Findings immutable | 100 | store-layer allow-list on UPDATE; unit test |
+| Security: default-deny permissions | 100 | permission matching + attention.permission on undeclared |
 | No silent state advance | 101 | supervisor contract rules + retry ceiling |
-| Pull model for dispatch | 104 | supervisor rule forbidding `send-keys` of message content |
+| Pull model for dispatch | 104 | lease-based protocol; supervisor rule forbids `send-keys` of message content |
 
 ## Checkpoint policy
 
@@ -330,12 +356,22 @@ Cross-plan gate:
 - Workflow Level 3 customization (user-defined workflow classes in Go).
 - Replay-recording tooling beyond manual transcript capture.
 - Slack/Discord notification integrations.
+- Path reservations in the plan manifest schema (defer until parallel conflicts appear in dogfood).
+- Filesystem-watch-based human-edit recording (V1 is commit-based only).
 
-## Spec amendments already applied
+## Spec amendments applied
 
 - §Non-Goals — "Workflow topology is code (Go)" clarified; stage contents noted as configurable.
 - §V1 Scope — daemon language specified: Go + `modernc.org/sqlite` + Bubble Tea + cobra.
 - §Workflow State Machine — added §Workflow customization subsection with Level 1/2 mechanisms.
+- §Workflow State Machine — added §Workspace model (worktrees for parallel plans, daemon-controlled cwd).
+- §Lifecycle — replaced "inject job into that session" with lease-based pull protocol.
+- §Security Model — new section (trust boundaries, enforcement points, permission matching, default-deny, hard deny, environment/path/network handling).
+- §Data Model — expanded `events` table with `sequence`, `idempotency_key`, `causation_id`, `correlation_id`, `schema_version`. Added §Event Log Semantics.
+- §Modes — human-edit recording narrowed to commit-based only in V1.
+- §Supervisor — quality checks advisory by default; block-capable allowlist for 4 categories.
+- §Fan-In Aggregation — new section (findings by fingerprint, tests by status, artifacts by path, notes chronological, costs summed).
+- §Configuration Layering — new section (7-level precedence, `coworker config inspect`).
 - (queued) §Role definition format — `applies_when` field to be added when Plan 111 ships.
 
 ## How this manifest is maintained
