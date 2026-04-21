@@ -25,7 +25,7 @@ This spec defines that runtime: the **coworker** daemon.
 - **Not a team-shared service in V1.** Single-user dev tool, local daemon, one user's repos. Multi-tenancy, auth, cloud deployment are deferred.
 - **Not a replacement for PR-based review.** Coworker is the inner loop; GitHub PRs remain the outer loop for durable history and human review.
 - **Not a new coding agent.** It orchestrates the three existing ones; it does not embed an LLM of its own (except rules-based checks and optional LLM quality audits via existing CLIs).
-- **Not a general workflow engine.** Workflows are code (Python), not YAML; the runtime is narrow (coding workflows with spec→plan→phase structure), not a Temporal-competitor.
+- **Not a general workflow engine.** Workflow topology is code (Go), not YAML; stage *contents* are configurable (see §Workflow customization) but the state-machine structure is fixed per workflow. The runtime is narrow (coding workflows with spec→plan→phase structure), not a Temporal-competitor.
 
 ---
 
@@ -113,6 +113,57 @@ Non-blocking plans execute concurrently, each on its own feature branch (`featur
 ### `freeform` (interactive session, no PRD)
 
 For ad-hoc work: bug fixes, one-off reviews, manual role invocation. No spec, no plan, no structured phases — just direct role dispatches from the user. `coworker session` is the entry point.
+
+### Workflow customization
+
+**Workflow topology is code; stage contents are config.** The state-machine structure — ordered stages, transitions, fan-in/fan-out — is Go code. What each stage *contains* — which roles fire, under what conditions — is configuration.
+
+Two levels of configurability:
+
+**Level 1 — configurable role list per stage.**
+
+Each workflow declares named stages (`phase-dev`, `phase-review`, `phase-test`, `phase-ship`, etc.). `policy.yaml` can override the role list for any named stage:
+
+```yaml
+# .coworker/policy.yaml
+workflow_overrides:
+  build-from-prd:
+    stages:
+      phase-review: [reviewer.arch, reviewer.frontend, security-auditor]
+      phase-test:   []                           # disabled for this repo
+      phase-ship:   [changelog-writer, shipper]
+```
+
+Default = the spec catalog. Overrides layer on per-repo.
+
+**Level 2 — per-role `applies_when` predicate.**
+
+Each role can declare a predicate that gates whether it fires for a given dispatch:
+
+```yaml
+# .coworker/roles/reviewer.frontend.yaml
+applies_when:
+  changes_touch: ["web/**", "*.tsx", "*.css"]
+```
+
+False predicate → role skips; a `job.skipped` event is emitted for audit.
+
+Predicate DSL (minimal by design):
+- `changes_touch(glob...)` — current diff intersects glob
+- `plan_tagged(tag)` — plan manifest entry has tag
+- `commit_msg_contains(regex)` — last commit matches
+- `phase_index_in(range)` — phase position in plan
+- `and(a, b, …)` / `or(a, b, …)` / `not(a)`
+
+Adding new predicate kinds is a runtime code change — YAML doesn't grow unboundedly.
+
+**What customization does NOT allow in V1:**
+
+- Reordering stages or changing fan-in/fan-out structure
+- Branching on conditions beyond per-role `applies_when`
+- User-defined workflow implementations (Go plugin / external binary)
+
+Those are V2+ if real need emerges. Level 1 + Level 2 cover every "add / remove / skip a step" case we've identified within coding workflows.
 
 ---
 
@@ -400,7 +451,7 @@ Canonical event kinds: `run.*`, `plan.*`, `job.*`, `supervisor.verdict`, `checkp
 
 | Surface | Answers | Best for |
 |---|---|---|
-| **TUI dashboard** (Textual) | "What's happening? What needs me?" | Live, parallel-state visualization, checkpoint approvals |
+| **TUI dashboard** (Bubble Tea) | "What's happening? What needs me?" | Live, parallel-state visualization, checkpoint approvals |
 | **CLI** (`status`, `watch`, `logs`, `inspect`) | "State of run X?" / scripting | Shell pipelines, CI |
 | **File artifacts** (`adherence.md`, spec/plan files, commits) | "What happened, in human-readable form?" | Postmortem, git-diffable audit |
 | **Notifications** (desktop, webhook) | "Tell me when I need to act" | Overnight autopilot |
@@ -731,7 +782,7 @@ Specifically verify (both Claude Code and Codex):
 
 Shipped in V1:
 
-- Daemon (Python, asyncio, SQLite, Textual TUI)
+- Daemon in Go (goroutines + channels, SQLite via `modernc.org/sqlite`, Bubble Tea TUI, cobra CLI)
 - MCP server exposing orch.* tools
 - Three role plugins (claude, codex, opencode) each with interactive + worker modes
 - `build-from-prd` and `freeform` workflows

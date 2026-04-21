@@ -6,7 +6,7 @@
 
 Design spec: `docs/specs/000-coworker-runtime-design.md`. Read it before planning or implementing.
 
-Stack (V1): Python + asyncio + SQLite + Textual TUI + MCP server exposing `orch.*` tools, plus plugins for each CLI (Claude Code, Codex, OpenCode).
+Stack (V1): Go (goroutines + channels) + SQLite (`modernc.org/sqlite`, pure Go, no cgo) + Bubble Tea TUI + cobra CLI + MCP server exposing `orch.*` tools, plus plugins for each CLI (Claude Code, Codex, OpenCode).
 
 ## CRITICAL RULES (never skip)
 
@@ -17,18 +17,25 @@ Stack (V1): Python + asyncio + SQLite + Textual TUI + MCP server exposing `orch.
 
 ## Project Structure (intended — most does not yet exist)
 
-Runtime package layout (to be created during implementation):
+Go module layout (to be created during implementation):
 
-- `coworker/` — daemon, scheduler, registry, supervisor, workflow state machines, MCP server
-- `coworker/cli/` — `coworker` CLI entry points (`run`, `session`, `init`, `status`, `watch`, `logs`, `inspect`, `resume`, `invoke`, `redo`, `edit`, `advance`, `rollback`)
-- `coworker/tui/` — Textual dashboard
-- `coworker/roles/` — canonical role implementations / built-in prompt templates
-- `coworker/workflows/` — `build-from-prd` and `freeform` state machines
-- `plugins/coworker-claude/` — Claude Code plugin (skills, commands, settings)
-- `plugins/coworker-codex/` — Codex worker prompts
-- `plugins/coworker-opencode/` — OpenCode plugin
-- `tests/` — unit (Layer 1), integration with mocks (Layer 2), replay (Layer 3)
+- `go.mod` at repo root; module path `github.com/<org>/coworker`
+- `cmd/coworker/` — CLI binary entry point (main.go)
+- `core/` — **domain-neutral primitives** (runs, jobs, events, supervisor framework, attention queue, worker registry, cost ledger, agent protocol). Imports flow core → coding, never the reverse.
+- `coding/` — coding-specific roles, rules, workflows, plugins. Depends on `core`.
+- `cli/` — cobra command definitions (`run`, `session`, `init`, `status`, `watch`, `logs`, `inspect`, `resume`, `invoke`, `redo`, `edit`, `advance`, `rollback`)
+- `tui/` — Bubble Tea dashboard (`charmbracelet/bubbletea` + `lipgloss` + `bubbles`)
+- `mcp/` — MCP server exposing `orch.*` tools
+- `store/` — SQLite layer (`modernc.org/sqlite`), schema migrations, event-first write helpers
+- `agent/` — `Agent` protocol + `CliAgent` (shell-out + stream-json parser)
+- `plugins/coworker-claude/` — Claude Code plugin (skills, commands, settings — not Go code)
+- `plugins/coworker-codex/` — Codex worker prompts (not Go code)
+- `plugins/coworker-opencode/` — OpenCode plugin (not Go code)
+- `testdata/` — test fixtures (mock CLI binaries, golden event logs, role YAMLs)
+- `internal/` — private helpers not meant for external import
 - `docs/` — specs, plans, architecture decisions
+
+Tests live next to the package they cover (`*_test.go`), with fixtures in `testdata/`. Integration tests live in a top-level `tests/` directory.
 
 Per-repo scaffolding (created by `coworker init`, see spec Appendix A):
 
@@ -61,14 +68,19 @@ Load-bearing invariants from the spec (violations must be caught by supervisor r
 
 ## Coding Conventions
 
-### Python (runtime, CLI, TUI)
+### Go (runtime, CLI, TUI, MCP)
 
-- Async-first: `asyncio` throughout the daemon; no thread pools unless wrapping a blocking stdlib call.
-- Data model: SQLite via raw `sqlite3` or a thin wrapper; no ORM. Schema migrations are explicit and versioned.
-- TUI: `textual` for the dashboard. CLI: `typer` or `click` (decide during Plan 100).
-- MCP server: use the official Python MCP SDK.
-- Linting: `ruff`. Type-checking: `mypy --strict` on new modules.
-- Prompt/role templates live alongside their role definitions (filesystem, not embedded strings).
+- **Concurrency:** goroutines + channels. Contexts (`context.Context`) everywhere for cancellation and deadlines. No naked goroutines — every `go func()` has a defined lifecycle (wait group, error channel, or select-on-ctx.Done).
+- **Data model:** SQLite via `modernc.org/sqlite` (pure Go, no cgo — preserves single-binary distribution). Raw `database/sql` + prepared statements; no ORM. Schema migrations are explicit and versioned (numbered .sql files + a tiny runner).
+- **TUI:** Bubble Tea (`charmbracelet/bubbletea`), Lip Gloss (`charmbracelet/lipgloss`) for styling, Bubbles (`charmbracelet/bubbles`) for stock widgets.
+- **CLI:** `spf13/cobra` for command hierarchy, `spf13/viper` only if we outgrow flat config (prefer simple YAML+struct decoding).
+- **MCP server:** official `modelcontextprotocol/go-sdk` if viable; fall back to `mark3labs/mcp-go` if the official SDK lags features we need (decide in Plan 104 based on spike findings).
+- **YAML + validation:** `gopkg.in/yaml.v3` for parsing, `go-playground/validator` for struct-tag validation, or hand-rolled validation if the surface is small.
+- **Subprocess:** `os/exec` with explicit `cmd.StdoutPipe()` streaming; parse stream-json with `json.Decoder` in a loop. Never buffer the whole output.
+- **Linting:** `golangci-lint` with `govet`, `staticcheck`, `errcheck`, `gosec`, `gocyclo` enabled.
+- **Error handling:** `fmt.Errorf("...: %w", err)` for wrapping; `errors.Is` / `errors.As` at inspection sites. No silent error drops. Structured logging via `slog`.
+- **Prompt/role templates** live in the filesystem under `.coworker/prompts/` and `.coworker/roles/` — loaded at daemon start, not embedded in Go source.
+- **Package layout posture:** `core/` and `coding/` are separate packages; `coding/` may import `core/` but never the reverse. Enforced by import tests.
 
 ### General
 
@@ -81,8 +93,8 @@ Load-bearing invariants from the spec (violations must be caught by supervisor r
 
 Three layers, per the spec:
 
-1. **Unit** (`tests/unit/`) — state-machine transitions, fan-in dedupe, rule predicates, schema validation, scheduler DAG. Fast, deterministic, no agents. ~80% of the suite. Must pass on every commit.
-2. **Integration with mocks** (`tests/integration/`) — swap real CLIs with mock binaries under `tests/mocks/<cli-name>` that emit canned stream-json. Exercises dispatch, registry eviction, supervisor loops, crash recovery, fan-out width. Runs in seconds, no API cost.
+1. **Unit** (`*_test.go` next to source files) — state-machine transitions, fan-in dedupe, rule predicates, schema validation, scheduler DAG. Fast, deterministic, no agents. ~80% of the suite. Must pass on every commit. Run via `go test ./... -count=1 -timeout 60s`.
+2. **Integration with mocks** (`tests/integration/`) — swap real CLIs with mock binaries under `testdata/mocks/<cli-name>` (shell scripts or compiled Go binaries) that emit canned stream-json. Exercises dispatch, registry eviction, supervisor loops, crash recovery, fan-out width. Runs in seconds, no API cost.
 3. **Replay** (`tests/replay/<run-name>/`) — recorded real-agent transcripts. Played back via a replay-mode CLI wrapper. Gated to nightly CI.
 
 **Event log as fixture.** Every test that drives the runtime should snapshot the resulting `events` log and diff against the golden file. This catches ordering regressions that return-value / DB-state assertions miss.
