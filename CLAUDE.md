@@ -81,6 +81,7 @@ Load-bearing invariants from the spec (violations must be caught by supervisor r
 - **Error handling:** `fmt.Errorf("...: %w", err)` for wrapping; `errors.Is` / `errors.As` at inspection sites. No silent error drops. Structured logging via `slog`.
 - **Prompt/role templates** live in the filesystem under `.coworker/prompts/` and `.coworker/roles/` — loaded at daemon start, not embedded in Go source.
 - **Package layout posture:** `core/` and `coding/` are separate packages; `coding/` may import `core/` but never the reverse. Enforced by import tests.
+- **Production-quality code required.** Go code must cover the SAME business logic, edge cases, fallback chains, defensive patterns, and generalization as the Python implementation — not just the happy path. Do NOT strip defensive logic, pre-validation, health probes, retry paths, or fallback chains in the name of Go minimalism or YAGNI. When porting from Python, read the Python implementation's INTERNAL logic (not just the API shape) and port ALL defensive paths. When writing new Go code with no Python counterpart, handle: what happens on failure? partial input? upstream down? concurrent access? empty collections? Think like a production SRE, not a tutorial writer.
 
 ### General
 
@@ -88,6 +89,8 @@ Load-bearing invariants from the spec (violations must be caught by supervisor r
 - Never hardcode secrets. `.env` for secrets; `config.yaml` / `policy.yaml` for non-secret configuration.
 - When modifying any logic, proactively search the codebase for similar patterns that should receive the same change. Audit related roles, rules, prompts, and handlers for consistency.
 - Don't duplicate logic. If a utility exists, reuse it. Keep a single source of truth.
+- **Never defer fixes without a follow-up plan.** If a known issue is identified during implementation, fix it NOW in the same commit/PR. Do NOT label it "acceptable trade-off", "follow-up", "TODO", or "deferred" unless a concrete follow-up plan has been drafted in `docs/plans/` with a plan number, scope, and phases. Unfiled deferrals rot — they become invisible tech debt that surfaces only during live user testing.
+- **Always implement the long-term solution, not the short-term workaround.** When two approaches exist — a quick hack that unblocks now vs a proper fix that solves the root cause — choose the proper fix. Short-term workarounds create architectural debt that compounds across plans (e.g., dual agentic loops, dual streaming states, dual event channels). If the proper fix is genuinely too large for the current scope, draft the follow-up plan immediately and get user approval before shipping the workaround.
 
 ## Testing
 
