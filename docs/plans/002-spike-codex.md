@@ -10,7 +10,7 @@
 - OpenAI API key configured (Codex auth working)
 - `tmux` installed
 - Go 1.25+
-- Spike 001 MCP server built (we reuse it — the server is CLI-agnostic)
+- Shared MCP server source at `spike/common/mcp-server/` (build if not already built — see Test 1 setup)
 
 **Branch:** `feature/spike-002-codex`
 
@@ -39,26 +39,47 @@ Unlike Claude Code, Codex's interactive mode is a TUI — it's unclear whether i
 
 ## Test Protocol
 
+### Test 0: CLI availability
+
+**Question:** Is the Codex CLI present at the expected path with expected flags?
+
+**Steps:**
+1. Verify the binary exists and runs:
+   ```bash
+   /home/chris/.nvm/versions/node/v20.20.1/bin/codex --version 2>&1 | tee spike/002/RESULTS.md
+   ```
+2. Capture help output:
+   ```bash
+   /home/chris/.nvm/versions/node/v20.20.1/bin/codex --help 2>&1 >> spike/002/RESULTS.md
+   ```
+3. Confirm key subcommands exist: `exec`, `mcp add`, `mcp list`, `resume`.
+
+**Expected result:** Both commands succeed. Key subcommands are present in `--help` output.
+
+**Failure mode:** Binary not found or flags changed → update paths/flags before proceeding.
+
+---
+
 ### Test 1: MCP server connection + tool discovery
 
 **Question:** Can Codex connect to a custom stdio MCP server and discover its tools?
 
 **Setup:**
-Reuse the MCP server from spike 001 (`spike/001/spike-mcp-server`). If not yet built:
+Build the shared MCP server if not already built:
 ```bash
-cd spike/001 && go build -o spike-mcp-server . && cd -
+cd spike/common/mcp-server && go build -o spike-mcp-server . && cd -
 ```
 
 **Steps:**
 1. Register the MCP server with Codex:
    ```bash
-   codex mcp add coworker-spike -- /home/chris/workshop/coworker/spike/001/spike-mcp-server
+   /home/chris/.nvm/versions/node/v20.20.1/bin/codex mcp add coworker-spike -- /home/chris/workshop/coworker/spike/common/mcp-server/spike-mcp-server
    ```
-2. Verify registration: `codex mcp list` — confirm `coworker-spike` appears.
-3. Verify with `codex mcp list --json` for machine-readable output.
+2. Verify registration: `/home/chris/.nvm/versions/node/v20.20.1/bin/codex mcp list` — confirm `coworker-spike` appears.
+3. Verify with `/home/chris/.nvm/versions/node/v20.20.1/bin/codex mcp list --json` for machine-readable output.
 4. Start Codex interactively and check tool availability:
    ```bash
-   codex "List all available MCP tools. Do you see orch_next_dispatch and orch_job_complete?"
+   /home/chris/.nvm/versions/node/v20.20.1/bin/codex "List all available MCP tools. Do you see orch_next_dispatch and orch_job_complete?"
    ```
 5. Check if Codex can see both tools.
 
@@ -82,7 +103,7 @@ Set `spike/001/dispatch.json`:
   "status": "dispatched",
   "job_id": "codex-test-001",
   "role": "reviewer.arch",
-  "prompt": "Review the architecture of spike/001/server.go. Return findings as JSON with keys: summary, findings (array of {file, line, severity, message}).",
+  "prompt": "Review the architecture of spike/common/mcp-server/main.go. Return findings as JSON with keys: summary, findings (array of {file, line, severity, message}).",
   "context": {}
 }
 ```
@@ -90,7 +111,7 @@ Set `spike/001/dispatch.json`:
 **Steps:**
 1. Run Codex in exec mode:
    ```bash
-   codex exec "Call the orch_next_dispatch tool. If it returns a dispatch with status 'dispatched', execute the task in the prompt field. When done, call orch_job_complete with the job_id and your structured findings as JSON." 2>&1 | tee spike/002/exec-output.txt
+   /home/chris/.nvm/versions/node/v20.20.1/bin/codex exec "Call the orch_next_dispatch tool. If it returns a dispatch with status 'dispatched', execute the task in the prompt field. When done, call orch_job_complete with the job_id and your structured findings as JSON." 2>&1 | tee spike/002/exec-output.txt
    ```
 2. Check `spike/001/completed.json` for the completion payload.
 3. Verify structured JSON output.
@@ -112,7 +133,7 @@ Set `spike/001/dispatch.json`:
 1. Reset `dispatch.json` to the test dispatch.
 2. Run:
    ```bash
-   codex exec --json \
+   /home/chris/.nvm/versions/node/v20.20.1/bin/codex exec --json \
      "Call orch_next_dispatch. If dispatched, execute the task and call orch_job_complete with findings." \
      2>/dev/null | tee spike/002/exec-jsonl.txt
    ```
@@ -140,7 +161,7 @@ Start Codex interactively in a tmux pane.
 1. Set `dispatch.json` to `{"status": "idle"}`.
 2. Start Codex in tmux:
    ```bash
-   tmux new-session -d -s spike002 "codex 'You are connected to the coworker orchestrator. At the end of every response, you MUST call orch_next_dispatch to check for work. If idle, say Waiting. If dispatched, execute and call orch_job_complete, then poll again.'"
+   tmux new-session -d -s spike002 "/home/chris/.nvm/versions/node/v20.20.1/bin/codex 'You are connected to the coworker orchestrator. At the end of every response, you MUST call orch_next_dispatch to check for work. If idle, say Waiting. If dispatched, execute and call orch_job_complete, then poll again.'"
    ```
 3. Observe: Does Codex call `orch_next_dispatch` after responding?
 4. If yes, update `dispatch.json` with a test dispatch.
@@ -163,8 +184,8 @@ Start Codex interactively in a tmux pane.
 
 **Steps:**
 1. Start an interactive Codex session, call `orch_next_dispatch` once, then exit.
-2. Note the session ID from `codex resume --last` or the session output.
-3. Resume: `codex resume --last`
+2. Note the session ID from `/home/chris/.nvm/versions/node/v20.20.1/bin/codex resume --last` or the session output.
+3. Resume: `/home/chris/.nvm/versions/node/v20.20.1/bin/codex resume --last`
 4. Ask Codex to call `orch_next_dispatch` again.
 5. Verify the MCP server is re-launched and tools are available.
 
@@ -208,7 +229,7 @@ Write `spike/002/findings-schema.json`:
 1. Reset `dispatch.json`.
 2. Run:
    ```bash
-   codex exec \
+   /home/chris/.nvm/versions/node/v20.20.1/bin/codex exec \
      --output-schema spike/002/findings-schema.json \
      "Call orch_next_dispatch. Execute the dispatched task. Call orch_job_complete. Then output your findings." \
      2>/dev/null | tee spike/002/schema-output.txt
@@ -225,21 +246,45 @@ Write `spike/002/findings-schema.json`:
 
 **Question:** How do Codex sandbox modes interact with the MCP server's file I/O?
 
+**Framing:** The goal is to **measure** whether MCP subprocesses can read/write outside the Codex workspace. Document the boundary. Feed findings into the security model (docs/specs/000 §Security Model).
+
 **Steps:**
 1. Run Test 2 with each sandbox mode:
    ```bash
-   codex exec --sandbox read-only "Call orch_next_dispatch and orch_job_complete..." 
-   codex exec --sandbox workspace-write "Call orch_next_dispatch and orch_job_complete..."
-   codex exec --full-auto "Call orch_next_dispatch and orch_job_complete..."
+   /home/chris/.nvm/versions/node/v20.20.1/bin/codex exec --sandbox read-only "Call orch_next_dispatch and orch_job_complete..." 
+   /home/chris/.nvm/versions/node/v20.20.1/bin/codex exec --sandbox workspace-write "Call orch_next_dispatch and orch_job_complete..."
+   /home/chris/.nvm/versions/node/v20.20.1/bin/codex exec --full-auto "Call orch_next_dispatch and orch_job_complete..."
    ```
-2. For each mode, check:
+2. For each mode, record:
    - Does the MCP server start? (stdio subprocess may be affected by sandbox)
    - Can the server write `completed.json`?
+   - Can the server read `dispatch.json`?
    - Are Codex's own file operations sandboxed independently of MCP?
+3. Document the exact sandbox boundary — which operations are blocked, which pass through.
 
-**Expected result:** MCP server operates outside the sandbox (it's a subprocess managed by Codex, not a user command). Codex's own operations are sandboxed per policy.
+**Expected result:** Neutral observation of the boundary. Record whether MCP server I/O is sandboxed or independent for each mode.
 
-**Failure mode:** Sandbox blocks MCP server file I/O → need to understand the boundary. MCP servers should run outside the sandbox since Codex launches them as trusted infrastructure.
+**Failure mode:** If sandbox blocks all MCP server I/O, Codex may require `--full-auto` for the coworker use case. Document this constraint for the security model.
+
+---
+
+## Pass/Fail Gates
+
+Persistent mode is viable **only if BOTH of the following pass:**
+
+| Gate | Required Test(s) | Criterion |
+|---|---|---|
+| Interactive polling | Test 4 | Codex maintains polling behavior across at least 2 consecutive turns |
+| Session resume | Test 5 | MCP tools are available after `codex resume` |
+
+**If either gate fails:** Codex is **ephemeral-only** (via `codex exec`). This is the expected fallback and is still a valuable operating mode for review/test roles.
+
+**Ephemeral mode requires:**
+
+| Gate | Required Test(s) | Criterion |
+|---|---|---|
+| `codex exec` round-trip | Test 2 | Codex calls both tools and produces structured output |
+| Output capture | Test 3 or Test 6 | At least one of `--json` JSONL or `--output-schema` produces parseable output |
 
 ---
 
@@ -262,9 +307,8 @@ Fill in after running:
 - `persistent_mcp_pull:` yes | partial | no
 - `ephemeral_exec:` yes | partial | no
 - `tmux_wake:` reliable | flaky | broken | n/a
-- `mcp_notifications:` supported | unsupported
 - `output_capture:` jsonl | schema | file-read | none
-- `compaction:` acceptable | problematic | n/a
+- `sandbox_boundary:` <description of what is/isn't sandboxed>
 - `recommendation:` persistent | ephemeral-only | persistent-with-workarounds
 - `plan_104_impact:` <how this affects the MCP server plan>
 - `plan_109_impact:` <how this affects the Codex plugin plan>
@@ -280,7 +324,10 @@ All prototype code lives in `spike/002/`:
 - `schema-output.txt` — schema-enforced output
 - `RESULTS.md` — raw test results
 
-The MCP server binary is shared with spike 001 at `spike/001/spike-mcp-server`.
+The MCP server binary is shared at `spike/common/mcp-server/spike-mcp-server`. If not already built:
+```bash
+cd spike/common/mcp-server && go build -o spike-mcp-server . && cd -
+```
 
 ---
 
@@ -292,6 +339,7 @@ The MCP server binary is shared with spike 001 at `spike/001/spike-mcp-server`.
 
 | Test | Result | Notes |
 |---|---|---|
+| 0. CLI availability | | |
 | 1. MCP connection | | |
 | 2. exec tool round-trip | | |
 | 3. exec --json capture | | |

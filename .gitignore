@@ -21,3 +21,6 @@ Thumbs.db
 
 # Go
 vendor/
+
+# Spike prototypes (only docs/plans/00N-*.md are committed)
+/spike/

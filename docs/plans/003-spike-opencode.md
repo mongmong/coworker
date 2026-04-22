@@ -39,6 +39,27 @@ The spec (§Per-CLI mechanism) says OpenCode uses HTTP POST for dispatch and ser
 
 ## Test Protocol
 
+### Test 0: CLI availability
+
+**Question:** Is the OpenCode CLI present at the expected path with expected flags?
+
+**Steps:**
+1. Verify the binary exists and runs:
+   ```bash
+   /home/chris/.opencode/bin/opencode --version 2>&1 | tee spike/003/RESULTS.md
+   ```
+2. Capture help output:
+   ```bash
+   /home/chris/.opencode/bin/opencode --help 2>&1 >> spike/003/RESULTS.md
+   ```
+3. Confirm key subcommands exist: `serve`, `run`, `mcp`.
+
+**Expected result:** Both commands succeed. Key subcommands are present in `--help` output.
+
+**Failure mode:** Binary not found or flags changed → update paths/flags before proceeding.
+
+---
+
 ### Test 1: Server startup and OpenAPI discovery
 
 **Question:** Does `opencode serve` start reliably and expose a usable API?
@@ -46,7 +67,7 @@ The spec (§Per-CLI mechanism) says OpenCode uses HTTP POST for dispatch and ser
 **Steps:**
 1. Start the server on a fixed port:
    ```bash
-   opencode serve --port 4096 --print-logs --log-level DEBUG 2>&1 | tee spike/003/server.log &
+   /home/chris/.opencode/bin/opencode serve --port 4096 --print-logs --log-level DEBUG 2>&1 | tee spike/003/server.log &
    OPENCODE_PID=$!
    sleep 3
    ```
@@ -96,7 +117,7 @@ echo "Response: $RESPONSE"
 ```
 
 **Steps:**
-1. Start `opencode serve --port 4096` in background.
+1. Start `/home/chris/.opencode/bin/opencode serve --port 4096` in background.
 2. Run the test script. Adjust endpoint paths based on OpenAPI spec from Test 1.
 3. Verify a session is created and a message is accepted.
 4. Check if the response is synchronous (blocks until LLM responds) or returns immediately with a handle.
@@ -122,7 +143,7 @@ Write `spike/003/sse_listener.go` — a minimal Go program that:
 4. Exits after 60 seconds or 20 events
 
 **Steps:**
-1. Start `opencode serve --port 4096` in background.
+1. Start `/home/chris/.opencode/bin/opencode serve --port 4096` in background.
 2. Start the SSE listener in background: `go run spike/003/sse_listener.go &`
 3. Create a session and send a message (via curl, as in Test 2).
 4. Observe the SSE listener output.
@@ -153,7 +174,7 @@ Write `spike/003/dispatch_test.go` — a Go program that:
 7. Deletes/closes the session
 
 **Steps:**
-1. Start `opencode serve --port 4096`.
+1. Start `/home/chris/.opencode/bin/opencode serve --port 4096`.
 2. Run the dispatch test: `go run spike/003/dispatch_test.go`
 3. Verify:
    - Session was created
@@ -178,8 +199,8 @@ Write `spike/003/dispatch_test.go` — a Go program that:
 **Steps:**
 1. Run:
    ```bash
-   opencode run --format json \
-     "Review this code and return findings as JSON with keys summary and findings: $(cat spike/001/server.go)" \
+   /home/chris/.opencode/bin/opencode run --format json \
+     "Review this code and return findings as JSON with keys summary and findings: $(cat spike/common/mcp-server/main.go)" \
      2>/dev/null | tee spike/003/run-output.jsonl
    ```
 2. Parse each line/block as JSON.
@@ -200,17 +221,20 @@ Write `spike/003/dispatch_test.go` — a Go program that:
 **Question:** Can OpenCode connect to the coworker MCP server as a client, enabling the same pull model as Claude Code?
 
 **Setup:**
-Reuse the MCP server from spike 001.
+Reuse the MCP server from spike 001. Build if not already built:
+```bash
+cd spike/common/mcp-server && go build -o spike-mcp-server . && cd -
+```
 
 **Steps:**
 1. Register the MCP server with OpenCode:
    ```bash
-   opencode mcp add
+   /home/chris/.opencode/bin/opencode mcp add
    ```
    (Follow the interactive prompts, or find the config file format from docs.)
 2. Start OpenCode with the MCP server configured.
 3. Verify MCP tools (`orch_next_dispatch`, `orch_job_complete`) are available.
-4. Test a tool call via `opencode run "Call orch_next_dispatch"`.
+4. Test a tool call via `/home/chris/.opencode/bin/opencode run "Call orch_next_dispatch"`.
 
 **Expected result:** OpenCode can connect to MCP servers and call custom tools.
 
@@ -226,7 +250,7 @@ Reuse the MCP server from spike 001.
 **Question:** Can the server handle multiple concurrent sessions? What happens when sessions are abandoned?
 
 **Steps:**
-1. Start `opencode serve --port 4096`.
+1. Start `/home/chris/.opencode/bin/opencode serve --port 4096`.
 2. Create 3 sessions via the API.
 3. Send a message to each session concurrently (using `&` in shell).
 4. Verify all 3 responses are received.
@@ -262,7 +286,7 @@ Write `spike/003/sdk_test.go` that uses the Go SDK to:
 5. Subscribe to events (if the SDK supports SSE)
 
 **Steps:**
-1. Start `opencode serve --port 4096`.
+1. Start `/home/chris/.opencode/bin/opencode serve --port 4096`.
 2. Run: `cd spike/003 && go test -v -run TestSDK -timeout 120s`
 3. Note which operations the SDK supports and which require raw HTTP.
 
@@ -275,6 +299,163 @@ Write `spike/003/sdk_test.go` that uses the Go SDK to:
 
 ---
 
+### Test 9: Workspace/worktree isolation
+
+**Question:** Does `opencode serve` correctly bind to a git worktree root and maintain isolation between sessions with different project roots?
+
+**Setup:**
+Create a git worktree at a temp path:
+```bash
+WORKTREE_DIR=$(mktemp -d)
+git worktree add "$WORKTREE_DIR" HEAD --detach
+```
+
+**Steps:**
+1. Start `/home/chris/.opencode/bin/opencode serve --port 4097 --print-logs` from within the worktree:
+   ```bash
+   cd "$WORKTREE_DIR" && /home/chris/.opencode/bin/opencode serve --port 4097 --print-logs 2>&1 | tee spike/003/worktree-server.log &
+   WORKTREE_PID=$!
+   sleep 3
+   ```
+2. Create a session and send a message that references a file path:
+   ```bash
+   curl -s -X POST http://localhost:4097/session \
+     -H "Content-Type: application/json" \
+     -d '{"title": "worktree-test"}'
+   ```
+3. Verify the session binds to the worktree root, not the main checkout:
+   - Ask the session "What is your current working directory?" or check server logs for the project root.
+   - Create a file in the worktree and verify the session can see it.
+   - Verify the session does NOT see uncommitted files from the main checkout.
+4. Start a second server instance on the main checkout (port 4096) and verify:
+   - Sessions on port 4096 see the main checkout.
+   - Sessions on port 4097 see the worktree.
+   - No state leaks between the two (different session lists, different file views).
+5. Clean up:
+   ```bash
+   kill $WORKTREE_PID
+   git worktree remove "$WORKTREE_DIR"
+   ```
+
+**Expected result:** Each `opencode serve` instance binds to its own project root. No state leaks between instances with different roots.
+
+**Failure mode:**
+- Server always uses the main checkout → OpenCode resolves the repo root, not cwd
+- State leaks between instances → shared state directory; need `--data-dir` or similar isolation
+- Worktree not recognized as valid project → OpenCode may require `.git` directory (worktrees use `.git` file)
+
+---
+
+### Test 10: Cancel/abort in-flight prompt
+
+**Question:** Can we abort a running prompt via the API? How does the server signal cancellation?
+
+**Steps:**
+1. Start `/home/chris/.opencode/bin/opencode serve --port 4096`.
+2. Create a session and subscribe to SSE events.
+3. Send a long-running prompt (e.g., "Write a comprehensive 5000-word essay on the history of computing"):
+   ```bash
+   SESSION_ID=<from session creation>
+   curl -s -X POST "http://localhost:4096/session/$SESSION_ID/message" \
+     -H "Content-Type: application/json" \
+     -d '{"content": "Write a comprehensive 5000-word essay on the history of computing."}' &
+   MSG_PID=$!
+   sleep 5
+   ```
+4. Abort the message via the API (check OpenAPI spec for abort endpoint — likely `POST /session/$SESSION_ID/abort` or `DELETE /session/$SESSION_ID/message/<msg_id>`):
+   ```bash
+   curl -s -X POST "http://localhost:4096/session/$SESSION_ID/abort"
+   ```
+5. Observe:
+   - Does the SSE stream emit a cancellation event?
+   - Does the API return a success/failure response?
+   - Is the session still usable after abort (can we send a new message)?
+6. Record the exact event types and timing.
+
+**Expected result:** Abort succeeds. SSE stream signals cancellation. Session remains usable.
+
+**Failure mode:**
+- No abort endpoint → cancellation not supported via API; document the gap
+- Abort succeeds but session is corrupted → need to create a new session after abort
+- SSE stream hangs after abort → the known disconnection issue
+
+---
+
+### Test 11: Terminal completion detection via SSE
+
+**Question:** How does the SSE event stream signal that a message/response is fully complete?
+
+**Steps:**
+1. Start `/home/chris/.opencode/bin/opencode serve --port 4096`.
+2. Subscribe to SSE events with detailed logging.
+3. Send a simple prompt and capture the full SSE event sequence.
+4. Identify the **terminal event** — the event that signals "the assistant is done responding." Look for:
+   - A `message.updated` with a `status: "complete"` field
+   - A `session.updated` with an idle/ready state
+   - A distinct `message.done` or `message.completed` event type
+   - The SSE stream closing
+5. Send a prompt that triggers tool use (if OpenCode has built-in tools) and capture the event sequence through tool call → tool result → final response.
+6. Document the exact completion signal for both simple and tool-use responses.
+
+**Expected result:** A clear, programmatically detectable signal that the assistant response is complete. Document the exact event type and fields.
+
+**Failure mode:**
+- No clear completion signal → must poll session state via REST to detect completion
+- Completion signal is unreliable → need timeout-based detection as fallback
+- Different signals for simple vs tool-use responses → document both paths
+
+---
+
+### Test 12: SSE reconnection after disconnect
+
+**Question:** Can we reliably reconnect to the SSE stream after a client-side disconnect? (This addresses the known bug.)
+
+**Steps:**
+1. Start `/home/chris/.opencode/bin/opencode serve --port 4096`.
+2. Subscribe to SSE events.
+3. Disconnect the SSE client (close the HTTP connection).
+4. Wait 5 seconds.
+5. Reconnect to the SSE endpoint.
+6. Send a new message and verify events are received on the new connection.
+7. Repeat the disconnect/reconnect cycle 3 times.
+8. Test reconnecting **during** an active response:
+   - Send a prompt, wait for partial SSE events, disconnect, reconnect.
+   - Verify the reconnected stream picks up remaining events (or at least doesn't corrupt the session).
+
+**Expected result:** Reconnection works. New events arrive on the new connection. No data corruption.
+
+**Failure mode:**
+- Server becomes unresponsive after SSE disconnect → the known bug; document conditions and workarounds
+- Reconnection works but misses events during the gap → need event replay or last-event-ID support
+- Server crashes on rapid disconnect/reconnect → need connection debouncing in the client
+
+---
+
+## Pass/Fail Gates
+
+HTTP dispatch is viable **only if ALL of the following pass:**
+
+| Gate | Required Test(s) | Criterion |
+|---|---|---|
+| Session creation | Test 2 | Programmatic session creation via REST API succeeds |
+| Prompt dispatch | Test 2, Test 4 | Messages accepted and LLM responses received |
+| Terminal completion detection | Test 11 | A clear, programmatically detectable signal that the response is complete |
+| SSE capture | Test 3 | SSE events arrive in real-time with sufficient data to track response progress |
+| Cancellation | Test 10 | In-flight prompts can be aborted; session remains usable after abort |
+| Cleanup | Test 4, Test 7 | Sessions can be deleted; abandoned sessions don't crash the server |
+
+**If any gate fails:** HTTP dispatch is not viable in its current form. Fall back to `opencode run --format json` for ephemeral dispatch.
+
+**Informational tests (do not gate the verdict):**
+- Test 0 (CLI availability) — prerequisite validation
+- Test 5 (`opencode run` JSON) — ephemeral alternative assessment
+- Test 6 (MCP client) — hybrid path option
+- Test 8 (Go SDK) — implementation convenience
+- Test 9 (worktree isolation) — multi-worker deployment model
+- Test 12 (SSE reconnection) — robustness assessment; informs client implementation but doesn't block viability
+
+---
+
 ## Decision Matrix
 
 | Dimension | Result | Implication |
@@ -283,10 +464,14 @@ Write `spike/003/sdk_test.go` that uses the Go SDK to:
 | Session CRUD via API | yes/no | Core dispatch viability |
 | Message sending + response | sync/async/no | Determines dispatch model (fire-and-wait vs fire-and-poll) |
 | SSE event stream | rich/sparse/broken | Output capture strategy |
+| Terminal completion detection | clear/ambiguous/none | Determines if we can detect "done" programmatically |
 | Full dispatch cycle | yes/no | End-to-end viability |
+| Cancel/abort | works/broken/missing | In-flight task management |
+| SSE reconnection | clean/lossy/broken | Client robustness strategy |
 | `opencode run --format json` | usable/not | Ephemeral alternative |
 | MCP client support | yes/no | Hybrid path option |
 | Concurrent sessions | yes/no | Multi-worker viability |
+| Worktree isolation | yes/no | Multi-worker deployment model |
 | Go SDK | usable/partial/broken | Implementation convenience |
 
 ## Verdict Template
@@ -294,8 +479,12 @@ Write `spike/003/sdk_test.go` that uses the Go SDK to:
 Fill in after running:
 - `server_dispatch:` yes | partial | no
 - `sse_capture:` rich | sparse | broken
+- `completion_detection:` clear | ambiguous | none
+- `cancellation:` works | broken | missing
+- `sse_reconnection:` clean | lossy | broken
 - `session_lifecycle:` clean | leaky | broken
 - `concurrent_sessions:` yes | no
+- `worktree_isolation:` yes | no
 - `go_sdk:` usable | partial | raw-http-needed
 - `opencode_run_json:` usable | not
 - `mcp_client:` yes | no
@@ -315,6 +504,7 @@ All prototype code lives in `spike/003/`:
 - `test_api.sh` — shell script for quick API testing
 - `openapi.json` — captured OpenAPI spec from server
 - `server.log` — server output log
+- `worktree-server.log` — worktree isolation test log
 - `run-output.jsonl` — `opencode run` JSON output
 - `RESULTS.md` — raw test results
 
@@ -328,6 +518,7 @@ All prototype code lives in `spike/003/`:
 
 | Test | Result | Notes |
 |---|---|---|
+| 0. CLI availability | | |
 | 1. Server startup | | |
 | 2. Session + message | | |
 | 3. SSE event stream | | |
@@ -336,6 +527,10 @@ All prototype code lives in `spike/003/`:
 | 6. MCP client support | | |
 | 7. Session lifecycle | | |
 | 8. Go SDK | | |
+| 9. Worktree isolation | | |
+| 10. Cancel/abort | | |
+| 11. Completion detection | | |
+| 12. SSE reconnection | | |
 
 ### Verdict
 

@@ -33,36 +33,69 @@ The coworker runtime's persistent-worker model (spec §Lifecycle) relies on CLI 
 
 ## Test Protocol
 
+### Test 0: CLI availability
+
+**Question:** Is the Claude Code CLI present at the expected path with expected flags?
+
+**Steps:**
+1. Verify the binary exists and runs:
+   ```bash
+   /home/chris/.local/bin/claude --version 2>&1 | tee spike/001/RESULTS.md
+   ```
+2. Capture help output:
+   ```bash
+   /home/chris/.local/bin/claude --help 2>&1 >> spike/001/RESULTS.md
+   ```
+3. Confirm key flags exist: `--system-prompt-file`, `--mcp-config`, `--output-format`, `-p` (print mode).
+
+**Expected result:** Both commands succeed. Key flags are present in `--help` output.
+
+**Failure mode:** Binary not found or flags changed → update paths/flags before proceeding.
+
+---
+
 ### Test 1: Minimal MCP server + Claude Code connection
 
 **Question:** Can Claude Code connect to a custom stdio MCP server and discover its tools?
 
 **Setup:**
 ```bash
-mkdir -p spike/001
-cd spike/001
-go mod init spike001
+mkdir -p spike/common/mcp-server
+cd spike/common/mcp-server
+go mod init spike-mcp-server
 go get github.com/modelcontextprotocol/go-sdk@v1.5.0
 ```
 
-Write `spike/001/server.go` — a minimal MCP server that registers two tools:
+Write `spike/common/mcp-server/main.go` — a minimal MCP server that registers two tools:
 - `orch_next_dispatch` — returns a JSON dispatch object or `{"status": "idle"}` (controlled by a file flag `spike/001/dispatch.json`)
 - `orch_job_complete` — accepts `job_id` + `outputs` JSON, writes them to `spike/001/completed.json`, returns `{"status": "ok"}`
 
 The server uses `mcp.StdioTransport{}` and logs all tool calls to stderr.
 
 **Steps:**
-1. Build the server: `cd spike/001 && go build -o spike-mcp-server .`
-2. Register with Claude Code:
-   ```bash
-   claude mcp add --scope local -t stdio coworker-spike -- /home/chris/workshop/coworker/spike/001/spike-mcp-server
+1. Build the server: `cd spike/common/mcp-server && go build -o spike-mcp-server .`
+2. Write the shared MCP config file at `spike/common/mcp.json`:
+   ```json
+   {
+     "mcpServers": {
+       "coworker-spike": {
+         "command": "/home/chris/workshop/coworker/spike/common/mcp-server/spike-mcp-server",
+         "args": [],
+         "type": "stdio"
+       }
+     }
+   }
    ```
-3. Verify registration: `claude mcp list` — confirm `coworker-spike` appears and is healthy.
-4. Start Claude Code in print mode to test tool discovery:
+3. Register with Claude Code:
    ```bash
-   claude -p "List all available MCP tools. Do you see orch_next_dispatch and orch_job_complete?"
+   /home/chris/.local/bin/claude mcp add --scope local -t stdio coworker-spike -- /home/chris/workshop/coworker/spike/common/mcp-server/spike-mcp-server
    ```
-5. Verify Claude Code sees both tools in its response.
+4. Verify registration: `/home/chris/.local/bin/claude mcp list` — confirm `coworker-spike` appears and is healthy.
+5. Start Claude Code in print mode to test tool discovery:
+   ```bash
+   /home/chris/.local/bin/claude -p "List all available MCP tools. Do you see orch_next_dispatch and orch_job_complete?"
+   ```
+6. Verify Claude Code sees both tools in its response.
 
 **Expected result:** Claude Code discovers both tools and can list them.
 
@@ -81,7 +114,7 @@ Write `spike/001/dispatch.json`:
   "status": "dispatched",
   "job_id": "test-job-001",
   "role": "reviewer.arch",
-  "prompt": "Review the architecture of spike/001/server.go. Return your findings as JSON with keys: summary, findings (array of {file, line, severity, message}).",
+  "prompt": "Review the architecture of spike/common/mcp-server/main.go. Return your findings as JSON with keys: summary, findings (array of {file, line, severity, message}).",
   "context": {}
 }
 ```
@@ -90,7 +123,9 @@ Write `spike/001/dispatch.json`:
 1. Ensure `dispatch.json` contains the test dispatch above.
 2. Run Claude Code with explicit instruction:
    ```bash
-   claude -p "Call the orch_next_dispatch tool. If it returns a dispatch with status 'dispatched', execute the role described in the prompt field. When done, call orch_job_complete with the job_id from the dispatch and your outputs as structured JSON."
+   /home/chris/.local/bin/claude -p \
+     --mcp-config /home/chris/workshop/coworker/spike/common/mcp.json \
+     "Call the orch_next_dispatch tool. If it returns a dispatch with status 'dispatched', execute the role described in the prompt field. When done, call orch_job_complete with the job_id from the dispatch and your outputs as structured JSON."
    ```
 3. Check `spike/001/completed.json` for the completion payload.
 4. Verify the completion contains valid JSON with the expected structure.
@@ -128,7 +163,7 @@ This polling behavior is mandatory. Never skip the `orch_next_dispatch` call at 
 1. Set `dispatch.json` to `{"status": "idle"}`.
 2. Start Claude Code interactively in a tmux pane with the skill:
    ```bash
-   tmux new-session -d -s spike001 "claude --system-prompt-file spike/001/coworker-orchy-skill.md --mcp-config <(echo '{\"mcpServers\":{\"coworker-spike\":{\"type\":\"stdio\",\"command\":\"/home/chris/workshop/coworker/spike/001/spike-mcp-server\",\"args\":[]}}}')"
+   tmux new-session -d -s spike001 "/home/chris/.local/bin/claude --system-prompt-file spike/001/coworker-orchy-skill.md --mcp-config /home/chris/workshop/coworker/spike/common/mcp.json"
    ```
 3. In the Claude Code session, type: "Hello, check for work."
 4. Observe: Claude should call `orch_next_dispatch`, get idle, and report waiting.
@@ -169,12 +204,14 @@ This polling behavior is mandatory. Never skip the `orch_next_dispatch` call at 
 
 ---
 
-### Test 5: MCP server-to-client notifications
+### Test 5: MCP server-to-client notifications (informational)
 
-**Question:** Can the MCP server send a notification that triggers Claude Code to start a new turn or call a tool?
+**Question:** Does a server-initiated notification trigger Claude Code to start a new turn?
+
+**Framing:** This test is **informational only** and is NOT part of the pass/fail gates for the spike verdict. The goal is to measure whether server-initiated notifications can trigger a new turn. Success here is an optimization (no tmux wake needed for dispatch delivery). No-op is the expected baseline (tmux wake remains the primary mechanism).
 
 **Setup:**
-Extend `spike/001/server.go` to send a `notifications/message` or `tools/list_changed` notification when a file watcher detects `dispatch.json` has changed.
+Extend `spike/common/mcp-server/main.go` to send a `notifications/message` or `tools/list_changed` notification when a file watcher detects `dispatch.json` has changed.
 
 **Steps:**
 1. Start Claude Code connected to the MCP server (as in Test 3).
@@ -183,12 +220,9 @@ Extend `spike/001/server.go` to send a `notifications/message` or `tools/list_ch
 4. The server detects the change and sends a notification.
 5. Observe whether Claude Code reacts (starts a new turn, calls `orch_next_dispatch`).
 
-**Expected result:** Claude Code receives the notification and begins a new turn.
-
-**Failure mode:**
-- Notification not received → Claude Code doesn't process unsolicited server notifications (known limitation)
-- Received but not acted upon → notification type may need to be different
-- If this fails: tmux wake-idle from Test 4 is the fallback. Document the gap.
+**Expected result:** Document the observed behavior:
+- **If Claude Code reacts:** Notification-based wake is viable — an optimization over tmux wake.
+- **If Claude Code ignores the notification:** Expected baseline. tmux wake-idle from Test 4 is the primary mechanism. Document the gap.
 
 ---
 
@@ -220,8 +254,8 @@ Extend `spike/001/server.go` to send a `notifications/message` or `tools/list_ch
 **Steps:**
 1. Run:
    ```bash
-   claude -p --output-format stream-json \
-     --mcp-config <(echo '{\"mcpServers\":{\"coworker-spike\":{\"type\":\"stdio\",\"command\":\"/home/chris/workshop/coworker/spike/001/spike-mcp-server\",\"args\":[]}}}') \
+   /home/chris/.local/bin/claude -p --output-format stream-json \
+     --mcp-config /home/chris/workshop/coworker/spike/common/mcp.json \
      "Call orch_next_dispatch. If you get a dispatch, execute it and call orch_job_complete. Output your findings as JSON." \
      2>/dev/null | tee spike/001/stream-output.jsonl
    ```
@@ -235,6 +269,84 @@ Extend `spike/001/server.go` to send a `notifications/message` or `tools/list_ch
 
 ---
 
+### Test 8: Real plugin/skill loading path
+
+**Question:** Can Claude Code discover and load coworker tools through the real plugin path (`.claude/plugins/` + `.mcp.json`) rather than `--system-prompt-file`? This is the path Plan 108 will rely on.
+
+**Setup:**
+1. Create the plugin directory and skill file:
+   ```bash
+   mkdir -p .claude/plugins/coworker-spike
+   ```
+2. Write `.claude/plugins/coworker-spike/coworker-orchy.md`:
+   ```markdown
+   # coworker-orchy
+
+   ## Instructions
+
+   You are connected to the coworker orchestrator via MCP. At the END of every response you give, you MUST call the `orch_next_dispatch` tool to check for new work.
+
+   - If `orch_next_dispatch` returns `{"status": "idle"}`, say "Waiting for dispatch..." and stop.
+   - If it returns a dispatch with `status: "dispatched"`, execute the task described in the `prompt` field, then call `orch_job_complete` with the `job_id` and your structured outputs.
+   - After calling `orch_job_complete`, call `orch_next_dispatch` again to check for more work.
+   ```
+3. Write `.mcp.json` at the project root:
+   ```json
+   {
+     "mcpServers": {
+       "coworker-spike": {
+         "command": "/home/chris/workshop/coworker/spike/common/mcp-server/spike-mcp-server",
+         "args": [],
+         "type": "stdio"
+       }
+     }
+   }
+   ```
+
+**Steps:**
+1. Set `spike/001/dispatch.json` to the test dispatch from Test 2.
+2. Launch Claude Code **without** `--system-prompt-file` or `--mcp-config` flags — rely on `.mcp.json` and the plugin directory:
+   ```bash
+   /home/chris/.local/bin/claude -p "Use the /coworker-orchy skill. Then call orch_next_dispatch and follow its instructions."
+   ```
+3. Verify Claude Code:
+   - Discovers the MCP server from `.mcp.json`
+   - Loads the skill from `.claude/plugins/coworker-spike/`
+   - Calls `orch_next_dispatch` and processes the dispatch
+4. Check `spike/001/completed.json` for the output.
+5. Clean up: remove `.mcp.json` and `.claude/plugins/coworker-spike/` after the test.
+
+**Expected result:** Claude Code loads the skill and MCP server through the real plugin path. Tool discovery and dispatch work identically to Tests 1-2.
+
+**Failure mode:**
+- Plugin not discovered → check `.claude/plugins/` naming conventions; Claude Code may require a different directory structure
+- MCP server not loaded from `.mcp.json` → check `.mcp.json` format against Claude Code docs
+- Skill loads but MCP tools unavailable → `.mcp.json` and plugin loading may be independent; both need to work together
+
+---
+
+## Pass/Fail Gates
+
+Persistent mode is viable **only if ALL of the following pass:**
+
+| Gate | Required Test(s) | Criterion |
+|---|---|---|
+| Tool discovery | Test 1 | Claude Code discovers both `orch_next_dispatch` and `orch_job_complete` from the MCP server |
+| Dispatch completion | Test 2 | Full round-trip: call `orch_next_dispatch` → execute task → call `orch_job_complete` with structured output |
+| Polling across turns | Test 3 | Skill-driven polling persists across at least 3 consecutive turns (idle → dispatch → idle) |
+| Wake reliability | Test 4 | tmux send-keys wakes idle session at least 4/5 times within 10 seconds |
+
+**If any gate fails:** persistent mode is not viable. Fall back to ephemeral-only (`claude -p --output-format stream-json`).
+
+**Informational tests (do not gate the verdict):**
+- Test 0 (CLI availability) — prerequisite validation
+- Test 5 (MCP notifications) — optimization measurement, not a requirement
+- Test 6 (compaction) — informs long-session strategy but not core viability
+- Test 7 (stream-json) — ephemeral fallback validation
+- Test 8 (plugin path) — informs Plan 108 but not core persistent viability
+
+---
+
 ## Decision Matrix
 
 | Dimension | Result | Implication |
@@ -243,18 +355,20 @@ Extend `spike/001/server.go` to send a `notifications/message` or `tools/list_ch
 | Tool round-trip (dispatch → complete) | yes/no | Core pull-model viability |
 | Skill-driven polling | yes/no/partial | Determines if persistent worker model is viable |
 | tmux wake-idle | reliable/flaky/broken | Fallback wake mechanism; flaky is acceptable if notifications work |
-| MCP notifications | supported/unsupported | If unsupported, tmux wake is sole mechanism |
+| MCP notifications | supported/unsupported | If unsupported, tmux wake is sole mechanism (informational) |
 | Compaction resilience | survives/lost | If lost, need CLAUDE.md or re-injection strategy |
 | stream-json capture | parseable/not | Ephemeral fallback viability |
+| Plugin path loading | works/broken | Informs Plan 108 implementation approach |
 
 ## Verdict Template
 
 Fill in after running:
 - `persistent_mcp_pull:` yes | partial | no
 - `tmux_wake:` reliable | flaky | unnecessary
-- `mcp_notifications:` supported | unsupported
+- `mcp_notifications:` supported | unsupported *(informational — does not affect verdict)*
 - `compaction:` acceptable | problematic
 - `ephemeral_stream_json:` parseable | not
+- `plugin_path:` works | broken
 - `recommendation:` persistent | ephemeral-only | persistent-with-workarounds
 - `plan_104_impact:` <how this affects the MCP server plan>
 - `plan_108_impact:` <how this affects the Claude Code plugin plan>
@@ -263,14 +377,15 @@ Fill in after running:
 
 ## Spike Code Location
 
-All prototype code lives in `spike/001/`:
-- `server.go` — minimal MCP server
-- `go.mod` / `go.sum` — independent module (not in main go.mod)
-- `coworker-orchy-skill.md` — test skill file
-- `dispatch.json` — test dispatch payload (mutable during tests)
-- `completed.json` — output from `orch_job_complete` (written by server)
-- `stream-output.jsonl` — captured stream-json output
-- `RESULTS.md` — raw test results (filled during execution)
+All prototype code lives in `spike/001/` and `spike/common/`:
+- `spike/common/mcp-server/main.go` — shared MCP server (used by spikes 001 and 002)
+- `spike/common/mcp-server/go.mod` / `go.sum` — independent module (not in main go.mod)
+- `spike/common/mcp.json` — shared MCP config file referencing the server binary
+- `spike/001/coworker-orchy-skill.md` — test skill file
+- `spike/001/dispatch.json` — test dispatch payload (mutable during tests)
+- `spike/001/completed.json` — output from `orch_job_complete` (written by server)
+- `spike/001/stream-output.jsonl` — captured stream-json output
+- `spike/001/RESULTS.md` — raw test results (filled during execution)
 
 This directory is gitignored from the main build. Prototype code is disposable.
 
@@ -284,13 +399,15 @@ This directory is gitignored from the main build. Prototype code is disposable.
 
 | Test | Result | Notes |
 |---|---|---|
+| 0. CLI availability | | |
 | 1. MCP connection | | |
 | 2. Tool round-trip | | |
 | 3. Skill-driven polling | | |
 | 4. tmux wake-idle | | |
-| 5. MCP notifications | | |
+| 5. MCP notifications (informational) | | |
 | 6. Compaction resilience | | |
 | 7. stream-json capture | | |
+| 8. Plugin path loading | | |
 
 ### Verdict
 
