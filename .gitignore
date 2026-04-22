@@ -1,0 +1,26 @@
+# Binary
+/coworker
+/bin/
+*.exe
+
+# Test output
+*.test
+*.out
+coverage.*
+*.prof
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Go
+vendor/
+
+# Spike prototypes (only docs/plans/00N-*.md are committed)
+/spike/
