@@ -1,0 +1,25 @@
+name: test.role
+concurrency: single
+cli: codex
+prompt_template: prompts/test.md
+inputs:
+  required:
+    - diff_path
+outputs:
+  contract:
+    findings_line_anchored: true
+  emits:
+    findings: []
+sandbox: read-only
+permissions:
+  allowed_tools:
+    - read
+  never: []
+  requires_human: []
+budget:
+  max_tokens_per_job: 10000
+  max_wallclock_minutes: 5
+  max_cost_usd: 1.00
+retry_policy:
+  on_contract_fail: fail
+  on_job_error: retry_once
