@@ -423,10 +423,35 @@ cd spike/common/mcp-server && go build -o spike-mcp-server . && cd -
 ### Review 1
 
 - **Date**: 2026-04-22
-- **Reviewer**: Codex
+- **Reviewer**: Codex (self-review)
 - **PR**: N/A — pre-PR review for plan 002 spike execution updates
 - **Verdict**: Approved
 
-**Must Fix / Should Fix / Nice to Have**
+No open findings. The executed report reflects the real Codex behavior.
 
-No open findings remain in the plan/report bundle. The executed report now reflects the real Codex behavior: bare MCP tool names, the misleading `mcp list --json` result, the `danger-full-access` requirement for noninteractive MCP completion, explicit-turn persistence success, idle-wake failure, resume success, and the stricter schema requirements for `--output-schema`. Residual risk is operational rather than documentary: Codex still needs either an explicit wake phrase or an ephemeral-only role assignment in the runtime design.
+### Review 2
+
+- **Date**: 2026-04-22
+- **Reviewer**: Claude (cross-review of PR #3)
+- **PR**: #3 — Document Spike 002 execution verdict and review
+- **Verdict**: Approved with suggestions
+
+**Should Fix**
+
+1. `[OPEN]` **Verdict `persistent_mcp_pull: partial` is ambiguous — should be `explicit-turn-only`.** "Partial" implies some core tests passed and some didn't. The reality is more specific: explicit-turn persistence works (Test 4 PASS), idle-wake is broken (Test 5 FAIL). Change to `persistent_mcp_pull: explicit-turn-only` and update the recommendation to `ephemeral-primary, persistent-explicit-turn-only` so Plan 104/109 know exactly what works.
+
+2. `[OPEN]` **`danger-full-access` requirement is a security-model-level finding that needs more prominence.** Currently buried in the `sandbox_boundary` verdict line. This has direct implications for `docs/specs/000-coworker-runtime-design.md` §Security Model — if Codex ephemeral dispatch requires `danger-full-access` to complete MCP tool calls, the spec's per-role permission surface is undermined for Codex roles. Add a top-level recommendation: "Plan 109 must document that Codex ephemeral dispatch currently requires `--sandbox danger-full-access`. The security model should treat Codex jobs as `partially-observed` by default until sandbox modes improve."
+
+**Nice to Have**
+
+3. `[OPEN]` Verify no stale `spike/001/` path references remain in the final file.
+
+4. `[OPEN]` Add "Discovered tool names: `orch_next_dispatch`, `orch_job_complete` (bare, no namespace prefix)" near the verdict section so readers don't have to scroll to Test 1 notes. Key difference from Claude Code (which namespaces as `mcp__coworker-spike__orch_next_dispatch`).
+
+5. `[OPEN]` Pin `codex mcp list --json` returning `[]` as a known bug against `codex-cli 0.122.0` so Plan 109 knows to work around it.
+
+6. `[OPEN]` Review 1 says "Reviewer: Codex" — clarified in Review 2 header as self-review.
+
+**Key takeaway for downstream plans:**
+- **Plan 104:** Do not rely on idle-wake (`tmux send-keys Enter`) for Codex persistent workers. If Codex is kept persistent, it needs explicit wake phrases or human-driven turns.
+- **Plan 109:** Treat `danger-full-access` as a first-class constraint. Document the `--output-schema` strict profile requirement (`additionalProperties: false`, fully enumerated `required`).
