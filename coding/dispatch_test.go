@@ -2,6 +2,7 @@ package coding
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -288,6 +289,238 @@ rules:
 	// 1 retry event (between attempt 0 and attempt 1).
 	if retryCount != 1 {
 		t.Errorf("supervisor.retry events = %d, want 1", retryCount)
+	}
+}
+
+func TestOrchestrate_WithSupervisor_MaxRetriesExhausted(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script mock requires unix")
+	}
+
+	repoRoot := findRepoRoot(t)
+	mockBin := filepath.Join(repoRoot, "testdata", "mocks", "codex-bad-findings")
+	if _, err := os.Stat(mockBin); err != nil {
+		t.Fatalf("mock binary not found: %v", err)
+	}
+
+	db, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("Open(:memory:): %v", err)
+	}
+	defer db.Close()
+
+	engine, err := supervisor.NewRuleEngineFromBytes([]byte(`
+rules:
+  findings_have_path:
+    applies_to: [reviewer.*]
+    check: all_findings_have(["path"])
+    message: "findings must have a non-empty path"
+  findings_have_line:
+    applies_to: [reviewer.*]
+    check: all_findings_have(["line"])
+    message: "findings must have a non-zero line"
+`))
+	if err != nil {
+		t.Fatalf("NewRuleEngineFromBytes: %v", err)
+	}
+
+	d := &Dispatcher{
+		RoleDir:    filepath.Join(repoRoot, "coding", "roles"),
+		PromptDir:  filepath.Join(repoRoot, "coding"),
+		Agent:      agent.NewCliAgent(mockBin),
+		DB:         db,
+		Supervisor: engine,
+	}
+
+	ctx := context.Background()
+	result, err := d.Orchestrate(ctx, &DispatchInput{
+		RoleName: "reviewer.arch",
+		Inputs: map[string]string{
+			"diff_path": "/tmp/test.diff",
+			"spec_path": "/tmp/spec.md",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Orchestrate: %v", err)
+	}
+
+	if result.RetryCount != DefaultMaxRetries {
+		t.Errorf("retry count = %d, want %d", result.RetryCount, DefaultMaxRetries)
+	}
+	if result.SupervisorVerdict == nil {
+		t.Fatal("expected supervisor verdict")
+	}
+	if result.SupervisorVerdict.Pass {
+		t.Error("expected final verdict to fail after max retries exhausted")
+	}
+
+	events, err := store.NewEventStore(db).ListEvents(ctx, result.RunID)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	var verdictCount, retryCount, breachCount int
+	var breachPayload struct {
+		JobID       string   `json:"job_id"`
+		Role        string   `json:"role"`
+		FailedRules []string `json:"failed_rules"`
+		Attempts    int      `json:"attempts"`
+	}
+	for _, e := range events {
+		switch e.Kind {
+		case core.EventSupervisorVerdict:
+			verdictCount++
+		case core.EventSupervisorRetry:
+			retryCount++
+		case core.EventComplianceBreach:
+			breachCount++
+			if err := json.Unmarshal([]byte(e.Payload), &breachPayload); err != nil {
+				t.Fatalf("unmarshal compliance-breach payload: %v", err)
+			}
+		}
+	}
+	if verdictCount != DefaultMaxRetries+1 {
+		t.Errorf("supervisor.verdict events = %d, want %d", verdictCount, DefaultMaxRetries+1)
+	}
+	if retryCount != DefaultMaxRetries {
+		t.Errorf("supervisor.retry events = %d, want %d", retryCount, DefaultMaxRetries)
+	}
+	if breachCount != 1 {
+		t.Errorf("compliance-breach events = %d, want 1", breachCount)
+	}
+	if breachPayload.JobID != result.JobID {
+		t.Errorf("compliance-breach job_id = %q, want %q", breachPayload.JobID, result.JobID)
+	}
+	if breachPayload.Role != "reviewer.arch" {
+		t.Errorf("compliance-breach role = %q, want %q", breachPayload.Role, "reviewer.arch")
+	}
+	if breachPayload.Attempts != DefaultMaxRetries+1 {
+		t.Errorf("compliance-breach attempts = %d, want %d", breachPayload.Attempts, DefaultMaxRetries+1)
+	}
+	if len(breachPayload.FailedRules) != 2 {
+		t.Fatalf("compliance-breach failed_rules len = %d, want 2", len(breachPayload.FailedRules))
+	}
+
+	runStore := store.NewRunStore(db, store.NewEventStore(db))
+	run, err := runStore.GetRun(ctx, result.RunID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if run.State != core.RunStateFailed {
+		t.Errorf("run state = %q, want %q", run.State, core.RunStateFailed)
+	}
+
+	jobStore := store.NewJobStore(db, store.NewEventStore(db))
+	job, err := jobStore.GetJob(ctx, result.JobID)
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	if job.State != core.JobStateFailed {
+		t.Errorf("job state = %q, want %q", job.State, core.JobStateFailed)
+	}
+	if job.DispatchedBy != "supervisor-retry" {
+		t.Errorf("dispatched_by = %q, want %q", job.DispatchedBy, "supervisor-retry")
+	}
+}
+
+func TestOrchestrate_WithSupervisor_NoApplicableRules(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script mock requires unix")
+	}
+
+	repoRoot := findRepoRoot(t)
+	mockBin := filepath.Join(repoRoot, "testdata", "mocks", "codex")
+	if _, err := os.Stat(mockBin); err != nil {
+		t.Fatalf("mock binary not found: %v", err)
+	}
+
+	db, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("Open(:memory:): %v", err)
+	}
+	defer db.Close()
+
+	engine, err := supervisor.NewRuleEngineFromBytes([]byte(`
+rules:
+  dev_rule:
+    applies_to: [developer]
+    check: exit_code_is(99)
+    message: "developer must exit 99"
+`))
+	if err != nil {
+		t.Fatalf("NewRuleEngineFromBytes: %v", err)
+	}
+
+	d := &Dispatcher{
+		RoleDir:    filepath.Join(repoRoot, "coding", "roles"),
+		PromptDir:  filepath.Join(repoRoot, "coding"),
+		Agent:      agent.NewCliAgent(mockBin),
+		DB:         db,
+		Supervisor: engine,
+	}
+
+	ctx := context.Background()
+	result, err := d.Orchestrate(ctx, &DispatchInput{
+		RoleName: "reviewer.arch",
+		Inputs: map[string]string{
+			"diff_path": "/tmp/test.diff",
+			"spec_path": "/tmp/spec.md",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Orchestrate: %v", err)
+	}
+
+	if result.SupervisorVerdict == nil {
+		t.Fatal("expected supervisor verdict")
+	}
+	if !result.SupervisorVerdict.Pass {
+		t.Error("expected pass when no rules apply to role")
+	}
+	if result.RetryCount != 0 {
+		t.Errorf("retry count = %d, want 0", result.RetryCount)
+	}
+
+	events, err := store.NewEventStore(db).ListEvents(ctx, result.RunID)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	var verdictCount, retryCount, breachCount int
+	for _, e := range events {
+		switch e.Kind {
+		case core.EventSupervisorVerdict:
+			verdictCount++
+		case core.EventSupervisorRetry:
+			retryCount++
+		case core.EventComplianceBreach:
+			breachCount++
+		}
+	}
+	if verdictCount != 1 {
+		t.Errorf("supervisor.verdict events = %d, want 1", verdictCount)
+	}
+	if retryCount != 0 {
+		t.Errorf("supervisor.retry events = %d, want 0", retryCount)
+	}
+	if breachCount != 0 {
+		t.Errorf("compliance-breach events = %d, want 0", breachCount)
+	}
+
+	runStore := store.NewRunStore(db, store.NewEventStore(db))
+	run, err := runStore.GetRun(ctx, result.RunID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if run.State != core.RunStateCompleted {
+		t.Errorf("run state = %q, want %q", run.State, core.RunStateCompleted)
+	}
+
+	jobStore := store.NewJobStore(db, store.NewEventStore(db))
+	job, err := jobStore.GetJob(ctx, result.JobID)
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	if job.State != core.JobStateComplete {
+		t.Errorf("job state = %q, want %q", job.State, core.JobStateComplete)
 	}
 }
 
