@@ -2,23 +2,43 @@ package coding
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/chris/coworker/coding/roles"
+	"github.com/chris/coworker/coding/supervisor"
 	"github.com/chris/coworker/core"
 	"github.com/chris/coworker/store"
 )
 
+// DefaultMaxRetries is the default maximum number of supervisor retries
+// before escalating to a compliance-breach event.
+const DefaultMaxRetries = 3
+
 // Dispatcher orchestrates the end-to-end flow: load role -> create run/job
-// -> render prompt -> dispatch agent -> capture result -> persist findings.
+// -> render prompt -> dispatch agent -> capture result -> supervisor check
+// -> persist findings (with retry loop on contract failure).
 type Dispatcher struct {
 	RoleDir   string // path to directory containing role YAML files
 	PromptDir string // path to directory containing prompt template files
 	Agent     core.Agent
 	DB        *store.DB
 	Logger    *slog.Logger
+
+	// Supervisor is the optional rule engine. If nil, no contract
+	// checks are performed (equivalent to all-pass).
+	Supervisor *supervisor.RuleEngine
+
+	// MaxRetries is the maximum number of supervisor retries per job.
+	// Zero means use DefaultMaxRetries. Negative means no retries.
+	MaxRetries int
+
+	// WorkDir is the working directory for git-based predicates.
+	// If empty, git predicates use the current working directory.
+	WorkDir string
 }
 
 // DispatchInput contains the inputs for a dispatch operation.
@@ -33,6 +53,13 @@ type DispatchResult struct {
 	JobID    string
 	Findings []core.Finding
 	ExitCode int
+
+	// SupervisorVerdict is the final verdict from the last evaluation.
+	// Nil if no supervisor engine was configured.
+	SupervisorVerdict *core.SupervisorVerdict
+
+	// RetryCount is the number of supervisor retries that occurred.
+	RetryCount int
 }
 
 // Orchestrate runs the full dispatch pipeline for an ephemeral job.
@@ -75,22 +102,6 @@ func (d *Dispatcher) Orchestrate(ctx context.Context, input *DispatchInput) (*Di
 	}
 	logger.Info("created run", "id", runID)
 
-	// 5. Create a job.
-	jobID := core.NewID()
-	job := &core.Job{
-		ID:           jobID,
-		RunID:        runID,
-		Role:         role.Name,
-		State:        core.JobStatePending,
-		DispatchedBy: "user",
-		CLI:          role.CLI,
-		StartedAt:    time.Now(),
-	}
-	if err := jobStore.CreateJob(ctx, job); err != nil {
-		return nil, fmt.Errorf("create job: %w", err)
-	}
-	logger.Info("created job", "id", jobID, "role", role.Name)
-
 	// 6. Render the prompt template.
 	tmpl, err := roles.LoadPromptTemplate(d.PromptDir, role.PromptTemplate)
 	if err != nil {
@@ -104,56 +115,186 @@ func (d *Dispatcher) Orchestrate(ctx context.Context, input *DispatchInput) (*Di
 		tmplData[snakeToPascal(k)] = v
 	}
 
-	prompt, err := roles.RenderPrompt(tmpl, tmplData)
+	originalPrompt, err := roles.RenderPrompt(tmpl, tmplData)
 	if err != nil {
 		return nil, fmt.Errorf("render prompt: %w", err)
 	}
 
-	// 7. Update job state to dispatched.
-	if err := jobStore.UpdateJobState(ctx, jobID, core.JobStateDispatched); err != nil {
-		return nil, fmt.Errorf("update job to dispatched: %w", err)
+	maxRetries := d.maxRetries()
+	var lastVerdict *core.SupervisorVerdict
+	var lastJobID string
+	var lastResult *core.JobResult
+	retryCount := 0
+	prompt := originalPrompt
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		// 5. Create a job.
+		jobID := core.NewID()
+		dispatchedBy := "user"
+		if attempt > 0 {
+			dispatchedBy = "supervisor-retry"
+		}
+		job := &core.Job{
+			ID:           jobID,
+			RunID:        runID,
+			Role:         role.Name,
+			State:        core.JobStatePending,
+			DispatchedBy: dispatchedBy,
+			CLI:          role.CLI,
+			StartedAt:    time.Now(),
+		}
+		if err := jobStore.CreateJob(ctx, job); err != nil {
+			return nil, fmt.Errorf("create job: %w", err)
+		}
+		logger.Info("created job", "id", jobID, "role", role.Name, "attempt", attempt)
+
+		// 7. Update job state to dispatched.
+		if err := jobStore.UpdateJobState(ctx, jobID, core.JobStateDispatched); err != nil {
+			return nil, fmt.Errorf("update job to dispatched: %w", err)
+		}
+
+		// 8. Dispatch to the agent.
+		handle, err := d.Agent.Dispatch(ctx, job, prompt)
+		if err != nil {
+			jobStore.UpdateJobState(ctx, jobID, core.JobStateFailed) //nolint:errcheck
+			return nil, fmt.Errorf("dispatch agent: %w", err)
+		}
+		logger.Info("dispatched to agent", "cli", role.CLI, "attempt", attempt)
+
+		// 9. Wait for result.
+		result, err := handle.Wait(ctx)
+		if err != nil {
+			jobStore.UpdateJobState(ctx, jobID, core.JobStateFailed) //nolint:errcheck
+			return nil, fmt.Errorf("wait for agent: %w", err)
+		}
+		logger.Info("agent completed", "findings", len(result.Findings), "exit_code", result.ExitCode, "attempt", attempt)
+
+		lastJobID = jobID
+		lastResult = result
+
+		// 10. Supervisor evaluation (if configured).
+		if d.Supervisor != nil {
+			evalCtx := &supervisor.EvalContext{
+				Job:     job,
+				Result:  result,
+				Role:    role,
+				RunID:   runID,
+				WorkDir: d.WorkDir,
+			}
+
+			verdict, evalErr := d.Supervisor.Evaluate(evalCtx)
+			if evalErr != nil {
+				logger.Error("supervisor evaluation error", "error", evalErr)
+				// Treat evaluation error as a pass — don't block the job
+				// for engine bugs.
+				verdict = &core.SupervisorVerdict{Pass: true}
+			}
+			lastVerdict = verdict
+
+			// Emit supervisor.verdict event.
+			verdictPayload := d.marshalVerdictPayload(jobID, verdict)
+			verdictEvent := &core.Event{
+				ID:            core.NewID(),
+				RunID:         runID,
+				Kind:          core.EventSupervisorVerdict,
+				SchemaVersion: 1,
+				CorrelationID: jobID,
+				Payload:       verdictPayload,
+				CreatedAt:     time.Now(),
+			}
+			if writeErr := eventStore.WriteEventThenRow(ctx, verdictEvent, nil); writeErr != nil {
+				logger.Error("failed to write supervisor.verdict event", "error", writeErr)
+			}
+
+			if !verdict.Pass && attempt < maxRetries {
+				// Retry: update current job to failed, emit retry event.
+				jobStore.UpdateJobState(ctx, jobID, core.JobStateFailed) //nolint:errcheck
+
+				feedback := d.buildRetryFeedback(verdict)
+				prompt = feedback + "\n\n" + originalPrompt
+				retryCount++
+
+				// Emit supervisor.retry event.
+				retryPayload, _ := json.Marshal(map[string]interface{}{
+					"job_id":       jobID,
+					"attempt":      attempt + 1,
+					"feedback":     feedback,
+					"failed_rules": verdict.FailedMessages(),
+				})
+				retryEvent := &core.Event{
+					ID:            core.NewID(),
+					RunID:         runID,
+					Kind:          core.EventSupervisorRetry,
+					SchemaVersion: 1,
+					CorrelationID: jobID,
+					Payload:       string(retryPayload),
+					CreatedAt:     time.Now(),
+				}
+				if writeErr := eventStore.WriteEventThenRow(ctx, retryEvent, nil); writeErr != nil {
+					logger.Error("failed to write supervisor.retry event", "error", writeErr)
+				}
+
+				logger.Info("supervisor retry", "attempt", attempt+1, "failed_rules", len(verdict.FailedMessages()))
+				continue
+			}
+
+			if !verdict.Pass && attempt >= maxRetries {
+				// Max retries exhausted — escalate.
+				logger.Warn("supervisor max retries exhausted, emitting compliance-breach",
+					"job_id", jobID, "attempts", attempt+1)
+
+				breachPayload, _ := json.Marshal(map[string]interface{}{
+					"job_id":       jobID,
+					"role":         role.Name,
+					"failed_rules": verdict.FailedMessages(),
+					"attempts":     attempt + 1,
+				})
+				breachEvent := &core.Event{
+					ID:            core.NewID(),
+					RunID:         runID,
+					Kind:          core.EventComplianceBreach,
+					SchemaVersion: 1,
+					CorrelationID: jobID,
+					Payload:       string(breachPayload),
+					CreatedAt:     time.Now(),
+				}
+				if writeErr := eventStore.WriteEventThenRow(ctx, breachEvent, nil); writeErr != nil {
+					logger.Error("failed to write compliance-breach event", "error", writeErr)
+				}
+			}
+		}
+
+		// Supervisor passed (or not configured) — persist findings and finalize.
+		break
 	}
 
-	// 8. Dispatch to the agent.
-	handle, err := d.Agent.Dispatch(ctx, job, prompt)
-	if err != nil {
-		jobStore.UpdateJobState(ctx, jobID, core.JobStateFailed) //nolint:errcheck
-		return nil, fmt.Errorf("dispatch agent: %w", err)
-	}
-	logger.Info("dispatched to agent", "cli", role.CLI)
-
-	// 9. Wait for result.
-	result, err := handle.Wait(ctx)
-	if err != nil {
-		jobStore.UpdateJobState(ctx, jobID, core.JobStateFailed) //nolint:errcheck
-		return nil, fmt.Errorf("wait for agent: %w", err)
-	}
-	logger.Info("agent completed", "findings", len(result.Findings), "exit_code", result.ExitCode)
-
-	// 10. Persist findings.
-	for i := range result.Findings {
-		f := &result.Findings[i]
+	// 11. Persist findings from the final attempt.
+	for i := range lastResult.Findings {
+		f := &lastResult.Findings[i]
 		f.RunID = runID
-		f.JobID = jobID
+		f.JobID = lastJobID
 		if f.ID == "" {
 			f.ID = core.NewID()
 		}
 		if err := findingStore.InsertFinding(ctx, f); err != nil {
 			logger.Error("failed to persist finding", "error", err, "path", f.Path, "line", f.Line)
-			// Continue persisting other findings.
 		}
 	}
 
-	// 11. Update job state to complete (or failed).
+	// 12. Update job state to complete (or failed).
 	finalState := core.JobStateComplete
-	if result.ExitCode != 0 {
+	if lastResult.ExitCode != 0 {
 		finalState = core.JobStateFailed
 	}
-	if err := jobStore.UpdateJobState(ctx, jobID, finalState); err != nil {
+	// If supervisor verdict failed after max retries, mark as failed.
+	if lastVerdict != nil && !lastVerdict.Pass {
+		finalState = core.JobStateFailed
+	}
+	if err := jobStore.UpdateJobState(ctx, lastJobID, finalState); err != nil {
 		return nil, fmt.Errorf("update job to %s: %w", finalState, err)
 	}
 
-	// 12. Complete the run.
+	// 13. Complete the run.
 	runState := core.RunStateCompleted
 	if finalState == core.JobStateFailed {
 		runState = core.RunStateFailed
@@ -163,11 +304,60 @@ func (d *Dispatcher) Orchestrate(ctx context.Context, input *DispatchInput) (*Di
 	}
 
 	return &DispatchResult{
-		RunID:    runID,
-		JobID:    jobID,
-		Findings: result.Findings,
-		ExitCode: result.ExitCode,
+		RunID:             runID,
+		JobID:             lastJobID,
+		Findings:          lastResult.Findings,
+		ExitCode:          lastResult.ExitCode,
+		SupervisorVerdict: lastVerdict,
+		RetryCount:        retryCount,
 	}, nil
+}
+
+// maxRetries returns the effective max retry count.
+func (d *Dispatcher) maxRetries() int {
+	if d.MaxRetries < 0 {
+		return 0
+	}
+	if d.MaxRetries == 0 {
+		return DefaultMaxRetries
+	}
+	return d.MaxRetries
+}
+
+// buildRetryFeedback constructs the supervisor feedback string
+// prepended to the prompt on retry.
+func (d *Dispatcher) buildRetryFeedback(verdict *core.SupervisorVerdict) string {
+	msgs := verdict.FailedMessages()
+	var sb strings.Builder
+	sb.WriteString("SUPERVISOR FEEDBACK: The following contract rules were violated:\n")
+	for i, msg := range msgs {
+		sb.WriteString(fmt.Sprintf("  %d. %s\n", i+1, msg))
+	}
+	sb.WriteString("Please fix these issues and try again.")
+	return sb.String()
+}
+
+// marshalVerdictPayload serializes a verdict to JSON for the event payload.
+func (d *Dispatcher) marshalVerdictPayload(jobID string, verdict *core.SupervisorVerdict) string {
+	type resultJSON struct {
+		RuleName string `json:"rule_name"`
+		Passed   bool   `json:"passed"`
+		Message  string `json:"message"`
+	}
+	var results []resultJSON
+	for _, r := range verdict.Results {
+		results = append(results, resultJSON{
+			RuleName: r.RuleName,
+			Passed:   r.Passed,
+			Message:  r.Message,
+		})
+	}
+	payload, _ := json.Marshal(map[string]interface{}{
+		"job_id":  jobID,
+		"pass":    verdict.Pass,
+		"results": results,
+	})
+	return string(payload)
 }
 
 // snakeToPascal converts "diff_path" to "DiffPath".

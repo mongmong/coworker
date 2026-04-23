@@ -1,0 +1,22 @@
+#!/bin/bash
+# Mock codex CLI that returns bad findings on first call and good
+# findings on second call. Uses a state file to track attempts.
+#
+# The state file path is passed via the COWORKER_MOCK_STATE env var.
+# If not set, defaults to /tmp/codex-retry-state.
+
+cat > /dev/null
+
+STATE_FILE="${COWORKER_MOCK_STATE:-/tmp/codex-retry-state}"
+
+if [ ! -f "$STATE_FILE" ]; then
+    # First call: emit bad findings (missing path/line).
+    echo '{"type":"finding","path":"","line":0,"severity":"important","body":"Missing error check"}'
+    echo '{"type":"done","exit_code":0}'
+    echo "1" > "$STATE_FILE"
+else
+    # Subsequent calls: emit good findings.
+    echo '{"type":"finding","path":"main.go","line":42,"severity":"important","body":"Missing error check on Close()"}'
+    echo '{"type":"finding","path":"store.go","line":17,"severity":"minor","body":"Consider using prepared statement"}'
+    echo '{"type":"done","exit_code":0}'
+fi

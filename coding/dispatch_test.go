@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/chris/coworker/agent"
+	"github.com/chris/coworker/coding/supervisor"
 	"github.com/chris/coworker/core"
 	"github.com/chris/coworker/store"
 )
@@ -113,6 +114,180 @@ func TestOrchestrate_WithMockCodex(t *testing.T) {
 		for i, e := range events {
 			t.Logf("  event[%d]: seq=%d kind=%s", i, e.Sequence, e.Kind)
 		}
+	}
+}
+
+func TestOrchestrate_WithSupervisor_AllPass(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script mock requires unix")
+	}
+
+	repoRoot := findRepoRoot(t)
+	mockBin := filepath.Join(repoRoot, "testdata", "mocks", "codex")
+
+	db, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("Open(:memory:): %v", err)
+	}
+	defer db.Close()
+
+	// The mock codex emits findings with path and line, so
+	// all_findings_have(["path", "line"]) should pass.
+	engine, err := supervisor.NewRuleEngineFromBytes([]byte(`
+rules:
+  findings_have_path_line:
+    applies_to: [reviewer.*]
+    check: all_findings_have(["path", "line"])
+    message: "findings must have path and line"
+`))
+	if err != nil {
+		t.Fatalf("NewRuleEngineFromBytes: %v", err)
+	}
+
+	d := &Dispatcher{
+		RoleDir:    filepath.Join(repoRoot, "coding", "roles"),
+		PromptDir:  filepath.Join(repoRoot, "coding"),
+		Agent:      agent.NewCliAgent(mockBin),
+		DB:         db,
+		Supervisor: engine,
+	}
+
+	ctx := context.Background()
+	result, err := d.Orchestrate(ctx, &DispatchInput{
+		RoleName: "reviewer.arch",
+		Inputs: map[string]string{
+			"diff_path": "/tmp/test.diff",
+			"spec_path": "/tmp/spec.md",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Orchestrate: %v", err)
+	}
+
+	if result.SupervisorVerdict == nil {
+		t.Fatal("expected supervisor verdict, got nil")
+	}
+	if !result.SupervisorVerdict.Pass {
+		t.Error("expected supervisor pass")
+	}
+	if result.RetryCount != 0 {
+		t.Errorf("retry count = %d, want 0", result.RetryCount)
+	}
+
+	// Verify supervisor.verdict event was emitted.
+	events, err := store.NewEventStore(db).ListEvents(ctx, result.RunID)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	var hasVerdictEvent bool
+	for _, e := range events {
+		if e.Kind == core.EventSupervisorVerdict {
+			hasVerdictEvent = true
+			break
+		}
+	}
+	if !hasVerdictEvent {
+		t.Error("expected supervisor.verdict event in event log")
+		for i, e := range events {
+			t.Logf("  event[%d]: seq=%d kind=%s", i, e.Sequence, e.Kind)
+		}
+	}
+}
+
+func TestOrchestrate_WithSupervisor_RetryThenPass(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script mock requires unix")
+	}
+
+	repoRoot := findRepoRoot(t)
+	mockBin := filepath.Join(repoRoot, "testdata", "mocks", "codex-retry-then-pass")
+	if _, err := os.Stat(mockBin); err != nil {
+		t.Fatalf("mock binary not found: %v", err)
+	}
+
+	// Create a unique state file for this test.
+	stateFile := filepath.Join(t.TempDir(), "retry-state")
+	t.Setenv("COWORKER_MOCK_STATE", stateFile)
+	t.Cleanup(func() { os.Remove(stateFile) })
+
+	db, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("Open(:memory:): %v", err)
+	}
+	defer db.Close()
+
+	engine, err := supervisor.NewRuleEngineFromBytes([]byte(`
+rules:
+  findings_have_path:
+    applies_to: [reviewer.*]
+    check: all_findings_have(["path"])
+    message: "findings must have path"
+  findings_have_line:
+    applies_to: [reviewer.*]
+    check: all_findings_have(["line"])
+    message: "findings must have line"
+`))
+	if err != nil {
+		t.Fatalf("NewRuleEngineFromBytes: %v", err)
+	}
+
+	d := &Dispatcher{
+		RoleDir:    filepath.Join(repoRoot, "coding", "roles"),
+		PromptDir:  filepath.Join(repoRoot, "coding"),
+		Agent:      agent.NewCliAgent(mockBin),
+		DB:         db,
+		Supervisor: engine,
+		MaxRetries: 3,
+	}
+
+	ctx := context.Background()
+	result, err := d.Orchestrate(ctx, &DispatchInput{
+		RoleName: "reviewer.arch",
+		Inputs: map[string]string{
+			"diff_path": "/tmp/test.diff",
+			"spec_path": "/tmp/spec.md",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Orchestrate: %v", err)
+	}
+
+	// Should have retried once, then passed.
+	if result.RetryCount != 1 {
+		t.Errorf("retry count = %d, want 1", result.RetryCount)
+	}
+	if result.SupervisorVerdict == nil {
+		t.Fatal("expected supervisor verdict")
+	}
+	if !result.SupervisorVerdict.Pass {
+		t.Error("expected final verdict to pass")
+	}
+	// Final findings should be the good ones (2 findings with path/line).
+	if len(result.Findings) != 2 {
+		t.Errorf("findings count = %d, want 2", len(result.Findings))
+	}
+
+	// Verify events include supervisor.verdict and supervisor.retry.
+	events, err := store.NewEventStore(db).ListEvents(ctx, result.RunID)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	var verdictCount, retryCount int
+	for _, e := range events {
+		switch e.Kind {
+		case core.EventSupervisorVerdict:
+			verdictCount++
+		case core.EventSupervisorRetry:
+			retryCount++
+		}
+	}
+	// 2 verdicts: one for failed attempt, one for passing attempt.
+	if verdictCount != 2 {
+		t.Errorf("supervisor.verdict events = %d, want 2", verdictCount)
+	}
+	// 1 retry event (between attempt 0 and attempt 1).
+	if retryCount != 1 {
+		t.Errorf("supervisor.retry events = %d, want 1", retryCount)
 	}
 }
 

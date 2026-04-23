@@ -1,0 +1,17 @@
+# Seed rule catalog — built-in contract rules for the supervisor.
+# Per-repo overrides go in .coworker/rules/supervisor-contract.yaml.
+rules:
+  reviewer_findings_line_anchored:
+    applies_to: [reviewer.*]
+    check: all_findings_have(["path", "line"])
+    message: "All reviewer findings must have both path and line references"
+
+  reviewer_findings_have_severity:
+    applies_to: [reviewer.*]
+    check: all_findings_have(["severity"])
+    message: "All reviewer findings must include a severity level"
+
+  reviewer_findings_have_body:
+    applies_to: [reviewer.*]
+    check: all_findings_have(["body"])
+    message: "All reviewer findings must include a body description"
