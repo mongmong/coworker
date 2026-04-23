@@ -138,6 +138,12 @@ func (d *Dispatcher) Orchestrate(ctx context.Context, input *DispatchInput) (*Di
 	prompt := originalPrompt
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
 		attemptResult, err := d.executeAttempt(ctx, logger, eventStore, jobStore, runID, role, prompt, originalPrompt, attempt, maxRetries)
 		if err != nil {
 			return nil, err

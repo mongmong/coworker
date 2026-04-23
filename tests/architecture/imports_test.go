@@ -45,3 +45,32 @@ func TestCoreDoesNotImportCoding(t *testing.T) {
 			strings.Join(violations, "\n  "))
 	}
 }
+
+func TestSupervisorDoesNotImportStore(t *testing.T) {
+	out, err := exec.Command("go", "list",
+		"-f", "{{.ImportPath}}: {{.Imports}}",
+		modulePath+"/coding/supervisor/...").CombinedOutput()
+	if err != nil {
+		t.Fatalf("go list failed: %v\n%s", err, out)
+	}
+
+	trimmed := strings.TrimSpace(string(out))
+	if trimmed == "" {
+		t.Fatal("go list matched no packages")
+	}
+
+	forbidden := modulePath + "/store"
+	var violations []string
+	for _, line := range strings.Split(trimmed, "\n") {
+		if line == "" {
+			continue
+		}
+		if strings.Contains(line, forbidden) {
+			violations = append(violations, line)
+		}
+	}
+	if len(violations) > 0 {
+		t.Errorf("supervisor imports store (forbidden):\n  %s",
+			strings.Join(violations, "\n  "))
+	}
+}

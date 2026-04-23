@@ -14,6 +14,32 @@ import (
 	"github.com/chris/coworker/store"
 )
 
+type stubJobHandle struct {
+	wait func(ctx context.Context) (*core.JobResult, error)
+}
+
+func (h stubJobHandle) Wait(ctx context.Context) (*core.JobResult, error) {
+	return h.wait(ctx)
+}
+
+func (stubJobHandle) Cancel() error {
+	return nil
+}
+
+type countingAgent struct {
+	dispatches int
+	wait       func(ctx context.Context, job *core.Job, prompt string) (*core.JobResult, error)
+}
+
+func (a *countingAgent) Dispatch(ctx context.Context, job *core.Job, prompt string) (core.JobHandle, error) {
+	a.dispatches++
+	return stubJobHandle{
+		wait: func(waitCtx context.Context) (*core.JobResult, error) {
+			return a.wait(waitCtx, job, prompt)
+		},
+	}, nil
+}
+
 func findRepoRoot(t *testing.T) string {
 	t.Helper()
 	wd, err := os.Getwd()
@@ -579,6 +605,63 @@ func TestOrchestrate_InvalidRole(t *testing.T) {
 	})
 	if err == nil {
 		t.Error("expected error for invalid role, got nil")
+	}
+}
+
+func TestOrchestrate_CanceledBeforeRetry(t *testing.T) {
+	repoRoot := findRepoRoot(t)
+
+	db, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("Open(:memory:): %v", err)
+	}
+	defer db.Close()
+
+	engine, err := supervisor.NewRuleEngineFromBytes([]byte(`
+rules:
+  exit_zero:
+    applies_to: [reviewer.*]
+    check: exit_code_is(0)
+    message: "reviewer must exit zero"
+`))
+	if err != nil {
+		t.Fatalf("NewRuleEngineFromBytes: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	agent := &countingAgent{
+		wait: func(ctx context.Context, job *core.Job, prompt string) (*core.JobResult, error) {
+			cancel()
+			return &core.JobResult{
+				ExitCode: 1,
+			}, nil
+		},
+	}
+
+	d := &Dispatcher{
+		RoleDir:    filepath.Join(repoRoot, "coding", "roles"),
+		PromptDir:  filepath.Join(repoRoot, "coding"),
+		Agent:      agent,
+		DB:         db,
+		Supervisor: engine,
+		MaxRetries: 3,
+	}
+
+	result, err := d.Orchestrate(ctx, &DispatchInput{
+		RoleName: "reviewer.arch",
+		Inputs: map[string]string{
+			"diff_path": "/tmp/test.diff",
+			"spec_path": "/tmp/spec.md",
+		},
+	})
+	if result != nil {
+		t.Fatalf("result = %#v, want nil", result)
+	}
+	if err != context.Canceled {
+		t.Fatalf("Orchestrate error = %v, want %v", err, context.Canceled)
+	}
+	if agent.dispatches != 1 {
+		t.Fatalf("dispatches = %d, want 1", agent.dispatches)
 	}
 }
 

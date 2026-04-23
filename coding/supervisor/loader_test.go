@@ -1,6 +1,7 @@
 package supervisor
 
 import (
+	"slices"
 	"testing"
 )
 
@@ -184,9 +185,78 @@ func TestRoleGlobMatches(t *testing.T) {
 		{"*.*", "abc", false},
 	}
 	for _, tt := range tests {
-		got := roleGlobMatches(tt.pattern, tt.name)
+		compiled, err := compileRoleGlobs([]string{tt.pattern})
+		if err != nil {
+			t.Fatalf("compileRoleGlobs(%q): %v", tt.pattern, err)
+		}
+		got := roleGlobMatches(compiled, tt.name)
 		if got != tt.want {
 			t.Errorf("roleGlobMatches(%q, %q) = %v, want %v", tt.pattern, tt.name, got, tt.want)
 		}
+	}
+}
+
+func TestLoadRulesFromBytes_SortsRulesByName(t *testing.T) {
+	yaml := []byte(`
+rules:
+  z_rule:
+    applies_to: [developer]
+    check: exit_code_is(0)
+    message: "z"
+  a_rule:
+    applies_to: [developer]
+    check: exit_code_is(0)
+    message: "a"
+  m_rule:
+    applies_to: [developer]
+    check: exit_code_is(0)
+    message: "m"
+`)
+
+	for i := 0; i < 25; i++ {
+		rl, err := LoadRulesFromBytes(yaml)
+		if err != nil {
+			t.Fatalf("LoadRulesFromBytes: %v", err)
+		}
+
+		var got []string
+		for _, rule := range rl.Rules {
+			got = append(got, rule.Name)
+		}
+
+		want := []string{"a_rule", "m_rule", "z_rule"}
+		if !slices.Equal(got, want) {
+			t.Fatalf("rule order = %v, want %v", got, want)
+		}
+	}
+}
+
+func TestRulesForRole_EscapesRegexMetaCharacters(t *testing.T) {
+	rl, err := LoadRulesFromBytes([]byte(`
+rules:
+  plus_rule:
+    applies_to: ["dev+ops"]
+    check: exit_code_is(0)
+    message: "plus"
+  bracket_rule:
+    applies_to: ["release[1]"]
+    check: exit_code_is(0)
+    message: "bracket"
+`))
+	if err != nil {
+		t.Fatalf("LoadRulesFromBytes: %v", err)
+	}
+
+	if matched := rl.RulesForRole("dev+ops"); len(matched) != 1 || matched[0].Name != "plus_rule" {
+		t.Fatalf("RulesForRole(dev+ops) = %v, want plus_rule", matched)
+	}
+	if matched := rl.RulesForRole("devvops"); len(matched) != 0 {
+		t.Fatalf("RulesForRole(devvops) matched %v, want none", matched)
+	}
+	if matched := rl.RulesForRole("release[1]"); len(matched) != 1 || matched[0].Name != "bracket_rule" {
+		t.Fatalf("RulesForRole(release[1]) = %v, want bracket_rule", matched)
+	}
+	if matched := rl.RulesForRole("release1"); len(matched) != 0 {
+		t.Fatalf("RulesForRole(release1) matched %v, want none", matched)
 	}
 }
