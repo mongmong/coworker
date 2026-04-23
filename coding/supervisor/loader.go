@@ -13,7 +13,7 @@ import (
 
 // Rule is a single contract rule parsed from YAML.
 type Rule struct {
-	Name      string   `yaml:"-"`       // populated from the map key
+	Name      string   `yaml:"-"` // populated from the map key
 	AppliesTo []string `yaml:"applies_to"`
 	Check     string   `yaml:"check"`
 	Message   string   `yaml:"message"`

@@ -3,8 +3,8 @@ package core
 // Supervisor EventKinds.
 const (
 	EventSupervisorVerdict EventKind = "supervisor.verdict"
-	EventSupervisorRetry EventKind = "supervisor.retry"
-	EventComplianceBreach EventKind = "compliance-breach"
+	EventSupervisorRetry   EventKind = "supervisor.retry"
+	EventComplianceBreach  EventKind = "compliance-breach"
 )
 
 type SupervisorVerdict struct {
