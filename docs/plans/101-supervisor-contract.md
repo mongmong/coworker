@@ -2657,4 +2657,42 @@ _To be written after implementation is complete._
 
 ## Code Review
 
-_To be written after implementation, before shipping._
+### Review 1
+
+- **Date**: 2026-04-23
+- **Reviewer**: Claude (full implementation review)
+- **Verdict**: Approved with suggestions
+
+**Should Fix**
+
+1. `[FIXED]` **`roleGlobMatches` compiles a regex on every call — no caching.** `coding/supervisor/loader.go:98-110`.
+   → Response: Added `compiled []*regexp.Regexp` field to Rule struct, populated during LoadRulesFromBytes.
+
+2. `[FIXED]` **`roleGlobMatches` only escapes dots, not all regex meta-chars.** `coding/supervisor/loader.go:99-104`.
+   → Response: Replaced with `regexp.QuoteMeta` + `\*` → `.*` conversion.
+
+3. `[FIXED]` **Context cancellation not checked between retry iterations.** `coding/dispatch.go:140-156`.
+   → Response: Added `select { case <-ctx.Done(): return nil, ctx.Err() default: }` at loop top.
+
+4. `[WONTFIX]` **`ParseCheck` regex `.+` rejects zero-arg predicates.** `coding/supervisor/predicates.go:58`.
+   → Response: No zero-arg predicates exist or are planned. Documented as intentional restriction.
+
+**Nice to Have**
+
+5. `[WONTFIX]` `Severity` type comparison with `""` — works, cosmetic only.
+
+6. `[WONTFIX]` `stripQuotes` deviation using `strconv.Unquote` — intentional and correct.
+
+7. `[FIXED]` **Non-deterministic rule iteration order from YAML map.** `coding/supervisor/loader.go:52-59`.
+   → Response: Added `sort.Slice(rules, ...)` by Name after loading.
+
+8. `[WONTFIX]` **Missing test for context cancellation mid-retry.** Defer to when retry loop gets more complex.
+
+9. `[WONTFIX]` Intermediate-attempt findings discarded — by design per plan.
+
+10. `[FIXED]` **Architecture test doesn't cover `coding/supervisor/` → `store/` import ban.**
+   → Response: Added `TestSupervisorDoesNotImportStore` to `tests/architecture/imports_test.go`.
+
+11. `[WONTFIX]` **Git predicates don't use `exec.CommandContext`.** Defer to Plan 103+ when context threading through EvalContext is designed.
+
+**Strengths noted:** Clean separation (engine is pure logic, no store imports), comprehensive test suite (44+ tests), backward-compatible nil-Supervisor path, well-designed mock scripts with state file pattern.
