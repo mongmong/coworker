@@ -1,6 +1,6 @@
 # Plan 002 — Spike: Codex Persistent MCP Pull
 
-**Goal:** Determine whether Codex can act as a persistent MCP-pull worker — connecting to a custom stdio MCP server, polling `orch.next_dispatch()` at each turn end, returning structured output via `orch.job_complete()`, and being woken from idle via tmux — or whether it should remain ephemeral-only.
+**Goal:** Determine whether Codex can act as a persistent MCP-pull worker — connecting to a custom stdio MCP server, polling `orch.next_dispatch()` at each turn end, returning structured output via `orch.job_complete()`, and surviving both explicit follow-up turns and idle wake attempts — or whether it should remain ephemeral-only.
 
 **Duration:** ~1 day
 
@@ -70,20 +70,38 @@ Build the shared MCP server if not already built:
 cd spike/common/mcp-server && go build -o spike-mcp-server . && cd -
 ```
 
+The shared spike server defaults to `spike/001` unless `SPIKE_DIR` is set. For this plan, Codex must register the server with:
+
+```text
+SPIKE_DIR=/home/chris/workshop/coworker/spike/002
+```
+
 **Steps:**
 1. Register the MCP server with Codex:
    ```bash
-   /home/chris/.nvm/versions/node/v20.20.1/bin/codex mcp add coworker-spike -- /home/chris/workshop/coworker/spike/common/mcp-server/spike-mcp-server
+   /home/chris/.nvm/versions/node/v20.20.1/bin/codex mcp add \
+     --env SPIKE_DIR=/home/chris/workshop/coworker/spike/002 \
+     coworker-spike -- /home/chris/workshop/coworker/spike/common/mcp-server/spike-mcp-server
    ```
 2. Verify registration: `/home/chris/.nvm/versions/node/v20.20.1/bin/codex mcp list` — confirm `coworker-spike` appears.
 3. Verify with `/home/chris/.nvm/versions/node/v20.20.1/bin/codex mcp list --json` for machine-readable output.
-4. Start Codex interactively and check tool availability:
+4. Confirm the configured server in machine-readable form:
    ```bash
-   /home/chris/.nvm/versions/node/v20.20.1/bin/codex "List all available MCP tools. Do you see orch_next_dispatch and orch_job_complete?"
+   /home/chris/.nvm/versions/node/v20.20.1/bin/codex mcp list --json | tee spike/002/mcp-list.json
    ```
-5. Check if Codex can see both tools.
+5. Run a non-interactive discovery prompt and capture the **exact** tool names Codex exposes:
+   ```bash
+   /home/chris/.nvm/versions/node/v20.20.1/bin/codex exec --json \
+     "List the exact MCP tool names available from the coworker-spike server. Return only the tool names." \
+     2>/dev/null | tee spike/002/tool-discovery.jsonl
+   ```
+6. Record the actual names discovered for use in the remaining tests:
+   - `<next_dispatch_tool>`
+   - `<job_complete_tool>`
 
-**Expected result:** Codex discovers both tools from the MCP server.
+**Important:** Every later test must use the exact discovered tool names. Do **not** assume bare `orch_next_dispatch` / `orch_job_complete`; if Codex namespaces MCP tools, use the namespaced forms everywhere.
+
+**Expected result:** Codex discovers both tools from the MCP server, and the exact callable names are known before Tests 2–8 run.
 
 **Failure mode:**
 - Server fails to start → check stderr, verify binary path
@@ -97,7 +115,7 @@ cd spike/common/mcp-server && go build -o spike-mcp-server . && cd -
 **Question:** Can Codex call `orch_next_dispatch`, process a dispatch, and call `orch_job_complete` in ephemeral mode?
 
 **Setup:**
-Set `spike/001/dispatch.json`:
+Set `spike/002/dispatch.json`:
 ```json
 {
   "status": "dispatched",
@@ -111,16 +129,18 @@ Set `spike/001/dispatch.json`:
 **Steps:**
 1. Run Codex in exec mode:
    ```bash
-   /home/chris/.nvm/versions/node/v20.20.1/bin/codex exec "Call the orch_next_dispatch tool. If it returns a dispatch with status 'dispatched', execute the task in the prompt field. When done, call orch_job_complete with the job_id and your structured findings as JSON." 2>&1 | tee spike/002/exec-output.txt
+   /home/chris/.nvm/versions/node/v20.20.1/bin/codex exec \
+     "Call the <next_dispatch_tool> tool. If it returns a dispatch with status 'dispatched', execute the task in the prompt field. When done, call <job_complete_tool> with the job_id and your structured findings as JSON." \
+     2>&1 | tee spike/002/exec-output.txt
    ```
-2. Check `spike/001/completed.json` for the completion payload.
+2. Check `spike/002/completed.json` for the completion payload.
 3. Verify structured JSON output.
 
 **Expected result:** `completed.json` contains structured findings with the correct `job_id`.
 
 **Failure mode:**
 - Codex doesn't call MCP tools in exec mode → MCP servers may not load for `codex exec`
-- Calls `orch_next_dispatch` but not `orch_job_complete` → prompting issue
+- Calls `<next_dispatch_tool>` but not `<job_complete_tool>` → prompting issue
 - Sandbox blocks file write → need `--sandbox workspace-write` or `--full-auto`
 
 ---
@@ -130,16 +150,16 @@ Set `spike/001/dispatch.json`:
 **Question:** Does `codex exec --json` produce parseable JSONL events that capture MCP tool calls and results?
 
 **Steps:**
-1. Reset `dispatch.json` to the test dispatch.
+1. Reset `spike/002/dispatch.json` to the test dispatch.
 2. Run:
    ```bash
    /home/chris/.nvm/versions/node/v20.20.1/bin/codex exec --json \
-     "Call orch_next_dispatch. If dispatched, execute the task and call orch_job_complete with findings." \
+     "Call <next_dispatch_tool>. If dispatched, execute the task and call <job_complete_tool> with findings." \
      2>/dev/null | tee spike/002/exec-jsonl.txt
    ```
 3. Parse each line of output as JSON.
 4. Identify event types — look for tool-call events, tool-result events, assistant messages.
-5. Check if MCP tool calls (`orch_next_dispatch`, `orch_job_complete`) appear in the event stream.
+5. Check if MCP tool calls (`<next_dispatch_tool>`, `<job_complete_tool>`) appear in the event stream.
 
 **Expected result:** JSONL output is parseable; MCP tool calls are visible in the event stream.
 
@@ -150,43 +170,64 @@ Set `spike/001/dispatch.json`:
 
 ---
 
-### Test 4: Interactive session — persistent polling feasibility
+### Test 4: Interactive session — explicit-turn persistence
 
-**Question:** Can Codex maintain a polling loop in an interactive session, similar to Claude Code's skill-driven approach?
+**Question:** Can Codex preserve the polling instruction across an explicit second turn in an interactive session?
 
-**Setup:**
-Start Codex interactively in a tmux pane.
+**Setup:** Start Codex interactively in a tmux pane.
 
 **Steps:**
-1. Set `dispatch.json` to `{"status": "idle"}`.
+1. Set `spike/002/dispatch.json` to `{"status": "idle"}`.
 2. Start Codex in tmux:
    ```bash
-   tmux new-session -d -s spike002 "/home/chris/.nvm/versions/node/v20.20.1/bin/codex 'You are connected to the coworker orchestrator. At the end of every response, you MUST call orch_next_dispatch to check for work. If idle, say Waiting. If dispatched, execute and call orch_job_complete, then poll again.'"
+   tmux new-session -d -s spike002 "cd /home/chris/workshop/coworker && /home/chris/.nvm/versions/node/v20.20.1/bin/codex 'You are connected to the coworker orchestrator. At the end of every response, you MUST call <next_dispatch_tool> to check for work. If idle, say Waiting. If dispatched, execute and call <job_complete_tool>, then poll again.'"
    ```
-3. Observe: Does Codex call `orch_next_dispatch` after responding?
-4. If yes, update `dispatch.json` with a test dispatch.
-5. Send wake: `tmux send-keys -t spike002 Enter`
-6. Observe: Does Codex pick up the dispatch?
+3. Send an initial prompt in the tmux pane, for example: `Hello, check for work.`
+4. Observe whether Codex calls `<next_dispatch_tool>`, reaches idle, and remains ready for another turn.
+5. Update `spike/002/dispatch.json` with a test dispatch.
+6. Send an explicit second turn, for example: `tmux send-keys -t spike002 "Check for work again." C-m`
+7. Observe whether Codex preserves the polling instruction, handles the dispatch, calls `<job_complete_tool>`, and returns to idle.
 
-**Expected result:** Codex maintains the polling behavior across turns.
+**Expected result:** Codex preserves the polling behavior across explicit consecutive turns: idle → explicit second turn → dispatch → complete → poll again.
 
 **Failure mode:**
 - Codex doesn't support persistent system prompt injection in interactive mode → persistent model not viable
-- Polling works on first turn but not subsequent → instruction lost after turn
-- tmux send-keys doesn't wake Codex TUI → Codex TUI may handle input differently than Claude Code
-- If persistent polling fails → **Codex is ephemeral-only** (via `codex exec`), which is the expected fallback
+- Polling works on the first turn but not the second → instruction lost after turn
+- If explicit-turn persistence fails → persistent polling is not viable and Codex is **ephemeral-only**
 
 ---
 
-### Test 5: Session resume with MCP tools
+### Test 5: Interactive session — idle wake reliability
+
+**Question:** If Codex reaches an idle prompt after Test 4, can `tmux send-keys ... Enter` start a new turn reliably enough to make persistent mode useful?
+
+**Setup:** Reuse the tmux session from Test 4 if explicit-turn persistence succeeded.
+
+**Steps:**
+1. Let the session sit idle for 30 seconds after it reports waiting / reaches its idle prompt.
+2. Update `spike/002/dispatch.json` with a new dispatch.
+3. Send: `tmux send-keys -t spike002 Enter`
+4. Wait up to 10 seconds. Check whether Codex starts a new turn.
+5. Repeat with longer idle times (for example 60s and 120s) if the first attempt works at all.
+6. Record success/failure for each attempt.
+
+**Expected result:** Codex starts a new turn reliably enough that the wake mechanism is operationally useful.
+
+**Failure mode:**
+- Enter does not trigger a new turn → idle wake is broken for the current Codex TUI path
+- Wake is flaky → document the rate and downgrade the recommendation accordingly
+
+---
+
+### Test 6: Session resume with MCP tools
 
 **Question:** If we use `codex resume` to continue a session, are MCP tools still available?
 
 **Steps:**
-1. Start an interactive Codex session, call `orch_next_dispatch` once, then exit.
+1. Start an interactive Codex session, call `<next_dispatch_tool>` once, then exit.
 2. Note the session ID from `/home/chris/.nvm/versions/node/v20.20.1/bin/codex resume --last` or the session output.
 3. Resume: `/home/chris/.nvm/versions/node/v20.20.1/bin/codex resume --last`
-4. Ask Codex to call `orch_next_dispatch` again.
+4. Ask Codex to call `<next_dispatch_tool>` again.
 5. Verify the MCP server is re-launched and tools are available.
 
 **Expected result:** MCP tools are available in resumed sessions.
@@ -195,7 +236,7 @@ Start Codex interactively in a tmux pane.
 
 ---
 
-### Test 6: `codex exec` with `--output-schema` for structured output
+### Test 7: `codex exec` with `--output-schema` for structured output
 
 **Question:** Can we enforce structured JSON output from Codex using `--output-schema`?
 
@@ -226,12 +267,12 @@ Write `spike/002/findings-schema.json`:
 ```
 
 **Steps:**
-1. Reset `dispatch.json`.
+1. Reset `spike/002/dispatch.json`.
 2. Run:
    ```bash
    /home/chris/.nvm/versions/node/v20.20.1/bin/codex exec \
      --output-schema spike/002/findings-schema.json \
-     "Call orch_next_dispatch. Execute the dispatched task. Call orch_job_complete. Then output your findings." \
+     "Call <next_dispatch_tool>. Execute the dispatched task. Call <job_complete_tool>. Then output your findings." \
      2>/dev/null | tee spike/002/schema-output.txt
    ```
 3. Verify the output conforms to the schema.
@@ -242,25 +283,26 @@ Write `spike/002/findings-schema.json`:
 
 ---
 
-### Test 7: Sandbox interaction with MCP server
+### Test 8: Sandbox interaction with MCP server
 
 **Question:** How do Codex sandbox modes interact with the MCP server's file I/O?
 
 **Framing:** The goal is to **measure** whether MCP subprocesses can read/write outside the Codex workspace. Document the boundary. Feed findings into the security model (docs/specs/000 §Security Model).
 
 **Steps:**
-1. Run Test 2 with each sandbox mode:
+1. Run Test 2 with each real sandbox mode:
    ```bash
-   /home/chris/.nvm/versions/node/v20.20.1/bin/codex exec --sandbox read-only "Call orch_next_dispatch and orch_job_complete..." 
-   /home/chris/.nvm/versions/node/v20.20.1/bin/codex exec --sandbox workspace-write "Call orch_next_dispatch and orch_job_complete..."
-   /home/chris/.nvm/versions/node/v20.20.1/bin/codex exec --full-auto "Call orch_next_dispatch and orch_job_complete..."
+   /home/chris/.nvm/versions/node/v20.20.1/bin/codex exec --sandbox read-only "Call <next_dispatch_tool> and <job_complete_tool>..."
+   /home/chris/.nvm/versions/node/v20.20.1/bin/codex exec --sandbox workspace-write "Call <next_dispatch_tool> and <job_complete_tool>..."
+   /home/chris/.nvm/versions/node/v20.20.1/bin/codex exec --sandbox danger-full-access "Call <next_dispatch_tool> and <job_complete_tool>..."
    ```
-2. For each mode, record:
+2. Optionally run one additional ergonomics check with `--full-auto` to confirm that its alias behavior matches `--sandbox workspace-write` for this use case.
+3. For each mode, record:
    - Does the MCP server start? (stdio subprocess may be affected by sandbox)
-   - Can the server write `completed.json`?
-   - Can the server read `dispatch.json`?
+   - Can the server write `spike/002/completed.json`?
+   - Can the server read `spike/002/dispatch.json`?
    - Are Codex's own file operations sandboxed independently of MCP?
-3. Document the exact sandbox boundary — which operations are blocked, which pass through.
+4. Document the exact sandbox boundary — which operations are blocked, which pass through.
 
 **Expected result:** Neutral observation of the boundary. Record whether MCP server I/O is sandboxed or independent for each mode.
 
@@ -274,17 +316,25 @@ Persistent mode is viable **only if BOTH of the following pass:**
 
 | Gate | Required Test(s) | Criterion |
 |---|---|---|
-| Interactive polling | Test 4 | Codex maintains polling behavior across at least 2 consecutive turns |
-| Session resume | Test 5 | MCP tools are available after `codex resume` |
+| Explicit-turn persistence | Test 4 | Codex maintains polling behavior across at least 2 consecutive explicit turns |
+| Session resume | Test 6 | MCP tools are available after `codex resume` |
 
 **If either gate fails:** Codex is **ephemeral-only** (via `codex exec`). This is the expected fallback and is still a valuable operating mode for review/test roles.
+
+**Wake reliability is a separate qualifier:**
+
+| Gate | Required Test(s) | Criterion |
+|---|---|---|
+| Idle wake | Test 5 | `tmux send-keys ... Enter` is reliable enough to make an idle persistent session operationally useful |
+
+If Test 4 passes but Test 5 fails, record the result as **persistent-with-workarounds** or **explicit-turn-only**, not a clean persistent success.
 
 **Ephemeral mode requires:**
 
 | Gate | Required Test(s) | Criterion |
 |---|---|---|
 | `codex exec` round-trip | Test 2 | Codex calls both tools and produces structured output |
-| Output capture | Test 3 or Test 6 | At least one of `--json` JSONL or `--output-schema` produces parseable output |
+| Output capture | Test 3 or Test 7 | At least one of `--json` JSONL or `--output-schema` produces parseable output |
 
 ---
 
@@ -295,8 +345,8 @@ Persistent mode is viable **only if BOTH of the following pass:**
 | MCP tool discovery | yes/no | Foundational |
 | `codex exec` tool round-trip | yes/no | Ephemeral mode viability |
 | `codex exec --json` capture | parseable/not | Event stream integration |
-| Interactive polling | yes/no | Persistent mode viability |
-| tmux wake (interactive) | works/broken | If broken + polling fails → ephemeral only |
+| Explicit-turn persistence | yes/no | Persistent polling viability |
+| tmux wake (interactive) | works/flaky/broken | Qualifies whether idle persistent mode is practical |
 | Session resume + MCP | yes/no | Persistent session continuity |
 | `--output-schema` enforcement | yes/no | Structured output capture path |
 | Sandbox + MCP interaction | clean/problematic | Deployment model |
@@ -333,25 +383,83 @@ cd spike/common/mcp-server && go build -o spike-mcp-server . && cd -
 
 ## Post-Execution Report
 
-*(fill in after running the spike)*
-
 ### Test Results
 
 | Test | Result | Notes |
 |---|---|---|
-| 0. CLI availability | | |
-| 1. MCP connection | | |
-| 2. exec tool round-trip | | |
-| 3. exec --json capture | | |
-| 4. Interactive polling | | |
-| 5. Session resume + MCP | | |
-| 6. --output-schema | | |
-| 7. Sandbox + MCP | | |
+| 0. CLI availability | PASS | `codex-cli 0.122.0`; expected subcommands and flags were present in `--help`. |
+| 1. MCP connection | PASS | `codex mcp list` and `~/.codex/config.toml` confirmed registration; discovery prompt exposed bare `orch_next_dispatch` and `orch_job_complete`. `codex mcp list --json` returned `[]`, which appears to be a CLI quirk. |
+| 2. exec tool round-trip | PARTIAL | Default noninteractive exec cancelled MCP calls. The full round-trip succeeded with `--sandbox danger-full-access` and wrote `completed.json`. |
+| 3. exec --json capture | PASS | `spike/002/exec-jsonl.txt` is parseable JSONL and includes MCP tool-call events plus results. |
+| 4. Explicit-turn persistence | PASS | Interactive Codex preserved the polling instruction across an explicit second turn and repolled after completion. |
+| 5. Idle wake reliability | FAIL | After 30 seconds idle, bare `tmux send-keys ... Enter` did not start a new turn. |
+| 6. Session resume + MCP | PASS | `codex resume --last` restored MCP tool availability and successfully called `orch_next_dispatch` again. |
+| 7. --output-schema | PASS | Structured JSON output worked once the schema added `additionalProperties: false` and required every declared property. |
+| 8. Sandbox + MCP | PARTIAL | `read-only` and `workspace-write` both cancelled noninteractive MCP calls; `danger-full-access` completed the job and file I/O. |
 
 ### Verdict
 
-*(fill in using verdict template above)*
+- `persistent_mcp_pull:` explicit-turn-only
+- `ephemeral_exec:` partial
+- `tmux_wake:` broken
+- `output_capture:` jsonl + schema
+- `discovered_tool_names:` `orch_next_dispatch`, `orch_job_complete` (bare MCP tool names; no namespace prefix in prompts)
+- `sandbox_boundary:` In `codex exec`, `read-only` and `workspace-write` both failed at the MCP tool-call stage with `user cancelled MCP tool call`; `danger-full-access` allowed the full dispatch/complete flow. In interactive mode, Codex could use MCP tools after explicit per-tool approval inside the TUI.
+- `recommendation:` ephemeral-primary, persistent-explicit-turn-only
+- `plan_104_impact:` Codex can preserve explicit-turn polling and resume MCP-backed sessions, but the current empty-enter wake assumption does not hold. Plan 104 should not rely on idle wake for Codex. If Codex is kept as a persistent worker, it needs a deterministic explicit wake phrase or human-driven turns; unattended pull workers should remain non-Codex for now.
+- `plan_109_impact:` The Codex integration should treat `danger-full-access` and approval behavior as first-class constraints. Codex ephemeral dispatch currently required `--sandbox danger-full-access` in this spike, so the security model should treat Codex jobs as partially observed until sandbox behavior improves. Plugin/runtime work should also record that `codex mcp list --json` was misleading in `codex-cli 0.122.0` and that `--output-schema` requires a stricter schema profile than the plan originally assumed.
 
 ### Recommendations for Plan 104 / 109
 
-*(fill in based on findings)*
+1. Treat Codex as **not cleanly autonomous-persistent** under the current tmux wake design. Its polling contract survives explicit turns, but bare idle wake is broken.
+2. Keep Codex viable for **ephemeral review/test roles**, but document prominently that the working noninteractive path currently requires `--sandbox danger-full-access`.
+3. If Plan 104 wants interactive Codex workers, allow a deterministic fixed wake phrase rather than relying on empty Enter. Do not send job content through tmux; only send a neutral wake command.
+4. Tighten any schema-based output capture in Plan 109: Codex requires `additionalProperties: false` and fully enumerated `required` arrays for `--output-schema`.
+5. Plan 109 should document that Codex ephemeral dispatch was only proven with `--sandbox danger-full-access`; until sandbox behavior improves, treat Codex job execution as partially observed in the security model.
+6. Do not trust `codex mcp list --json` alone as the source of truth for registration in `codex-cli 0.122.0`; confirm with `codex mcp list`, tool discovery, or config inspection.
+
+---
+
+## Code Review
+
+### Review 1
+
+- **Date**: 2026-04-22
+- **Reviewer**: Codex (self-review)
+- **PR**: N/A — pre-PR review for plan 002 spike execution updates
+- **Verdict**: Approved
+
+No open findings. The executed report reflects the real Codex behavior.
+
+### Review 2
+
+- **Date**: 2026-04-22
+- **Reviewer**: Claude (cross-review of PR #3)
+- **PR**: #3 — Document Spike 002 execution verdict and review
+- **Verdict**: Approved with suggestions
+
+**Should Fix**
+
+1. `[FIXED]` **Verdict `persistent_mcp_pull: partial` is ambiguous — should be `explicit-turn-only`.** "Partial" implies some core tests passed and some didn't. The reality is more specific: explicit-turn persistence works (Test 4 PASS), idle-wake is broken (Test 5 FAIL). Change to `persistent_mcp_pull: explicit-turn-only` and update the recommendation to `ephemeral-primary, persistent-explicit-turn-only` so Plan 104/109 know exactly what works.
+   → Response: Updated the verdict to `explicit-turn-only` and changed the top-level recommendation to `ephemeral-primary, persistent-explicit-turn-only`.
+
+2. `[FIXED]` **`danger-full-access` requirement is a security-model-level finding that needs more prominence.** Currently buried in the `sandbox_boundary` verdict line. This has direct implications for `docs/specs/000-coworker-runtime-design.md` §Security Model — if Codex ephemeral dispatch requires `danger-full-access` to complete MCP tool calls, the spec's per-role permission surface is undermined for Codex roles. Add a top-level recommendation: "Plan 109 must document that Codex ephemeral dispatch currently requires `--sandbox danger-full-access`. The security model should treat Codex jobs as `partially-observed` by default until sandbox modes improve."
+   → Response: Promoted this into both `plan_109_impact` and the numbered recommendations so the security implication is explicit rather than implicit in `sandbox_boundary`.
+
+**Nice to Have**
+
+3. `[WONTFIX]` Verify no stale `spike/001/` path references remain in the final file.
+   → Response: Checked the remaining `spike/001` reference. It is intentional documentation of the shared spike server default before `SPIKE_DIR` override, not a stale copy/paste path.
+
+4. `[FIXED]` Add "Discovered tool names: `orch_next_dispatch`, `orch_job_complete` (bare, no namespace prefix)" near the verdict section so readers don't have to scroll to Test 1 notes. Key difference from Claude Code (which namespaces as `mcp__coworker-spike__orch_next_dispatch`).
+   → Response: Added `discovered_tool_names` to the verdict block.
+
+5. `[FIXED]` Pin `codex mcp list --json` returning `[]` as a known bug against `codex-cli 0.122.0` so Plan 109 knows to work around it.
+   → Response: Tied the workaround note explicitly to `codex-cli 0.122.0` in the recommendations and `plan_109_impact`.
+
+6. `[FIXED]` Review 1 says "Reviewer: Codex" — clarified in Review 2 header as self-review.
+   → Response: Review 1 already reads `Codex (self-review)`, so reviewer identity is unambiguous.
+
+**Key takeaway for downstream plans:**
+- **Plan 104:** Do not rely on idle-wake (`tmux send-keys Enter`) for Codex persistent workers. If Codex is kept persistent, it needs explicit wake phrases or human-driven turns.
+- **Plan 109:** Treat `danger-full-access` as a first-class constraint. Document the `--output-schema` strict profile requirement (`additionalProperties: false`, fully enumerated `required`).

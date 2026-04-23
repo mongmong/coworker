@@ -150,6 +150,19 @@ Follow `docs/code-review.md`. Key points:
 - Reviewers: append findings with `[OPEN]` status and file:line references.
 - Authors: respond inline with `→ Response:` and `[FIXED]` / `[WONTFIX]`.
 
+## Codex Delegation (GPT-5.4)
+
+Use the `codex:rescue` skill to delegate complex tasks to Codex (GPT-5.4) when:
+
+- A coding task requires deep reasoning, architectural analysis, or multi-file refactoring that benefits from a second model's perspective.
+- You are stuck on a bug, failing test, or design problem after two attempts.
+- A task involves sandboxed execution (Codex runs in an isolated environment).
+- The user explicitly requests Codex involvement.
+
+Codex is available via `codex-cli 0.122.0` with ChatGPT auth. It runs on demand — no persistent process needed. Use `codex:rescue` for investigation and fix requests; use the `codex:codex-rescue` subagent type for substantial coding tasks dispatched through the Agent tool.
+
+Do NOT use Codex for trivial tasks, file reads, or simple searches — those are faster done directly. Reserve it for tasks where a fresh context + different model adds real value.
+
 ## Multi-Agent Coordination (building-the-builder caveat)
 
 This project builds a multi-agent runtime, and we ourselves will often work on it with multiple Claude Code sessions against the same repo. Until coworker exists to coordinate its own development, the same handoff rules apply:

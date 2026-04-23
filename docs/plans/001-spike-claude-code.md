@@ -86,18 +86,23 @@ The server uses `mcp.StdioTransport{}` and logs all tool calls to stderr.
      }
    }
    ```
-3. Register with Claude Code:
+3. Register with Claude Code (optional project-scoped registration for inspection):
    ```bash
-   /home/chris/.local/bin/claude mcp add --scope local -t stdio coworker-spike -- /home/chris/workshop/coworker/spike/common/mcp-server/spike-mcp-server
+   /home/chris/.local/bin/claude mcp add-json --scope project coworker-spike '{"type":"stdio","command":"/home/chris/workshop/coworker/spike/common/mcp-server/spike-mcp-server","args":[]}'
    ```
 4. Verify registration: `/home/chris/.local/bin/claude mcp list` — confirm `coworker-spike` appears and is healthy.
 5. Start Claude Code in print mode to test tool discovery:
    ```bash
-   /home/chris/.local/bin/claude -p "List all available MCP tools. Do you see orch_next_dispatch and orch_job_complete?"
+   /home/chris/.local/bin/claude -p \
+     --mcp-config /home/chris/workshop/coworker/spike/common/mcp.json \
+     --strict-mcp-config \
+     "List all available MCP tools. Do you see mcp__coworker-spike__orch_next_dispatch and mcp__coworker-spike__orch_job_complete?"
    ```
-6. Verify Claude Code sees both tools in its response.
+6. Verify Claude Code sees both tools in their namespaced form:
+   - `mcp__coworker-spike__orch_next_dispatch`
+   - `mcp__coworker-spike__orch_job_complete`
 
-**Expected result:** Claude Code discovers both tools and can list them.
+**Expected result:** Claude Code discovers both tools and can list them in namespaced form.
 
 **Failure mode:** Tools not discovered → check server stderr for connection issues. If stdio transport fails, try HTTP transport as fallback.
 
@@ -125,7 +130,8 @@ Write `spike/001/dispatch.json`:
    ```bash
    /home/chris/.local/bin/claude -p \
      --mcp-config /home/chris/workshop/coworker/spike/common/mcp.json \
-     "Call the orch_next_dispatch tool. If it returns a dispatch with status 'dispatched', execute the role described in the prompt field. When done, call orch_job_complete with the job_id from the dispatch and your outputs as structured JSON."
+     --strict-mcp-config \
+     "Call the mcp__coworker-spike__orch_next_dispatch tool. If it returns a dispatch with status 'dispatched', execute the role described in the prompt field. When done, call mcp__coworker-spike__orch_job_complete with the job_id from the dispatch and your outputs as structured JSON."
    ```
 3. Check `spike/001/completed.json` for the completion payload.
 4. Verify the completion contains valid JSON with the expected structure.
@@ -135,7 +141,7 @@ Write `spike/001/dispatch.json`:
 **Failure mode:**
 - Claude Code doesn't call the tools → skill/instruction issue
 - Calls `orch_next_dispatch` but not `orch_job_complete` → the two-step polling pattern needs reinforcement
-- Output is unstructured text instead of JSON → need `--json-schema` flag or stronger prompting
+- Output is unstructured text instead of JSON → strengthen the prompt or inspect the MCP completion payload directly
 
 ---
 
@@ -150,29 +156,30 @@ Create a skill file at `spike/001/coworker-orchy-skill.md`:
 
 ## Instructions
 
-You are connected to the coworker orchestrator via MCP. At the END of every response you give, you MUST call the `orch_next_dispatch` tool to check for new work.
+You are connected to the coworker orchestrator via MCP. At the END of every response you give, you MUST call the `mcp__coworker-spike__orch_next_dispatch` tool to check for new work.
 
-- If `orch_next_dispatch` returns `{"status": "idle"}`, say "Waiting for dispatch..." and stop.
-- If it returns a dispatch with `status: "dispatched"`, execute the task described in the `prompt` field, then call `orch_job_complete` with the `job_id` and your structured outputs.
-- After calling `orch_job_complete`, call `orch_next_dispatch` again to check for more work.
+- If `mcp__coworker-spike__orch_next_dispatch` returns `{"status": "idle"}`, say "Waiting for dispatch..." and stop.
+- If it returns a dispatch with `status: "dispatched"`, execute the task described in the `prompt` field, then call `mcp__coworker-spike__orch_job_complete` with the `job_id` and your structured outputs.
+- After calling `mcp__coworker-spike__orch_job_complete`, call `mcp__coworker-spike__orch_next_dispatch` again to check for more work.
 
-This polling behavior is mandatory. Never skip the `orch_next_dispatch` call at turn end.
+This polling behavior is mandatory. Never skip the `mcp__coworker-spike__orch_next_dispatch` call at turn end.
 ```
 
 **Steps:**
 1. Set `dispatch.json` to `{"status": "idle"}`.
 2. Start Claude Code interactively in a tmux pane with the skill:
    ```bash
-   tmux new-session -d -s spike001 "/home/chris/.local/bin/claude --system-prompt-file spike/001/coworker-orchy-skill.md --mcp-config /home/chris/workshop/coworker/spike/common/mcp.json"
+   tmux new-session -d -s spike001 "cd /home/chris/workshop/coworker && /home/chris/.local/bin/claude --system-prompt-file /home/chris/workshop/coworker/spike/001/coworker-orchy-skill.md --mcp-config /home/chris/workshop/coworker/spike/common/mcp.json --strict-mcp-config"
    ```
 3. In the Claude Code session, type: "Hello, check for work."
 4. Observe: Claude should call `orch_next_dispatch`, get idle, and report waiting.
 5. Now update `dispatch.json` to the test dispatch from Test 2.
-6. Send a wake nudge: `tmux send-keys -t spike001 Enter`
-7. Observe: Claude should call `orch_next_dispatch`, get the dispatch, execute it, call `orch_job_complete`, and then poll again.
-8. Check `completed.json` for the output.
+6. Send a second explicit turn first (for example `tmux send-keys -t spike001 "Check for work again." C-m`) to verify the polling instruction survives across turns.
+7. Separately test an idle wake nudge with `tmux send-keys -t spike001 Enter` (validated in Test 4).
+8. Observe whether Claude continues the polling contract on the explicit second turn, then check whether bare Enter can wake an idle prompt.
+9. Check `completed.json` for the output.
 
-**Expected result:** The polling loop works: idle → wake → dispatch → complete → poll again.
+**Expected result:** The polling instruction persists across explicit user turns: idle → explicit second turn → dispatch → complete → poll again. Bare Enter wake is a separate gate in Test 4.
 
 **Failure mode:**
 - Claude doesn't poll after the first turn → skill instructions not persistent enough; try CLAUDE.md approach
@@ -254,9 +261,10 @@ Extend `spike/common/mcp-server/main.go` to send a `notifications/message` or `t
 **Steps:**
 1. Run:
    ```bash
-   /home/chris/.local/bin/claude -p --output-format stream-json \
+   /home/chris/.local/bin/claude -p --verbose --output-format stream-json \
      --mcp-config /home/chris/workshop/coworker/spike/common/mcp.json \
-     "Call orch_next_dispatch. If you get a dispatch, execute it and call orch_job_complete. Output your findings as JSON." \
+     --strict-mcp-config \
+     "Call mcp__coworker-spike__orch_next_dispatch. If you get a dispatch, execute it and call mcp__coworker-spike__orch_job_complete. Output your findings as JSON." \
      2>/dev/null | tee spike/001/stream-output.jsonl
    ```
 2. Parse `stream-output.jsonl` — verify each line is valid JSON.
@@ -284,11 +292,11 @@ Extend `spike/common/mcp-server/main.go` to send a `notifications/message` or `t
 
    ## Instructions
 
-   You are connected to the coworker orchestrator via MCP. At the END of every response you give, you MUST call the `orch_next_dispatch` tool to check for new work.
+   You are connected to the coworker orchestrator via MCP. At the END of every response you give, you MUST call the `mcp__coworker-spike__orch_next_dispatch` tool to check for new work.
 
-   - If `orch_next_dispatch` returns `{"status": "idle"}`, say "Waiting for dispatch..." and stop.
-   - If it returns a dispatch with `status: "dispatched"`, execute the task described in the `prompt` field, then call `orch_job_complete` with the `job_id` and your structured outputs.
-   - After calling `orch_job_complete`, call `orch_next_dispatch` again to check for more work.
+   - If `mcp__coworker-spike__orch_next_dispatch` returns `{"status": "idle"}`, say "Waiting for dispatch..." and stop.
+   - If it returns a dispatch with `status: "dispatched"`, execute the task described in the `prompt` field, then call `mcp__coworker-spike__orch_job_complete` with the `job_id` and your structured outputs.
+   - After calling `mcp__coworker-spike__orch_job_complete`, call `mcp__coworker-spike__orch_next_dispatch` again to check for more work.
    ```
 3. Write `.mcp.json` at the project root:
    ```json
@@ -307,7 +315,7 @@ Extend `spike/common/mcp-server/main.go` to send a `notifications/message` or `t
 1. Set `spike/001/dispatch.json` to the test dispatch from Test 2.
 2. Launch Claude Code **without** `--system-prompt-file` or `--mcp-config` flags — rely on `.mcp.json` and the plugin directory:
    ```bash
-   /home/chris/.local/bin/claude -p "Use the /coworker-orchy skill. Then call orch_next_dispatch and follow its instructions."
+   /home/chris/.local/bin/claude -p "Use the /coworker-orchy skill. Then call mcp__coworker-spike__orch_next_dispatch and follow its instructions."
    ```
 3. Verify Claude Code:
    - Discovers the MCP server from `.mcp.json`
@@ -336,7 +344,7 @@ Persistent mode is viable **only if ALL of the following pass:**
 | Polling across turns | Test 3 | Skill-driven polling persists across at least 3 consecutive turns (idle → dispatch → idle) |
 | Wake reliability | Test 4 | tmux send-keys wakes idle session at least 4/5 times within 10 seconds |
 
-**If any gate fails:** persistent mode is not viable. Fall back to ephemeral-only (`claude -p --output-format stream-json`).
+**If any gate fails:** persistent mode is not viable. Fall back to ephemeral-only (`claude -p --verbose --output-format stream-json`).
 
 **Informational tests (do not gate the verdict):**
 - Test 0 (CLI availability) — prerequisite validation
@@ -393,26 +401,61 @@ This directory is gitignored from the main build. Prototype code is disposable.
 
 ## Post-Execution Report
 
-*(fill in after running the spike)*
-
 ### Test Results
 
 | Test | Result | Notes |
 |---|---|---|
-| 0. CLI availability | | |
-| 1. MCP connection | | |
-| 2. Tool round-trip | | |
-| 3. Skill-driven polling | | |
-| 4. tmux wake-idle | | |
-| 5. MCP notifications (informational) | | |
-| 6. Compaction resilience | | |
-| 7. stream-json capture | | |
-| 8. Plugin path loading | | |
+| 0. CLI availability | PASS | `claude --version` returned `2.1.117`; required flags were present in `--help`. |
+| 1. MCP connection | PASS | Both MCP tools were discovered in namespaced form. Project registration via `claude mcp add-json` also worked. |
+| 2. Tool round-trip | PASS | Claude called `mcp__coworker-spike__orch_next_dispatch`, executed the review prompt, and completed via `mcp__coworker-spike__orch_job_complete`. |
+| 3. Skill-driven polling | PARTIAL | Polling instructions persisted across explicit subsequent turns. Claude handled idle -> explicit second turn -> dispatch -> complete -> poll again. |
+| 4. tmux wake-idle | FAIL | Bare `tmux send-keys ... Enter` did not start a new turn in controlled 30s and 60s idle tests; earlier exploratory `Enter`/`C-m` nudges also failed. |
+| 5. MCP notifications (informational) | NOT RUN | Deferred once wake-idle already failed and explicit-turn polling had been characterized. |
+| 6. Compaction resilience | NOT RUN | Deferred; useful for long-session hardening but not needed to decide the core verdict. |
+| 7. stream-json capture | PASS | `claude -p --verbose --output-format stream-json` produced parseable JSONL with tool-use and tool-result events. `--verbose` was required. |
+| 8. Plugin path loading | PASS | `.claude/plugins/...` plus root `.mcp.json` loaded successfully; Claude used `/coworker-orchy` and completed the dispatched job. |
 
 ### Verdict
 
-*(fill in using verdict template above)*
+- `persistent_mcp_pull:` partial
+- `tmux_wake:` broken
+- `mcp_notifications:` untested
+- `compaction:` untested
+- `ephemeral_stream_json:` parseable
+- `plugin_path:` works
+- `recommendation:` ephemeral-only
+- `plan_104_impact:` Claude Code can execute MCP pull jobs and produce structured completions, but the spec's idle wake assumption is not validated. Plan 104 should not assume tmux Enter can wake an idle Claude worker. Either keep Claude in ephemeral mode, use a stronger wake primitive, or redesign the pull contract around explicit dispatch turns.
+- `plan_108_impact:` The real plugin path works: `.claude/plugins/` plus `.mcp.json` is a viable loading mechanism for Claude-side orchestration instructions. Plugin packaging should use namespaced MCP tool names and document that `--verbose` is required for stream-json capture in CLI fallback paths.
 
 ### Recommendations for Plan 104 / 108
 
-*(fill in based on findings)*
+1. Treat Claude persistent mode as **not production-viable** until a reliable wake mechanism exists.
+2. Keep the Claude integration capable of **ephemeral pull execution** using `-p --verbose --output-format stream-json` for deterministic capture.
+3. Use the real plugin path (`.claude/plugins/` + `.mcp.json`) for Plan 108, not just `--system-prompt-file`.
+4. Do not model production queue semantics on the file-based spike harness. The spike server still has known limitations: read-and-consume is not atomic across multiple pollers, and completion storage is overwrite-oriented rather than append-only.
+
+---
+
+## Code Review
+
+### Review 1
+
+- **Date**: 2026-04-21
+- **Reviewer**: Codex
+- **PR**: N/A — pre-PR review for plan 001 spike execution updates
+- **Verdict**: Approved
+
+**Must Fix / Should Fix / Nice to Have**
+
+No open findings. The plan now matches the executed Claude Code behavior: namespaced MCP tool names, `claude mcp add-json` registration, `--verbose` for stream-json, and a split between explicit-turn polling success and idle-wake failure. The remaining limitations are captured in the verdict and recommendations rather than left implicit.
+
+### Review 2
+
+- **Date**: 2026-04-21
+- **Reviewer**: Codex
+- **PR**: N/A — pre-PR review for spec alignment on top of plan 001 findings
+- **Verdict**: Approved
+
+**Must Fix / Should Fix / Nice to Have**
+
+No open findings. The follow-on spec edits are coherent with the spike result: V1 scope now treats Codex as worker-only by default, the runtime spec no longer assumes tmux wake is a valid generic fallback, and the bulletin-board design stays additive rather than rewriting the scheduler model. Residual risk remains in unrun spikes 002 and 003, but that uncertainty is explicitly preserved as roadmap dependency rather than hidden in the spec text.
