@@ -14,11 +14,13 @@ import (
 // stores bundles the store layer objects derived from ServerConfig.DB.
 // They are nil when DB is nil (stubs active during early plan phases).
 type stores struct {
-	run       *store.RunStore
-	event     *store.EventStore
-	dispatch  *store.DispatchStore
-	job       *store.JobStore
+	run      *store.RunStore
+	event    *store.EventStore
+	dispatch *store.DispatchStore
+	job      *store.JobStore
 	attention *store.AttentionStore
+	finding  *store.FindingStore
+	artifact *store.ArtifactStore
 }
 
 // ServerConfig holds the runtime dependencies required to construct the MCP
@@ -66,6 +68,8 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 			dispatch:  store.NewDispatchStore(cfg.DB, es),
 			job:       store.NewJobStore(cfg.DB, es),
 			attention: store.NewAttentionStore(cfg.DB),
+			finding:   store.NewFindingStore(cfg.DB, es),
+			artifact:  store.NewArtifactStore(cfg.DB, es),
 		}
 	}
 
@@ -253,37 +257,65 @@ func (s *Server) registerTools() {
 
 	// --- findings tools ------------------------------------------------------
 
-	mcp.AddTool(s.inner,
-		&mcp.Tool{
-			Name:        "orch_findings_list",
-			Description: "List findings recorded for a run or job, optionally filtered by severity.",
-		},
-		func(_ context.Context, _ *mcp.CallToolRequest, _ emptyInput) (*mcp.CallToolResult, notImplemented, error) {
-			return nil, stubResult(), nil
-		},
-	)
+	if s.stores.finding != nil {
+		mcp.AddTool(s.inner,
+			&mcp.Tool{
+				Name:        "orch_findings_list",
+				Description: "List findings recorded for a run or job, optionally filtered by severity.",
+			},
+			handleFindingsList(s.stores.finding),
+		)
+	} else {
+		mcp.AddTool(s.inner,
+			&mcp.Tool{
+				Name:        "orch_findings_list",
+				Description: "List findings recorded for a run or job, optionally filtered by severity.",
+			},
+			func(_ context.Context, _ *mcp.CallToolRequest, _ emptyInput) (*mcp.CallToolResult, notImplemented, error) {
+				return nil, stubResult(), nil
+			},
+		)
+	}
 
 	// --- artifact tools ------------------------------------------------------
 
-	mcp.AddTool(s.inner,
-		&mcp.Tool{
-			Name:        "orch_artifact_read",
-			Description: "Read the contents of an artifact produced by a job.",
-		},
-		func(_ context.Context, _ *mcp.CallToolRequest, _ emptyInput) (*mcp.CallToolResult, notImplemented, error) {
-			return nil, stubResult(), nil
-		},
-	)
+	if s.stores.artifact != nil {
+		mcp.AddTool(s.inner,
+			&mcp.Tool{
+				Name:        "orch_artifact_read",
+				Description: "Read the contents of an artifact produced by a job.",
+			},
+			handleArtifactRead(s.stores.artifact),
+		)
 
-	mcp.AddTool(s.inner,
-		&mcp.Tool{
-			Name:        "orch_artifact_write",
-			Description: "Write or update an artifact associated with the current job.",
-		},
-		func(_ context.Context, _ *mcp.CallToolRequest, _ emptyInput) (*mcp.CallToolResult, notImplemented, error) {
-			return nil, stubResult(), nil
-		},
-	)
+		mcp.AddTool(s.inner,
+			&mcp.Tool{
+				Name:        "orch_artifact_write",
+				Description: "Write or update an artifact associated with the current job.",
+			},
+			handleArtifactWrite(s.stores.artifact),
+		)
+	} else {
+		mcp.AddTool(s.inner,
+			&mcp.Tool{
+				Name:        "orch_artifact_read",
+				Description: "Read the contents of an artifact produced by a job.",
+			},
+			func(_ context.Context, _ *mcp.CallToolRequest, _ emptyInput) (*mcp.CallToolResult, notImplemented, error) {
+				return nil, stubResult(), nil
+			},
+		)
+
+		mcp.AddTool(s.inner,
+			&mcp.Tool{
+				Name:        "orch_artifact_write",
+				Description: "Write or update an artifact associated with the current job.",
+			},
+			func(_ context.Context, _ *mcp.CallToolRequest, _ emptyInput) (*mcp.CallToolResult, notImplemented, error) {
+				return nil, stubResult(), nil
+			},
+		)
+	}
 }
 
 // Tools returns the names of all registered tools, in registration order.
