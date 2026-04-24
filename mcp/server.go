@@ -14,10 +14,11 @@ import (
 // stores bundles the store layer objects derived from ServerConfig.DB.
 // They are nil when DB is nil (stubs active during early plan phases).
 type stores struct {
-	run      *store.RunStore
-	event    *store.EventStore
-	dispatch *store.DispatchStore
-	job      *store.JobStore
+	run       *store.RunStore
+	event     *store.EventStore
+	dispatch  *store.DispatchStore
+	job       *store.JobStore
+	attention *store.AttentionStore
 }
 
 // ServerConfig holds the runtime dependencies required to construct the MCP
@@ -60,10 +61,11 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	if cfg.DB != nil {
 		es := store.NewEventStore(cfg.DB)
 		s.stores = stores{
-			event:    es,
-			run:      store.NewRunStore(cfg.DB, es),
-			dispatch: store.NewDispatchStore(cfg.DB, es),
-			job:      store.NewJobStore(cfg.DB, es),
+			event:     es,
+			run:       store.NewRunStore(cfg.DB, es),
+			dispatch:  store.NewDispatchStore(cfg.DB, es),
+			job:       store.NewJobStore(cfg.DB, es),
+			attention: store.NewAttentionStore(cfg.DB),
 		}
 	}
 
@@ -189,37 +191,65 @@ func (s *Server) registerTools() {
 
 	// --- human-in-the-loop tools ---------------------------------------------
 
-	mcp.AddTool(s.inner,
-		&mcp.Tool{
-			Name:        "orch_ask_user",
-			Description: "Post a question to the human operator and block until they answer via the attention queue.",
-		},
-		func(_ context.Context, _ *mcp.CallToolRequest, _ emptyInput) (*mcp.CallToolResult, notImplemented, error) {
-			return nil, stubResult(), nil
-		},
-	)
+	if s.stores.attention != nil {
+		mcp.AddTool(s.inner,
+			&mcp.Tool{
+				Name:        "orch_ask_user",
+				Description: "Post a question to the human operator and block until they answer via the attention queue.",
+			},
+			handleAskUser(s.stores.attention),
+		)
+	} else {
+		mcp.AddTool(s.inner,
+			&mcp.Tool{
+				Name:        "orch_ask_user",
+				Description: "Post a question to the human operator and block until they answer via the attention queue.",
+			},
+			func(_ context.Context, _ *mcp.CallToolRequest, _ emptyInput) (*mcp.CallToolResult, notImplemented, error) {
+				return nil, stubResult(), nil
+			},
+		)
+	}
 
 	// --- attention tools -----------------------------------------------------
 
-	mcp.AddTool(s.inner,
-		&mcp.Tool{
-			Name:        "orch_attention_list",
-			Description: "List all open attention requests awaiting a human answer.",
-		},
-		func(_ context.Context, _ *mcp.CallToolRequest, _ emptyInput) (*mcp.CallToolResult, notImplemented, error) {
-			return nil, stubResult(), nil
-		},
-	)
+	if s.stores.attention != nil {
+		mcp.AddTool(s.inner,
+			&mcp.Tool{
+				Name:        "orch_attention_list",
+				Description: "List all open attention requests awaiting a human answer.",
+			},
+			handleAttentionList(s.stores.attention),
+		)
 
-	mcp.AddTool(s.inner,
-		&mcp.Tool{
-			Name:        "orch_attention_answer",
-			Description: "Submit a human answer for an open attention request, unblocking the waiting job.",
-		},
-		func(_ context.Context, _ *mcp.CallToolRequest, _ emptyInput) (*mcp.CallToolResult, notImplemented, error) {
-			return nil, stubResult(), nil
-		},
-	)
+		mcp.AddTool(s.inner,
+			&mcp.Tool{
+				Name:        "orch_attention_answer",
+				Description: "Submit a human answer for an open attention request, unblocking the waiting job.",
+			},
+			handleAttentionAnswer(s.stores.attention),
+		)
+	} else {
+		mcp.AddTool(s.inner,
+			&mcp.Tool{
+				Name:        "orch_attention_list",
+				Description: "List all open attention requests awaiting a human answer.",
+			},
+			func(_ context.Context, _ *mcp.CallToolRequest, _ emptyInput) (*mcp.CallToolResult, notImplemented, error) {
+				return nil, stubResult(), nil
+			},
+		)
+
+		mcp.AddTool(s.inner,
+			&mcp.Tool{
+				Name:        "orch_attention_answer",
+				Description: "Submit a human answer for an open attention request, unblocking the waiting job.",
+			},
+			func(_ context.Context, _ *mcp.CallToolRequest, _ emptyInput) (*mcp.CallToolResult, notImplemented, error) {
+				return nil, stubResult(), nil
+			},
+		)
+	}
 
 	// --- findings tools ------------------------------------------------------
 

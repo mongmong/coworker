@@ -207,3 +207,31 @@ func (s *AttentionStore) ListUnansweredByRun(ctx context.Context, runID string) 
 
 	return items, nil
 }
+
+// ListAllPending returns all unanswered attention items across all runs.
+func (s *AttentionStore) ListAllPending(ctx context.Context) ([]*core.AttentionItem, error) {
+	query := `SELECT id, run_id, kind, source, job_id, question, options,
+	presented_on, answered_on, answered_by, answer, created_at, resolved_at
+	FROM attention WHERE answer IS NULL
+	ORDER BY created_at ASC`
+
+	rows, err := s.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("list all pending: %w", err)
+	}
+	defer rows.Close()
+
+	var items []*core.AttentionItem
+	for rows.Next() {
+		item, err := scanAttentionItem(rows.Scan)
+		if err != nil {
+			return nil, fmt.Errorf("scan pending: %w", err)
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows error: %w", err)
+	}
+
+	return items, nil
+}
