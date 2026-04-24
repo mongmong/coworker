@@ -179,7 +179,7 @@ func AssertGoldenEvents(t *testing.T, db *DB, runID string, goldenFile string) {
 	}
 
 	if os.Getenv("GOLDEN_UPDATE") == "1" {
-		if err := os.WriteFile(goldenFile, got, 0o644); err != nil {
+		if err := os.WriteFile(goldenFile, got, 0o600); err != nil {
 			t.Fatalf("rewrite golden file: %v", err)
 		}
 		return
@@ -188,7 +188,7 @@ func AssertGoldenEvents(t *testing.T, db *DB, runID string, goldenFile string) {
 	want, err := os.ReadFile(goldenFile)
 	if err != nil {
 		if os.IsNotExist(err) {
-			if err := os.WriteFile(goldenFile, got, 0o644); err != nil {
+			if err := os.WriteFile(goldenFile, got, 0o600); err != nil {
 				t.Fatalf("create golden file: %v", err)
 			}
 			t.Logf("created golden file: %s", goldenFile)
@@ -205,7 +205,7 @@ func AssertGoldenEvents(t *testing.T, db *DB, runID string, goldenFile string) {
 		return
 	}
 
-	if err := os.WriteFile(actualFile, got, 0o644); err != nil {
+	if err := os.WriteFile(actualFile, got, 0o600); err != nil {
 		t.Fatalf("write actual snapshot %q: %v", actualFile, err)
 	}
 
