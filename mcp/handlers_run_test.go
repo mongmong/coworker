@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	mcpserver "github.com/chris/coworker/mcp"
 	"github.com/chris/coworker/core"
+	mcpserver "github.com/chris/coworker/mcp"
 	"github.com/chris/coworker/store"
 )
 

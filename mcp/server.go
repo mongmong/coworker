@@ -123,15 +123,25 @@ func (s *Server) registerTools() {
 
 	// --- role tools ----------------------------------------------------------
 
-	mcp.AddTool(s.inner,
-		&mcp.Tool{
-			Name:        "orch_role_invoke",
-			Description: "Invoke a named role synchronously, creating a run and waiting for completion.",
-		},
-		func(_ context.Context, _ *mcp.CallToolRequest, _ emptyInput) (*mcp.CallToolResult, notImplemented, error) {
-			return nil, stubResult(), nil
-		},
-	)
+	if s.cfg.Dispatcher != nil {
+		mcp.AddTool(s.inner,
+			&mcp.Tool{
+				Name:        "orch_role_invoke",
+				Description: "Invoke a named role synchronously, creating a run and waiting for completion.",
+			},
+			handleRoleInvoke(s.cfg.Dispatcher),
+		)
+	} else {
+		mcp.AddTool(s.inner,
+			&mcp.Tool{
+				Name:        "orch_role_invoke",
+				Description: "Invoke a named role synchronously, creating a run and waiting for completion.",
+			},
+			func(_ context.Context, _ *mcp.CallToolRequest, _ emptyInput) (*mcp.CallToolResult, notImplemented, error) {
+				return nil, stubResult(), nil
+			},
+		)
+	}
 
 	// --- dispatch tools (pull model) -----------------------------------------
 
