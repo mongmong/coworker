@@ -27,6 +27,14 @@ func Open(path string) (*DB, error) {
 		return nil, fmt.Errorf("open sqlite %q: %w", path, err)
 	}
 
+	// In-memory SQLite databases exist only on a single connection.
+	// Limit the pool to one connection so all queries share the same DB
+	// instance; otherwise concurrent or goroutine-based callers may receive a
+	// fresh empty connection from the pool.
+	if path == ":memory:" {
+		sqlDB.SetMaxOpenConns(1)
+	}
+
 	// Enable WAL mode for better concurrent read performance.
 	if _, err := sqlDB.Exec("PRAGMA journal_mode=WAL"); err != nil {
 		sqlDB.Close()

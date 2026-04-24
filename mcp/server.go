@@ -28,16 +28,18 @@ type stores struct {
 // server. All fields are optional during early plan phases; the server
 // registers stub handlers regardless.
 type ServerConfig struct {
-	DB         *store.DB
-	Dispatcher *coding.Dispatcher
-	EventBus   *eventbus.InMemoryBus
+	DB             *store.DB
+	Dispatcher     *coding.Dispatcher
+	EventBus       *eventbus.InMemoryBus
+	WatchdogConfig WatchdogConfig // Plan 105; zero value uses spec defaults
 }
 
 // Server wraps the official MCP SDK server and holds coworker runtime deps.
 type Server struct {
-	inner  *mcp.Server
-	cfg    ServerConfig
-	stores stores
+	inner    *mcp.Server
+	cfg      ServerConfig
+	stores   stores
+	watchdog *HeartbeatWatchdog // Plan 105; nil when worker store absent
 }
 
 // notImplemented is the shared output type for stub tool handlers.
@@ -77,12 +79,25 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 
 	s.registerTools()
 
+	// Wire heartbeat watchdog when both worker and dispatch stores are available.
+	if s.stores.worker != nil && s.stores.dispatch != nil {
+		s.watchdog = NewHeartbeatWatchdog(
+			s.stores.worker,
+			s.stores.dispatch,
+			cfg.WatchdogConfig,
+			nil, // use slog.Default()
+		)
+	}
+
 	return s, nil
 }
 
 // Run starts the MCP server on stdio transport, blocking until ctx is done or
 // the transport closes.
 func (s *Server) Run(ctx context.Context) error {
+	if s.watchdog != nil {
+		go s.watchdog.Run(ctx)
+	}
 	if err := s.inner.Run(ctx, &mcp.StdioTransport{}); err != nil {
 		return fmt.Errorf("mcp server: %w", err)
 	}
@@ -318,6 +333,42 @@ func (s *Server) registerTools() {
 			},
 		)
 	}
+
+	// --- registry tools ------------------------------------------------------
+
+	if s.stores.worker != nil {
+		mcp.AddTool(s.inner,
+			&mcp.Tool{
+				Name:        "orch_register",
+				Description: "Register a persistent CLI worker for a role. Returns a handle used for subsequent heartbeat and deregister calls.",
+			},
+			handleRegister(s.stores.worker),
+		)
+		mcp.AddTool(s.inner,
+			&mcp.Tool{
+				Name:        "orch_heartbeat",
+				Description: "Send a heartbeat for a registered worker. Must be called every 15 s to maintain live status.",
+			},
+			handleHeartbeat(s.stores.worker),
+		)
+		mcp.AddTool(s.inner,
+			&mcp.Tool{
+				Name:        "orch_deregister",
+				Description: "Deregister a persistent worker on clean shutdown.",
+			},
+			handleDeregister(s.stores.worker),
+		)
+	} else {
+		for _, name := range []string{"orch_register", "orch_heartbeat", "orch_deregister"} {
+			n := name
+			mcp.AddTool(s.inner,
+				&mcp.Tool{Name: n},
+				func(_ context.Context, _ *mcp.CallToolRequest, _ emptyInput) (*mcp.CallToolResult, notImplemented, error) {
+					return nil, stubResult(), nil
+				},
+			)
+		}
+	}
 }
 
 // Tools returns the names of all registered tools, in registration order.
@@ -335,5 +386,8 @@ func (s *Server) Tools() []string {
 		"orch_findings_list",
 		"orch_artifact_read",
 		"orch_artifact_write",
+		"orch_register",   // Plan 105
+		"orch_heartbeat",  // Plan 105
+		"orch_deregister", // Plan 105
 	}
 }
