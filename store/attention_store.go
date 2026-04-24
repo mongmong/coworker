@@ -33,6 +33,13 @@ func (s *AttentionStore) InsertAttention(ctx context.Context, item *core.Attenti
 	answeredOn, _ := json.Marshal(item.AnsweredOn)
 	options, _ := json.Marshal(item.Options)
 
+	// Use nil for empty answer so ListUnansweredByRun (answer IS NULL) works correctly.
+	var answer, answeredBy interface{}
+	if item.Answer != "" {
+		answer = item.Answer
+		answeredBy = item.AnsweredBy
+	}
+
 	query := `
 		INSERT INTO attention (
 			id, run_id, kind, source, job_id, question, options,
@@ -41,15 +48,54 @@ func (s *AttentionStore) InsertAttention(ctx context.Context, item *core.Attenti
 	`
 
 	_, err := s.db.ExecContext(ctx, query,
-		item.ID, item.RunID, item.Kind, item.Source, item.JobID,
+		item.ID, item.RunID, string(item.Kind), item.Source, item.JobID,
 		item.Question, string(options),
-		string(presentedOn), string(answeredOn), item.AnsweredBy, item.Answer,
+		string(presentedOn), string(answeredOn), answeredBy, answer,
 		item.CreatedAt.UTC().Format(time.RFC3339),
 	)
 	if err != nil {
 		return fmt.Errorf("insert attention: %w", err)
 	}
 	return nil
+}
+
+// scanAttentionItem scans a row into an AttentionItem.
+func scanAttentionItem(scan func(dest ...interface{}) error) (*core.AttentionItem, error) {
+	item := &core.AttentionItem{}
+	var kindStr, createdAtStr string
+	var options, presentedOn, answeredOn, resolvedAt, answeredBy, answer, jobID sql.NullString
+
+	err := scan(
+		&item.ID, &item.RunID, &kindStr, &item.Source, &jobID,
+		&item.Question, &options,
+		&presentedOn, &answeredOn, &answeredBy, &answer,
+		&createdAtStr, &resolvedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	item.Kind = core.AttentionKind(kindStr)
+	item.CreatedAt, _ = time.Parse(time.RFC3339, createdAtStr)
+	if jobID.Valid {
+		item.JobID = jobID.String
+	}
+	if answeredBy.Valid {
+		item.AnsweredBy = answeredBy.String
+	}
+	if answer.Valid {
+		item.Answer = answer.String
+	}
+	if resolvedAt.Valid {
+		t, _ := time.Parse(time.RFC3339, resolvedAt.String)
+		item.ResolvedAt = &t
+	}
+
+	_ = json.Unmarshal([]byte(options.String), &item.Options)
+	_ = json.Unmarshal([]byte(presentedOn.String), &item.PresentedOn)
+	_ = json.Unmarshal([]byte(answeredOn.String), &item.AnsweredOn)
+
+	return item, nil
 }
 
 // GetAttentionByID retrieves an attention item by ID.
@@ -59,31 +105,13 @@ func (s *AttentionStore) GetAttentionByID(ctx context.Context, id string) (*core
 		presented_on, answered_on, answered_by, answer, created_at, resolved_at
 		FROM attention WHERE id = ?`, id)
 
-	item := &core.AttentionItem{}
-	var options, presentedOn, answeredOn, resolvedAt sql.NullString
-
-	err := row.Scan(
-		&item.ID, &item.RunID, &item.Kind, &item.Source, &item.JobID,
-		&item.Question, &options,
-		&presentedOn, &answeredOn, &item.AnsweredBy, &item.Answer,
-		&item.CreatedAt, &resolvedAt,
-	)
+	item, err := scanAttentionItem(row.Scan)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("get attention: %w", err)
 	}
-
-	_ = json.Unmarshal([]byte(options.String), &item.Options)
-	_ = json.Unmarshal([]byte(presentedOn.String), &item.PresentedOn)
-	_ = json.Unmarshal([]byte(answeredOn.String), &item.AnsweredOn)
-
-	if resolvedAt.Valid {
-		t, _ := time.Parse(time.RFC3339, resolvedAt.String)
-		item.ResolvedAt = &t
-	}
-
 	return item, nil
 }
 
@@ -109,27 +137,10 @@ func (s *AttentionStore) ListAttentionByRun(ctx context.Context, runID string, k
 
 	var items []*core.AttentionItem
 	for rows.Next() {
-		item := &core.AttentionItem{}
-		var options, presentedOn, answeredOn, resolvedAt sql.NullString
-
-		if err := rows.Scan(
-			&item.ID, &item.RunID, &item.Kind, &item.Source, &item.JobID,
-			&item.Question, &options,
-			&presentedOn, &answeredOn, &item.AnsweredBy, &item.Answer,
-			&item.CreatedAt, &resolvedAt,
-		); err != nil {
+		item, err := scanAttentionItem(rows.Scan)
+		if err != nil {
 			return nil, fmt.Errorf("scan attention: %w", err)
 		}
-
-		_ = json.Unmarshal([]byte(options.String), &item.Options)
-		_ = json.Unmarshal([]byte(presentedOn.String), &item.PresentedOn)
-		_ = json.Unmarshal([]byte(answeredOn.String), &item.AnsweredOn)
-
-		if resolvedAt.Valid {
-			t, _ := time.Parse(time.RFC3339, resolvedAt.String)
-			item.ResolvedAt = &t
-		}
-
 		items = append(items, item)
 	}
 	if err := rows.Err(); err != nil {
@@ -141,14 +152,14 @@ func (s *AttentionStore) ListAttentionByRun(ctx context.Context, runID string, k
 
 // AnswerAttention marks an attention item as answered.
 func (s *AttentionStore) AnswerAttention(ctx context.Context, id, answer, answeredBy string) error {
+	now := time.Now().UTC().Format(time.RFC3339)
 	query := `
 		UPDATE attention
-		SET answered_on = json_array(json_extract(answered_on, '$') || ?),
-		    answered_by = ?, answer = ?
+		SET answered_by = ?, answer = ?, answered_on = ?
 		WHERE id = ?
 	`
 
-	_, err := s.db.ExecContext(ctx, query, answeredBy, answeredBy, answer, id)
+	_, err := s.db.ExecContext(ctx, query, answeredBy, answer, now, id)
 	if err != nil {
 		return fmt.Errorf("answer attention: %w", err)
 	}
@@ -181,27 +192,10 @@ func (s *AttentionStore) ListUnansweredByRun(ctx context.Context, runID string) 
 
 	var items []*core.AttentionItem
 	for rows.Next() {
-		item := &core.AttentionItem{}
-		var options, presentedOn, answeredOn, resolvedAt sql.NullString
-
-		if err := rows.Scan(
-			&item.ID, &item.RunID, &item.Kind, &item.Source, &item.JobID,
-			&item.Question, &options,
-			&presentedOn, &answeredOn, &item.AnsweredBy, &item.Answer,
-			&item.CreatedAt, &resolvedAt,
-		); err != nil {
+		item, err := scanAttentionItem(rows.Scan)
+		if err != nil {
 			return nil, fmt.Errorf("scan unanswered: %w", err)
 		}
-
-		_ = json.Unmarshal([]byte(options.String), &item.Options)
-		_ = json.Unmarshal([]byte(presentedOn.String), &item.PresentedOn)
-		_ = json.Unmarshal([]byte(answeredOn.String), &item.AnsweredOn)
-
-		if resolvedAt.Valid {
-			t, _ := time.Parse(time.RFC3339, resolvedAt.String)
-			item.ResolvedAt = &t
-		}
-
 		items = append(items, item)
 	}
 	if err := rows.Err(); err != nil {
