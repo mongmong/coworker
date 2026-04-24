@@ -14,8 +14,10 @@ import (
 // stores bundles the store layer objects derived from ServerConfig.DB.
 // They are nil when DB is nil (stubs active during early plan phases).
 type stores struct {
-	run   *store.RunStore
-	event *store.EventStore
+	run      *store.RunStore
+	event    *store.EventStore
+	dispatch *store.DispatchStore
+	job      *store.JobStore
 }
 
 // ServerConfig holds the runtime dependencies required to construct the MCP
@@ -58,8 +60,10 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	if cfg.DB != nil {
 		es := store.NewEventStore(cfg.DB)
 		s.stores = stores{
-			event: es,
-			run:   store.NewRunStore(cfg.DB, es),
+			event:    es,
+			run:      store.NewRunStore(cfg.DB, es),
+			dispatch: store.NewDispatchStore(cfg.DB, es),
+			job:      store.NewJobStore(cfg.DB, es),
 		}
 	}
 
@@ -145,25 +149,43 @@ func (s *Server) registerTools() {
 
 	// --- dispatch tools (pull model) -----------------------------------------
 
-	mcp.AddTool(s.inner,
-		&mcp.Tool{
-			Name:        "orch_next_dispatch",
-			Description: "Poll the orchestrator for the next pending dispatch assigned to the calling worker. Returns the dispatch payload or {\"status\": \"idle\"} when there is nothing to do.",
-		},
-		func(_ context.Context, _ *mcp.CallToolRequest, _ emptyInput) (*mcp.CallToolResult, notImplemented, error) {
-			return nil, stubResult(), nil
-		},
-	)
+	if s.stores.dispatch != nil {
+		mcp.AddTool(s.inner,
+			&mcp.Tool{
+				Name:        "orch_next_dispatch",
+				Description: "Poll the orchestrator for the next pending dispatch assigned to the calling worker. Returns the dispatch payload or {\"status\": \"idle\"} when there is nothing to do.",
+			},
+			handleNextDispatch(s.stores.dispatch),
+		)
 
-	mcp.AddTool(s.inner,
-		&mcp.Tool{
-			Name:        "orch_job_complete",
-			Description: "Report that a dispatched job is complete. Provide the job_id from the dispatch and structured outputs.",
-		},
-		func(_ context.Context, _ *mcp.CallToolRequest, _ emptyInput) (*mcp.CallToolResult, notImplemented, error) {
-			return nil, stubResult(), nil
-		},
-	)
+		mcp.AddTool(s.inner,
+			&mcp.Tool{
+				Name:        "orch_job_complete",
+				Description: "Report that a dispatched job is complete. Provide the job_id from the dispatch and structured outputs.",
+			},
+			handleJobComplete(s.stores.dispatch, s.stores.job),
+		)
+	} else {
+		mcp.AddTool(s.inner,
+			&mcp.Tool{
+				Name:        "orch_next_dispatch",
+				Description: "Poll the orchestrator for the next pending dispatch assigned to the calling worker. Returns the dispatch payload or {\"status\": \"idle\"} when there is nothing to do.",
+			},
+			func(_ context.Context, _ *mcp.CallToolRequest, _ emptyInput) (*mcp.CallToolResult, notImplemented, error) {
+				return nil, stubResult(), nil
+			},
+		)
+
+		mcp.AddTool(s.inner,
+			&mcp.Tool{
+				Name:        "orch_job_complete",
+				Description: "Report that a dispatched job is complete. Provide the job_id from the dispatch and structured outputs.",
+			},
+			func(_ context.Context, _ *mcp.CallToolRequest, _ emptyInput) (*mcp.CallToolResult, notImplemented, error) {
+				return nil, stubResult(), nil
+			},
+		)
+	}
 
 	// --- human-in-the-loop tools ---------------------------------------------
 
