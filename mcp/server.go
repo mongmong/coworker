@@ -11,6 +11,13 @@ import (
 	"github.com/chris/coworker/store"
 )
 
+// stores bundles the store layer objects derived from ServerConfig.DB.
+// They are nil when DB is nil (stubs active during early plan phases).
+type stores struct {
+	run   *store.RunStore
+	event *store.EventStore
+}
+
 // ServerConfig holds the runtime dependencies required to construct the MCP
 // server. All fields are optional during early plan phases; the server
 // registers stub handlers regardless.
@@ -22,8 +29,9 @@ type ServerConfig struct {
 
 // Server wraps the official MCP SDK server and holds coworker runtime deps.
 type Server struct {
-	inner *mcp.Server
-	cfg   ServerConfig
+	inner  *mcp.Server
+	cfg    ServerConfig
+	stores stores
 }
 
 // notImplemented is the shared output type for stub tool handlers.
@@ -45,6 +53,16 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	}, nil)
 
 	s := &Server{inner: inner, cfg: cfg}
+
+	// Build store layer when a DB is provided.
+	if cfg.DB != nil {
+		es := store.NewEventStore(cfg.DB)
+		s.stores = stores{
+			event: es,
+			run:   store.NewRunStore(cfg.DB, es),
+		}
+	}
+
 	s.registerTools()
 
 	return s, nil
@@ -65,25 +83,43 @@ func (s *Server) registerTools() {
 
 	type emptyInput struct{}
 
-	mcp.AddTool(s.inner,
-		&mcp.Tool{
-			Name:        "orch_run_status",
-			Description: "Return the status of all active and recent runs.",
-		},
-		func(_ context.Context, _ *mcp.CallToolRequest, _ emptyInput) (*mcp.CallToolResult, notImplemented, error) {
-			return nil, stubResult(), nil
-		},
-	)
+	if s.stores.run != nil && s.stores.event != nil {
+		mcp.AddTool(s.inner,
+			&mcp.Tool{
+				Name:        "orch_run_status",
+				Description: "Return the status of a run by run_id.",
+			},
+			handleRunStatus(s.stores.run),
+		)
 
-	mcp.AddTool(s.inner,
-		&mcp.Tool{
-			Name:        "orch_run_inspect",
-			Description: "Return full details for a specific run including its jobs and events.",
-		},
-		func(_ context.Context, _ *mcp.CallToolRequest, _ emptyInput) (*mcp.CallToolResult, notImplemented, error) {
-			return nil, stubResult(), nil
-		},
-	)
+		mcp.AddTool(s.inner,
+			&mcp.Tool{
+				Name:        "orch_run_inspect",
+				Description: "Return full details for a specific run including its events.",
+			},
+			handleRunInspect(s.stores.run, s.stores.event),
+		)
+	} else {
+		mcp.AddTool(s.inner,
+			&mcp.Tool{
+				Name:        "orch_run_status",
+				Description: "Return the status of a run by run_id.",
+			},
+			func(_ context.Context, _ *mcp.CallToolRequest, _ emptyInput) (*mcp.CallToolResult, notImplemented, error) {
+				return nil, stubResult(), nil
+			},
+		)
+
+		mcp.AddTool(s.inner,
+			&mcp.Tool{
+				Name:        "orch_run_inspect",
+				Description: "Return full details for a specific run including its events.",
+			},
+			func(_ context.Context, _ *mcp.CallToolRequest, _ emptyInput) (*mcp.CallToolResult, notImplemented, error) {
+				return nil, stubResult(), nil
+			},
+		)
+	}
 
 	// --- role tools ----------------------------------------------------------
 
