@@ -21,6 +21,7 @@ type stores struct {
 	attention *store.AttentionStore
 	finding   *store.FindingStore
 	artifact  *store.ArtifactStore
+	worker    *store.WorkerStore // Plan 105
 }
 
 // ServerConfig holds the runtime dependencies required to construct the MCP
@@ -70,6 +71,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 			attention: store.NewAttentionStore(cfg.DB),
 			finding:   store.NewFindingStore(cfg.DB, es),
 			artifact:  store.NewArtifactStore(cfg.DB, es),
+			worker:    store.NewWorkerStore(cfg.DB, es), // Plan 105
 		}
 	}
 

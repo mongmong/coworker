@@ -345,6 +345,66 @@ func (s *DispatchStore) ExpireLeases(ctx context.Context, timeout time.Duration)
 	return nil
 }
 
+// RequeueByWorker resets all dispatches leased by the given worker handle to
+// 'pending', clearing worker_handle and leased_at, and emits a dispatch.expired
+// event for each. Called when a worker is evicted.
+func (s *DispatchStore) RequeueByWorker(ctx context.Context, workerHandle string) error {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, run_id FROM dispatches
+		WHERE state = 'leased' AND worker_handle = ?`,
+		workerHandle,
+	)
+	if err != nil {
+		return fmt.Errorf("query leased dispatches for worker %q: %w", workerHandle, err)
+	}
+	defer rows.Close()
+
+	type row struct{ id, runID string }
+	var leased []row
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.id, &r.runID); err != nil {
+			return fmt.Errorf("scan dispatch: %w", err)
+		}
+		leased = append(leased, r)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	now := time.Now()
+	for _, r := range leased {
+		payload, _ := json.Marshal(map[string]string{
+			"dispatch_id":   r.id,
+			"run_id":        r.runID,
+			"worker_handle": workerHandle,
+			"reason":        "worker_evicted",
+		})
+		event := &core.Event{
+			ID:            core.NewID(),
+			RunID:         r.runID,
+			Kind:          core.EventDispatchExpired,
+			SchemaVersion: 1,
+			CorrelationID: r.id,
+			Payload:       string(payload),
+			CreatedAt:     now,
+		}
+		dispatchID := r.id
+		if err := s.event.WriteEventThenRow(ctx, event, func(tx *sql.Tx) error {
+			_, err := tx.ExecContext(ctx,
+				`UPDATE dispatches
+				SET state = 'pending', worker_handle = NULL, leased_at = NULL
+				WHERE id = ? AND state = 'leased'`,
+				dispatchID,
+			)
+			return err
+		}); err != nil {
+			return fmt.Errorf("requeue dispatch %q: %w", r.id, err)
+		}
+	}
+	return nil
+}
+
 // GetDispatch retrieves a dispatch by ID.
 func (s *DispatchStore) GetDispatch(ctx context.Context, id string) (*core.Dispatch, error) {
 	var d core.Dispatch
