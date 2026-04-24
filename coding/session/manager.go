@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/chris/coworker/core"
-	"github.com/chris/coworker/store"
 )
 
 const defaultSessionLockPath = ".coworker/session.lock"
@@ -25,7 +24,7 @@ var (
 
 // Manager manages interactive session lifecycle + lock file state.
 type Manager struct {
-	RunStore *store.RunStore
+	RunStore RunRepository
 	LockPath string
 	PID      int
 }
@@ -107,6 +106,9 @@ func (sm *Manager) EndSession() error {
 	return nil
 }
 
+// ErrLockExists is returned when a session lock file already exists (concurrent session).
+var ErrLockExists = errors.New("session lock already exists: another session may be active")
+
 func (sm *Manager) writeLock(runID string) error {
 	lockPath := sm.lockPath()
 	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
@@ -123,12 +125,23 @@ func (sm *Manager) writeLock(runID string) error {
 	}
 
 	payload := strings.Join(lines, "\n")
-	tmp := lockPath + ".tmp"
-	if err := os.WriteFile(tmp, []byte(payload), 0o600); err != nil {
-		return fmt.Errorf("write temporary lock file: %w", err)
+
+	// Use O_EXCL|O_CREATE for atomic exclusive creation — fails if lock already exists.
+	f, err := os.OpenFile(lockPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		if os.IsExist(err) {
+			return ErrLockExists
+		}
+		return fmt.Errorf("create lock file: %w", err)
 	}
-	if err := os.Rename(tmp, lockPath); err != nil {
-		return fmt.Errorf("install lock file: %w", err)
+	if _, err := f.WriteString(payload); err != nil {
+		_ = f.Close()
+		_ = os.Remove(lockPath)
+		return fmt.Errorf("write lock file: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(lockPath)
+		return fmt.Errorf("close lock file: %w", err)
 	}
 
 	return nil

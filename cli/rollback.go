@@ -50,7 +50,7 @@ func runRollback(cmd *cobra.Command, args []string) error {
 
 	sm := &session.Manager{
 		RunStore: store.NewRunStore(db, store.NewEventStore(db)),
-		LockPath: filepath.Join(".coworker", "session.lock"),
+		LockPath: sessionLockPath(dbPath),
 	}
 	_, err = sm.CurrentSession()
 	if err != nil {

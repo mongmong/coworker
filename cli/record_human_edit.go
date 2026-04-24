@@ -79,7 +79,7 @@ func runRecordHumanEdit(cmd *cobra.Command) error {
 	runStore := store.NewRunStore(db, eventStore)
 	sm := &session.Manager{
 		RunStore: runStore,
-		LockPath: filepath.Join(".coworker", "session.lock"),
+		LockPath: sessionLockPath(dbPath),
 	}
 	runID, err := sm.CurrentSession()
 	if err != nil {

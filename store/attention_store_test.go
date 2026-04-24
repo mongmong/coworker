@@ -168,3 +168,40 @@ func TestAttentionStore_GetNotFound(t *testing.T) {
 		t.Errorf("expected nil for missing item, got %+v", got)
 	}
 }
+
+func TestAttentionStore_AnswerAttention_AnsweredOnPopulated(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	db := setupTestDB(t)
+	mustCreateRunForAttention(t, db, ctx, "run_answeredon_test")
+
+	as := NewAttentionStore(db)
+
+	item := &core.AttentionItem{
+		RunID:    "run_answeredon_test",
+		Kind:     core.AttentionQuestion,
+		Source:   "user",
+		Question: "Ready?",
+	}
+
+	if err := as.InsertAttention(ctx, item); err != nil {
+		t.Fatalf("insert failed: %v", err)
+	}
+
+	if err := as.AnswerAttention(ctx, item.ID, "yes", "tui"); err != nil {
+		t.Fatalf("answer failed: %v", err)
+	}
+
+	retrieved, err := as.GetAttentionByID(ctx, item.ID)
+	if err != nil {
+		t.Fatalf("get failed: %v", err)
+	}
+	if retrieved == nil {
+		t.Fatal("retrieved nil")
+	}
+
+	if len(retrieved.AnsweredOn) != 1 || retrieved.AnsweredOn[0] != "tui" {
+		t.Errorf("AnsweredOn = %v, want [\"tui\"]", retrieved.AnsweredOn)
+	}
+}

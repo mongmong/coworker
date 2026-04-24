@@ -54,7 +54,7 @@ func runSession(cmd *cobra.Command) error {
 
 	sm := &session.Manager{
 		RunStore: store.NewRunStore(db, store.NewEventStore(db)),
-		LockPath: filepath.Join(".coworker", "session.lock"),
+		LockPath: sessionLockPath(dbPath),
 	}
 
 	if sessionEnd {

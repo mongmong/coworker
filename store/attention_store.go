@@ -152,14 +152,17 @@ func (s *AttentionStore) ListAttentionByRun(ctx context.Context, runID string, k
 
 // AnswerAttention marks an attention item as answered.
 func (s *AttentionStore) AnswerAttention(ctx context.Context, id, answer, answeredBy string) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	answeredOnJSON, err := json.Marshal([]string{answeredBy})
+	if err != nil {
+		return fmt.Errorf("marshal answered_on: %w", err)
+	}
 	query := `
 		UPDATE attention
 		SET answered_by = ?, answer = ?, answered_on = ?
 		WHERE id = ?
 	`
 
-	_, err := s.db.ExecContext(ctx, query, answeredBy, answer, now, id)
+	_, err = s.db.ExecContext(ctx, query, answeredBy, answer, string(answeredOnJSON), id)
 	if err != nil {
 		return fmt.Errorf("answer attention: %w", err)
 	}
