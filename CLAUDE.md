@@ -149,6 +149,7 @@ Follow `docs/code-review.md`. Key points:
 - Reviews go in the plan file's `## Code Review` section.
 - Reviewers: append findings with `[OPEN]` status and file:line references.
 - Authors: respond inline with `→ Response:` and `[FIXED]` / `[WONTFIX]`.
+- **Use Codex (GPT-5.4) for code reviews.** Dispatch via `codex:codex-rescue` subagent type with the review prompt, diff range (BASE_SHA..HEAD_SHA), and review focus areas. Codex's sandboxed execution lets it run `go test -race`, `go vet`, and read all files independently — producing a fresh-context review without Claude's session bias. Write Codex's findings into the plan file's Code Review section, then fix findings inline.
 
 ## Codex Delegation (GPT-5.4)
 
