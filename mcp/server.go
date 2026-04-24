@@ -14,13 +14,13 @@ import (
 // stores bundles the store layer objects derived from ServerConfig.DB.
 // They are nil when DB is nil (stubs active during early plan phases).
 type stores struct {
-	run      *store.RunStore
-	event    *store.EventStore
-	dispatch *store.DispatchStore
-	job      *store.JobStore
+	run       *store.RunStore
+	event     *store.EventStore
+	dispatch  *store.DispatchStore
+	job       *store.JobStore
 	attention *store.AttentionStore
-	finding  *store.FindingStore
-	artifact *store.ArtifactStore
+	finding   *store.FindingStore
+	artifact  *store.ArtifactStore
 }
 
 // ServerConfig holds the runtime dependencies required to construct the MCP
