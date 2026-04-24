@@ -4,8 +4,11 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/spf13/cobra"
 )
@@ -21,7 +24,10 @@ var rootCmd = &cobra.Command{
 
 // Execute runs the root command. Called from cmd/coworker/main.go.
 func Execute() {
-	if err := rootCmd.Execute(); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if err := rootCmd.ExecuteContext(ctx); err != nil {
 		fmt.Fprintln(os.Stderr, "coworker:", err)
 		os.Exit(1)
 	}
