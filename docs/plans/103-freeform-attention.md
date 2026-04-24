@@ -1809,7 +1809,32 @@ func TestAttentionFlow(t *testing.T) {
 
 ## Code Review
 
-*(To be filled during review phase)*
+### Review 1
+
+- **Date**: 2026-04-23
+- **Reviewer**: Codex (GPT-5.5)
+- **Verdict**: Approved with required fixes
+
+**Important**
+
+1. `[FIXED]` **`AnswerAttention` stores `answered_on` as plain timestamp, not JSON array.**
+   → Response: Now stores as `json.Marshal([]string{answeredBy})`. Test added to verify round-trip.
+
+2. `[FIXED]` **No exclusive write guard on session lock file.**
+   → Response: `writeLock` now uses `O_WRONLY|O_CREATE|O_EXCL` for atomic exclusive creation. Returns `ErrLockExists` if lock already exists.
+
+3. `[FIXED]` **`coding/session` imports `*store.RunStore` by concrete type.**
+   → Response: Extracted `RunRepository` interface in `coding/session/repository.go`. Manager now accepts the interface; `*store.RunStore` satisfies it.
+
+**Suggestions**
+
+4. `[WONTFIX]` `idx_attention_answered_on` index is of no practical use — accepted for now, can drop later.
+5. `[WONTFIX]` PID in lock file stored but never checked for liveness — `CurrentSession` validates via DB state instead.
+6. `[WONTFIX]` Event-before-row invariant inverted in `RecordCommit` — low-severity for synthetic human-edit jobs.
+7. `[WONTFIX]` `core.Workflow` interface too minimal (only `Name()`) — extend when second workflow (build-from-prd, Plan 106) exists.
+8. `[WONTFIX]` `config inspect` Cobra hierarchy — cosmetic, fix when `config` gets siblings.
+9. `[FIXED]` Lock path hardcoded independently in 4 CLI commands — extracted `sessionLockPath()` helper in `cli/helpers.go`.
+10. `[WONTFIX]` Integration tests don't cover `ResolveAttention` or concurrent session — add when those paths become critical.
 
 ---
 
