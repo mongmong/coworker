@@ -48,9 +48,14 @@ type Event struct {
 
 // EventWriter is the interface for writing events to the event log.
 // Implemented by store.EventStore.
+//
+// applyFn receives the live *sql.Tx as an any to avoid importing database/sql
+// from the core package. Callers that need the concrete type should use
+// store.EventStore directly; this interface exists only for dependency
+// injection in tests and cross-package wiring.
 type EventWriter interface {
 	// WriteEventThenRow writes the event first, then calls applyFn
 	// within the same transaction to update projection tables.
 	// This enforces the event-log-before-state invariant.
-	WriteEventThenRow(ctx context.Context, event *Event, applyFn func(tx interface{}) error) error
+	WriteEventThenRow(ctx context.Context, event *Event, applyFn func(tx any) error) error
 }

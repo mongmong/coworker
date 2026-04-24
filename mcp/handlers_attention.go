@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"fmt"
+	"log/slog"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -208,7 +209,8 @@ func handleAttentionAnswer(
 		if err := as.ResolveAttention(ctx, in.AttentionID); err != nil {
 			// Best-effort: the answer is recorded; resolution failure is non-fatal.
 			// A future reconcile pass can re-derive resolved_at from the answer fields.
-			_ = err
+			slog.Warn("failed to resolve attention after answer",
+				"attention_id", in.AttentionID, "error", err)
 		}
 
 		return nil, attentionAnswerOutput{Status: "ok"}, nil

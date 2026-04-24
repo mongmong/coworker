@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"fmt"
+	"log/slog"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -210,7 +211,8 @@ func handleJobComplete(
 				// Log but do not fail the call — the dispatch is already marked
 				// complete, and the job update is a best-effort projection.
 				// A future replay/reconcile pass can re-derive state from events.
-				_ = err
+				slog.Warn("failed to update job state after dispatch complete",
+					"job_id", in.JobID, "error", err)
 			}
 		}
 

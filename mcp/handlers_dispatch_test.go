@@ -343,6 +343,266 @@ func TestHandleRoleInvoke_FindingsEmptyNotNull(t *testing.T) {
 	}
 }
 
+// ---- orch_next_dispatch tests -----------------------------------------------
+
+// newDispatchStore creates a DispatchStore backed by an in-memory test DB.
+func newDispatchStore(t *testing.T, db *store.DB) *store.DispatchStore {
+	t.Helper()
+	es := store.NewEventStore(db)
+	return store.NewDispatchStore(db, es)
+}
+
+// createRunForDispatch creates a run required by the dispatch FK.
+func createRunForDispatch(t *testing.T, db *store.DB, runID string) {
+	t.Helper()
+	es := store.NewEventStore(db)
+	rs := store.NewRunStore(db, es)
+	createTestRun(t, rs, runID, "interactive")
+}
+
+func TestHandleNextDispatch_IdleWhenEmpty(t *testing.T) {
+	db := openTestDB(t)
+	ds := newDispatchStore(t, db)
+
+	out, err := mcpserver.CallNextDispatch(context.Background(), ds, "reviewer.arch")
+	if err != nil {
+		t.Fatalf("CallNextDispatch: %v", err)
+	}
+	if out["status"] != "idle" {
+		t.Errorf("status = %q, want %q", out["status"], "idle")
+	}
+}
+
+func TestHandleNextDispatch_ReturnDispatchWhenEnqueued(t *testing.T) {
+	db := openTestDB(t)
+	createRunForDispatch(t, db, "run_nd_1")
+	es := store.NewEventStore(db)
+	ds := store.NewDispatchStore(db, es)
+
+	// Enqueue a dispatch.
+	d := &core.Dispatch{
+		RunID:  "run_nd_1",
+		Role:   "reviewer.arch",
+		Prompt: "review this",
+		Inputs: map[string]interface{}{"key": "val"},
+	}
+	if err := ds.EnqueueDispatch(context.Background(), d); err != nil {
+		t.Fatalf("EnqueueDispatch: %v", err)
+	}
+
+	out, err := mcpserver.CallNextDispatch(context.Background(), ds, "reviewer.arch")
+	if err != nil {
+		t.Fatalf("CallNextDispatch: %v", err)
+	}
+
+	if out["status"] != "dispatched" {
+		t.Errorf("status = %q, want %q", out["status"], "dispatched")
+	}
+	if out["dispatch_id"] == "" {
+		t.Error("dispatch_id should not be empty")
+	}
+	if out["role"] != "reviewer.arch" {
+		t.Errorf("role = %q, want %q", out["role"], "reviewer.arch")
+	}
+	if out["prompt"] != "review this" {
+		t.Errorf("prompt = %q, want %q", out["prompt"], "review this")
+	}
+}
+
+func TestHandleNextDispatch_ErrorOnEmptyRole(t *testing.T) {
+	db := openTestDB(t)
+	ds := newDispatchStore(t, db)
+
+	_, err := mcpserver.CallNextDispatch(context.Background(), ds, "")
+	if err == nil {
+		t.Fatal("expected error for empty role, got nil")
+	}
+}
+
+func TestHandleNextDispatch_IdleAfterClaim(t *testing.T) {
+	db := openTestDB(t)
+	createRunForDispatch(t, db, "run_nd_2")
+	es := store.NewEventStore(db)
+	ds := store.NewDispatchStore(db, es)
+
+	d := &core.Dispatch{
+		RunID:  "run_nd_2",
+		Role:   "coder.impl",
+		Inputs: map[string]interface{}{},
+	}
+	if err := ds.EnqueueDispatch(context.Background(), d); err != nil {
+		t.Fatalf("EnqueueDispatch: %v", err)
+	}
+
+	// First claim — should get the dispatch.
+	out1, err := mcpserver.CallNextDispatch(context.Background(), ds, "coder.impl")
+	if err != nil {
+		t.Fatalf("CallNextDispatch 1: %v", err)
+	}
+	if out1["status"] != "dispatched" {
+		t.Fatalf("first claim status = %q, want dispatched", out1["status"])
+	}
+
+	// Second claim — queue now empty (dispatch is leased).
+	out2, err := mcpserver.CallNextDispatch(context.Background(), ds, "coder.impl")
+	if err != nil {
+		t.Fatalf("CallNextDispatch 2: %v", err)
+	}
+	if out2["status"] != "idle" {
+		t.Errorf("second claim status = %q, want idle", out2["status"])
+	}
+}
+
+// ---- orch_job_complete tests -------------------------------------------------
+
+func TestHandleJobComplete_HappyPath(t *testing.T) {
+	db := openTestDB(t)
+	createRunForDispatch(t, db, "run_jc_1")
+	es := store.NewEventStore(db)
+	ds := store.NewDispatchStore(db, es)
+
+	d := &core.Dispatch{
+		RunID:  "run_jc_1",
+		Role:   "reviewer.arch",
+		Inputs: map[string]interface{}{},
+	}
+	if err := ds.EnqueueDispatch(context.Background(), d); err != nil {
+		t.Fatalf("EnqueueDispatch: %v", err)
+	}
+
+	// Claim it so it's in leased state.
+	claimed, err := ds.ClaimNextDispatch(context.Background(), "reviewer.arch")
+	if err != nil {
+		t.Fatalf("ClaimNextDispatch: %v", err)
+	}
+	if claimed == nil {
+		t.Fatal("expected dispatch, got nil")
+	}
+
+	out, err := mcpserver.CallJobComplete(
+		context.Background(), ds, nil,
+		claimed.ID, "job_jc_1",
+		map[string]interface{}{"exit_code": 0},
+	)
+	if err != nil {
+		t.Fatalf("CallJobComplete: %v", err)
+	}
+	if out["status"] != "ok" {
+		t.Errorf("status = %q, want %q", out["status"], "ok")
+	}
+}
+
+func TestHandleJobComplete_ErrorOnMissingDispatchID(t *testing.T) {
+	db := openTestDB(t)
+	ds := newDispatchStore(t, db)
+
+	_, err := mcpserver.CallJobComplete(
+		context.Background(), ds, nil,
+		"", "job_jc_2",
+		map[string]interface{}{},
+	)
+	if err == nil {
+		t.Fatal("expected error for empty dispatch_id, got nil")
+	}
+}
+
+func TestHandleJobComplete_ErrorOnMissingJobID(t *testing.T) {
+	db := openTestDB(t)
+	ds := newDispatchStore(t, db)
+
+	_, err := mcpserver.CallJobComplete(
+		context.Background(), ds, nil,
+		"some-dispatch-id", "",
+		map[string]interface{}{},
+	)
+	if err == nil {
+		t.Fatal("expected error for empty job_id, got nil")
+	}
+}
+
+func TestHandleJobComplete_ErrorOnMissingOutputs(t *testing.T) {
+	db := openTestDB(t)
+	ds := newDispatchStore(t, db)
+
+	_, err := mcpserver.CallJobComplete(
+		context.Background(), ds, nil,
+		"some-dispatch-id", "some-job-id",
+		nil,
+	)
+	if err == nil {
+		t.Fatal("expected error for nil outputs, got nil")
+	}
+}
+
+// TestHandleDispatch_FullCycle exercises the full enqueue → next_dispatch →
+// job_complete lifecycle through the MCP handler layer.
+func TestHandleDispatch_FullCycle(t *testing.T) {
+	db := openTestDB(t)
+	createRunForDispatch(t, db, "run_cycle_d")
+	es := store.NewEventStore(db)
+	ds := store.NewDispatchStore(db, es)
+
+	// Step 1: enqueue a dispatch.
+	d := &core.Dispatch{
+		RunID:  "run_cycle_d",
+		Role:   "coder.impl",
+		Prompt: "implement feature Y",
+		Inputs: map[string]interface{}{"spec": "spec.md"},
+	}
+	if err := ds.EnqueueDispatch(context.Background(), d); err != nil {
+		t.Fatalf("EnqueueDispatch: %v", err)
+	}
+
+	// Step 2: claim via orch_next_dispatch.
+	ndOut, err := mcpserver.CallNextDispatch(context.Background(), ds, "coder.impl")
+	if err != nil {
+		t.Fatalf("CallNextDispatch: %v", err)
+	}
+	if ndOut["status"] != "dispatched" {
+		t.Fatalf("next_dispatch status = %q, want dispatched", ndOut["status"])
+	}
+	dispatchID, ok := ndOut["dispatch_id"].(string)
+	if !ok || dispatchID == "" {
+		t.Fatalf("dispatch_id missing from next_dispatch output: %v", ndOut)
+	}
+
+	// Step 3: after claiming, queue should be idle.
+	ndOut2, err := mcpserver.CallNextDispatch(context.Background(), ds, "coder.impl")
+	if err != nil {
+		t.Fatalf("CallNextDispatch (idle check): %v", err)
+	}
+	if ndOut2["status"] != "idle" {
+		t.Errorf("second next_dispatch status = %q, want idle", ndOut2["status"])
+	}
+
+	// Step 4: complete via orch_job_complete.
+	jcOut, err := mcpserver.CallJobComplete(
+		context.Background(), ds, nil,
+		dispatchID, "job_cycle_1",
+		map[string]interface{}{"exit_code": 0, "summary": "done"},
+	)
+	if err != nil {
+		t.Fatalf("CallJobComplete: %v", err)
+	}
+	if jcOut["status"] != "ok" {
+		t.Errorf("job_complete status = %q, want ok", jcOut["status"])
+	}
+
+	// Step 5: verify final state via store.
+	final, err := ds.GetDispatch(context.Background(), dispatchID)
+	if err != nil {
+		t.Fatalf("GetDispatch: %v", err)
+	}
+	if final == nil {
+		t.Fatal("dispatch not found after completion")
+	}
+	if final.State != core.DispatchStateCompleted {
+		t.Errorf("final state = %q, want completed", final.State)
+	}
+}
+
+// ---- orch_role_invoke tests ----
+
 func TestNewServer_WithDispatcher_RegistersRealHandler(t *testing.T) {
 	db := openTestDB(t)
 	repoRoot := findRepoRootFromMCP(t)

@@ -573,10 +573,42 @@ func BuildRenderedPrompt(roleName string, inputs map[string]string, roleDir, pro
 ### Review 1
 
 - **Date:** 2026-04-24
-- **Reviewer:** Codex
+- **Reviewer:** Codex (pre-implementation plan review)
 - **Verdict:** approved (plan staged for implementation)
 
-- [ ] Add required `[OPEN]` findings and file:line details before implementation begins.
+### Review 2
+
+- **Date**: 2026-04-23
+- **Reviewer**: Claude (post-implementation full review)
+- **Verdict**: Changes requested (2 Critical, 6 Important)
+
+**Critical**
+
+1. `[OPEN]` **TOCTOU race in ClaimNextDispatch — double-claim possible.** `store/dispatch_store.go:87-154`. SELECT outside tx then UPDATE inside tx. Two concurrent callers can claim the same dispatch. Fix: use `UPDATE ... WHERE state='pending' AND role=? ORDER BY created_at LIMIT 1 RETURNING *` in a single atomic statement.
+
+2. `[OPEN]` **CompleteDispatch missing state guard.** `store/dispatch_store.go:197-203`. UPDATE is unconditional — allows completing non-leased dispatches. Fix: add `AND state = 'leased'` guard, check rows affected.
+
+**Important**
+
+3. `[OPEN]` **ExpireLeases not atomic per row — can revert completed dispatches.** `store/dispatch_store.go:206-267`. SELECT then individual UPDATEs without state guards. Fix: add `AND state = 'leased'` to the UPDATE.
+
+4. `[OPEN]` **core.EventWriter interface signature mismatch.** `core/event.go:55` vs `store/event_store.go:28`. Interface uses `func(tx interface{})`, store uses `func(tx *sql.Tx)`. EventStore doesn't satisfy EventWriter. Fix: align signatures.
+
+5. `[OPEN]` **Silent error drops in handleJobComplete and handleAttentionAnswer.** `mcp/handlers_dispatch.go:209-214`. `_ = err` with no slog.Warn. Fix: add structured logging.
+
+6. `[OPEN]` **Zero tests for orch_next_dispatch and orch_job_complete MCP handlers.** `mcp/handlers_dispatch_test.go`. Core pull-model tools completely untested at the handler level.
+
+7. `[OPEN]` **DispatchStateExpired never written to DB.** `core/dispatch.go:12`. Dead constant. Fix: remove or use.
+
+8. `[OPEN]` **No post-execution report; decisions.md not updated for Plan 104.** Per CLAUDE.md critical rules.
+
+**Suggestions**
+
+9. `[WONTFIX]` Missing composite index (state, role, created_at) — optimize when performance matters.
+10. `[WONTFIX]` orch_ask_user status "pending" vs plan "asked" — pending is clearer, keep it.
+11. `[OPEN]` Worker registration tools (orch.register/heartbeat/deregister) and orch.findings.create unimplemented — defer to Plan 105 with explicit note.
+12. `[WONTFIX]` mcp/ → coding/ import — accepted coupling; MCP is a transport layer that necessarily knows about dispatch.
+13. `[WONTFIX]` Daemon missing --socket/--listen flags — V1 is stdio-only; update plan to reflect.
 
 ---
 

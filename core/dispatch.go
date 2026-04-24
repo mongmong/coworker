@@ -9,7 +9,8 @@ const (
 	DispatchStatePending   DispatchState = "pending"
 	DispatchStateLeased    DispatchState = "leased"
 	DispatchStateCompleted DispatchState = "completed"
-	DispatchStateExpired   DispatchState = "expired"
+	// Note: expired leases are reset to pending by ExpireLeases, not to a
+	// separate "expired" state. There is no DispatchStateExpired constant.
 )
 
 // Dispatch is a unit of work queued for a persistent CLI worker to pull.
