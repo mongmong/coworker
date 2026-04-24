@@ -10,6 +10,18 @@ import (
 	"github.com/chris/coworker/core"
 )
 
+type recordingBus struct {
+	published []*core.Event
+}
+
+func (b *recordingBus) Publish(event *core.Event) {
+	b.published = append(b.published, event)
+}
+
+func (b *recordingBus) Subscribe(ch chan<- *core.Event) {}
+
+func (b *recordingBus) Unsubscribe(ch chan<- *core.Event) {}
+
 func setupTestDB(t *testing.T) *DB {
 	t.Helper()
 	db, err := Open(":memory:")
@@ -85,6 +97,42 @@ func TestWriteEventThenRow_WritesEventAndApplies(t *testing.T) {
 	}
 }
 
+func TestWriteEventThenRow_PublishesCommittedEvent(t *testing.T) {
+	db := setupTestDB(t)
+	insertTestRun(t, db, "run_publish")
+
+	bus := &recordingBus{}
+	es := NewEventStore(db)
+	es.Bus = bus
+
+	ctx := context.Background()
+	event := &core.Event{
+		ID:            "evt_publish",
+		RunID:         "run_publish",
+		Kind:          core.EventRunCreated,
+		SchemaVersion: 1,
+		Payload:       `{"run_id":"run_publish"}`,
+		CreatedAt:     time.Unix(20, 0).UTC(),
+	}
+
+	if err := es.WriteEventThenRow(ctx, event, nil); err != nil {
+		t.Fatalf("WriteEventThenRow: %v", err)
+	}
+
+	if len(bus.published) != 1 {
+		t.Fatalf("published events = %d, want 1", len(bus.published))
+	}
+	if bus.published[0] != event {
+		t.Fatalf("published event pointer %p, want %p", bus.published[0], event)
+	}
+	if bus.published[0].ID != event.ID {
+		t.Fatalf("published event ID = %q, want %q", bus.published[0].ID, event.ID)
+	}
+	if bus.published[0].Sequence != 1 {
+		t.Fatalf("published event sequence = %d, want 1", bus.published[0].Sequence)
+	}
+}
+
 func TestWriteEventThenRow_ApplyFnFailsRollsBackBoth(t *testing.T) {
 	db := setupTestDB(t)
 	insertTestRun(t, db, "run1")
@@ -117,6 +165,44 @@ func TestWriteEventThenRow_ApplyFnFailsRollsBackBoth(t *testing.T) {
 	}
 }
 
+func TestWriteEventThenRow_ApplyFnFailsDoesNotPublish(t *testing.T) {
+	db := setupTestDB(t)
+	insertTestRun(t, db, "run_fail_publish")
+
+	bus := &recordingBus{}
+	es := NewEventStore(db)
+	es.Bus = bus
+
+	ctx := context.Background()
+	event := &core.Event{
+		ID:            "evt_fail_publish",
+		RunID:         "run_fail_publish",
+		Kind:          core.EventJobCreated,
+		SchemaVersion: 1,
+		Payload:       `{"job_id":"job_fail_publish"}`,
+		CreatedAt:     time.Unix(21, 0).UTC(),
+	}
+
+	err := es.WriteEventThenRow(ctx, event, func(tx *sql.Tx) error {
+		return fmt.Errorf("simulated projection failure")
+	})
+	if err == nil {
+		t.Fatal("expected error from failed applyFn, got nil")
+	}
+
+	if len(bus.published) != 0 {
+		t.Fatalf("published events = %d, want 0", len(bus.published))
+	}
+
+	events, listErr := es.ListEvents(ctx, "run_fail_publish")
+	if listErr != nil {
+		t.Fatalf("ListEvents: %v", listErr)
+	}
+	if len(events) != 0 {
+		t.Fatalf("expected 0 events after rollback, got %d", len(events))
+	}
+}
+
 func TestWriteEventThenRow_NilApplyFn(t *testing.T) {
 	db := setupTestDB(t)
 	insertTestRun(t, db, "run1")
@@ -138,6 +224,34 @@ func TestWriteEventThenRow_NilApplyFn(t *testing.T) {
 	}
 
 	events, err := es.ListEvents(ctx, "run1")
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+}
+
+func TestWriteEventThenRow_NilBusDoesNotPublish(t *testing.T) {
+	db := setupTestDB(t)
+	insertTestRun(t, db, "run_nil_bus")
+
+	es := NewEventStore(db)
+	ctx := context.Background()
+	event := &core.Event{
+		ID:            "evt_nil_bus",
+		RunID:         "run_nil_bus",
+		Kind:          core.EventRunCreated,
+		SchemaVersion: 1,
+		Payload:       `{"run_id":"run_nil_bus"}`,
+		CreatedAt:     time.Unix(22, 0).UTC(),
+	}
+
+	if err := es.WriteEventThenRow(ctx, event, nil); err != nil {
+		t.Fatalf("WriteEventThenRow: %v", err)
+	}
+
+	events, err := es.ListEvents(ctx, "run_nil_bus")
 	if err != nil {
 		t.Fatalf("ListEvents: %v", err)
 	}

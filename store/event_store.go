@@ -10,7 +10,8 @@ import (
 
 // EventStore handles event persistence with the event-log-before-state invariant.
 type EventStore struct {
-	db *DB
+	db  *DB
+	Bus core.EventBus
 }
 
 // NewEventStore creates an EventStore backed by the given DB.
@@ -71,6 +72,10 @@ func (s *EventStore) WriteEventThenRow(ctx context.Context, event *core.Event, a
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit: %w", err)
+	}
+
+	if s.Bus != nil {
+		s.Bus.Publish(event)
 	}
 
 	return nil
