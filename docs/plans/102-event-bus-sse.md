@@ -1586,3 +1586,42 @@ cd /home/chris/workshop/coworker && go run ./cmd/coworker watch --port 7700 --ru
 ```
 
 Expected: one line per matching event, formatted as `timestamp kind run=<id> payload=<summary>`.
+
+---
+
+## Code Review
+
+### Review 1
+
+- **Date**: 2026-04-23
+- **Reviewer**: Claude (full implementation review)
+- **Verdict**: Approved with required fixes
+
+**Critical**
+
+1. `[FIXED]` **Data races in SSE tests and watch test.**
+   → Response: Replaced httptest.ResponseRecorder with mutex-guarded buffers. Race detector passes.
+
+2. `[FIXED]` **`store/snapshot_test_helper.go` compiled into production binary.**
+   → Response: Moved to `internal/testutil/snapshot.go`. Production binary no longer links `testing`.
+
+**Important**
+
+3. `[FIXED]` **Backoff never resets after successful reconnection.**
+   → Response: Reset backoff to initial after stream runs >10s without error.
+
+4. `[FIXED]` **Dropped events silently lost — no observability.**
+   → Response: Added `slog.Warn` on the default branch in Publish.
+
+5. `[FIXED]` **No JSON struct tags on `core.Event`.**
+   → Response: Added `json:"snake_case"` tags. Golden snapshot file regenerated.
+
+**Suggestions (defer)**
+
+6. `[WONTFIX]` SSE filter is client-side after bus delivery — accepted V1 trade-off.
+7. `[WONTFIX]` `watchLoop` reconnect not tested — defer until retry logic becomes more complex.
+8. `[WONTFIX]` No initial SSE comment/heartbeat — add when a real SSE client integration test exists.
+9. `[FIXED]` Add `*.actual` to `.gitignore` for snapshot test failure artifacts.
+10. `[WONTFIX]` `signal.NotifyContext` change undocumented — correct, no action.
+11. `[WONTFIX]` `recordingBus` test double — positive deviation, preserves import discipline.
+12. `[WONTFIX]` `summarizePayload` byte truncation — low-risk for V1 terminal output.
