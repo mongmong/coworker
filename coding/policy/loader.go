@@ -12,18 +12,18 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// PolicyLoader loads and merges policy from multiple layers.
-type PolicyLoader struct {
+// Loader loads and merges policy from multiple layers.
+type Loader struct {
 	GlobalConfigPath string // e.g., ~/.config/coworker/policy.yaml
 	RepoConfigPath   string // e.g., .coworker/policy.yaml
 }
 
 type policyDocument struct {
-	Checkpoints       map[string]core.CheckpointAction    `yaml:"checkpoints"`
-	SupervisorLimits  *supervisorLimitsDocument          `yaml:"supervisor_limits"`
-	ConcurrencyLimits *concurrencyLimitsDocument         `yaml:"concurrency"`
-	PermissionPolicy  *permissionPolicyDocument          `yaml:"permissions"`
-	WorkflowOverrides map[string]map[string][]string      `yaml:"workflow_overrides"`
+	Checkpoints       map[string]core.CheckpointAction `yaml:"checkpoints"`
+	SupervisorLimits  *supervisorLimitsDocument        `yaml:"supervisor_limits"`
+	ConcurrencyLimits *concurrencyLimitsDocument       `yaml:"concurrency"`
+	PermissionPolicy  *permissionPolicyDocument        `yaml:"permissions"`
+	WorkflowOverrides map[string]map[string][]string   `yaml:"workflow_overrides"`
 }
 
 type supervisorLimitsDocument struct {
@@ -41,7 +41,7 @@ type permissionPolicyDocument struct {
 }
 
 // LoadPolicy merges policy layers in order: built-in -> global -> repo.
-func (l *PolicyLoader) LoadPolicy() (*core.Policy, error) {
+func (l *Loader) LoadPolicy() (*core.Policy, error) {
 	policy := DefaultPolicy()
 	defaultSourceMap(policy)
 
@@ -59,7 +59,7 @@ func (l *PolicyLoader) LoadPolicy() (*core.Policy, error) {
 	return policy, nil
 }
 
-func (l *PolicyLoader) mergeFromPath(policy *core.Policy, path string, source string) error {
+func (l *Loader) mergeFromPath(policy *core.Policy, path string, source string) error {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -77,7 +77,7 @@ func (l *PolicyLoader) mergeFromPath(policy *core.Policy, path string, source st
 	return nil
 }
 
-func (l *PolicyLoader) mergePolicy(policy *core.Policy, doc *policyDocument, source string) {
+func (l *Loader) mergePolicy(policy *core.Policy, doc *policyDocument, source string) {
 	if doc.Checkpoints != nil {
 		if policy.Checkpoints == nil {
 			policy.Checkpoints = make(map[string]core.CheckpointAction)
@@ -153,39 +153,39 @@ func InspectString(policy *core.Policy) string {
 		if src == "" {
 			src = builtinSource
 		}
-		sb.WriteString(fmt.Sprintf("  %s: %s (from %s)\n", checkpoint, action, src))
+		fmt.Fprintf(&sb, "  %s: %s (from %s)\n", checkpoint, action, src)
 	}
 
 	sb.WriteString("\n## Supervisor Limits\n")
-	sb.WriteString(fmt.Sprintf(
+	fmt.Fprintf(&sb,
 		"  max_retries_per_job: %d (from %s)\n",
 		policy.SupervisorLimits.MaxRetriesPerJob,
 		sourceOrDefault(policy.Source["supervisor_limits.max_retries_per_job"]),
-	))
-	sb.WriteString(fmt.Sprintf(
+	)
+	fmt.Fprintf(&sb,
 		"  max_fix_cycles_per_phase: %d (from %s)\n",
 		policy.SupervisorLimits.MaxFixCyclesPerPhase,
 		sourceOrDefault(policy.Source["supervisor_limits.max_fix_cycles_per_phase"]),
-	))
+	)
 
 	sb.WriteString("\n## Concurrency\n")
-	sb.WriteString(fmt.Sprintf(
+	fmt.Fprintf(&sb,
 		"  max_parallel_plans: %d (from %s)\n",
 		policy.ConcurrencyLimits.MaxParallelPlans,
 		sourceOrDefault(policy.Source["concurrency.max_parallel_plans"]),
-	))
-	sb.WriteString(fmt.Sprintf(
+	)
+	fmt.Fprintf(&sb,
 		"  max_parallel_reviewers: %d (from %s)\n",
 		policy.ConcurrencyLimits.MaxParallelReviewers,
 		sourceOrDefault(policy.Source["concurrency.max_parallel_reviewers"]),
-	))
+	)
 
 	sb.WriteString("\n## Permissions\n")
-	sb.WriteString(fmt.Sprintf(
+	fmt.Fprintf(&sb,
 		"  on_undeclared: %s (from %s)\n",
 		policy.PermissionPolicy.OnUndeclared,
 		sourceOrDefault(policy.Source["permissions.on_undeclared"]),
-	))
+	)
 
 	sb.WriteString("\n## Workflow Overrides\n")
 	if len(policy.WorkflowOverrides) == 0 {
@@ -209,7 +209,7 @@ func InspectString(policy *core.Policy) string {
 		sort.Strings(stageNames)
 		for _, stage := range stageNames {
 			key := fmt.Sprintf("workflow_overrides.%s.%s", workflow, stage)
-			sb.WriteString(fmt.Sprintf("    %s: %v (from %s)\n", stage, stages[stage], sourceOrDefault(policy.Source[key])))
+			fmt.Fprintf(&sb, "    %s: %v (from %s)\n", stage, stages[stage], sourceOrDefault(policy.Source[key]))
 		}
 	}
 

@@ -40,7 +40,7 @@ func TestSessionLifecycle(t *testing.T) {
 	eventStore := store.NewEventStore(db)
 	runStore := store.NewRunStore(db, eventStore)
 	jobStore := store.NewJobStore(db, eventStore)
-	sm := &session.SessionManager{
+	sm := &session.Manager{
 		RunStore: runStore,
 		LockPath: lockPath,
 	}

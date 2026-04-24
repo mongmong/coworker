@@ -54,7 +54,7 @@ func runGit(t *testing.T, dir string, args ...string) string {
 
 func writeFile(t *testing.T, path, content string) {
 	t.Helper()
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatalf("write %q: %v", path, err)
 	}
 }
@@ -80,7 +80,7 @@ func TestRecordCommit_HappyPath(t *testing.T) {
 
 	jobStore := &fakeJobStore{}
 	eventWriter := &fakeEventWriter{}
-	recorder := &HumanEditRecorder{
+	recorder := &Recorder{
 		RepoPath:    repoDir,
 		JobStore:    jobStore,
 		EventWriter: eventWriter,
@@ -158,7 +158,7 @@ func TestRecordCommit_InvalidSHA(t *testing.T) {
 
 	jobStore := &fakeJobStore{}
 	eventWriter := &fakeEventWriter{}
-	recorder := &HumanEditRecorder{
+	recorder := &Recorder{
 		RepoPath:    repoDir,
 		JobStore:    jobStore,
 		EventWriter: eventWriter,
@@ -186,7 +186,7 @@ func TestRecordCommit_MissingRepo(t *testing.T) {
 
 	jobStore := &fakeJobStore{}
 	eventWriter := &fakeEventWriter{}
-	recorder := &HumanEditRecorder{
+	recorder := &Recorder{
 		RepoPath:    missingRepo,
 		JobStore:    jobStore,
 		EventWriter: eventWriter,

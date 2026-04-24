@@ -18,20 +18,20 @@ import (
 const defaultSessionLockPath = ".coworker/session.lock"
 
 var (
-	ErrNoActiveSession  = errors.New("no active session")
-	errInvalidSession   = errors.New("invalid session lock")
-	errMissingRunStore  = errors.New("run store is required")
+	ErrNoActiveSession = errors.New("no active session")
+	errInvalidSession  = errors.New("invalid session lock")
+	errMissingRunStore = errors.New("run store is required")
 )
 
-// SessionManager manages interactive session lifecycle + lock file state.
-type SessionManager struct {
+// Manager manages interactive session lifecycle + lock file state.
+type Manager struct {
 	RunStore *store.RunStore
 	LockPath string
 	PID      int
 }
 
 // StartSession creates a run and stores the active session ID in the lock file.
-func (sm *SessionManager) StartSession() (string, error) {
+func (sm *Manager) StartSession() (string, error) {
 	if sm.RunStore == nil {
 		return "", errMissingRunStore
 	}
@@ -60,7 +60,7 @@ func (sm *SessionManager) StartSession() (string, error) {
 //
 // A session is considered inactive if there is no lock file, the lock file
 // is malformed, the run cannot be loaded, or the run state is not active.
-func (sm *SessionManager) CurrentSession() (string, error) {
+func (sm *Manager) CurrentSession() (string, error) {
 	if sm.RunStore == nil {
 		return "", errMissingRunStore
 	}
@@ -86,7 +86,7 @@ func (sm *SessionManager) CurrentSession() (string, error) {
 }
 
 // EndSession completes the active run and removes the lock file.
-func (sm *SessionManager) EndSession() error {
+func (sm *Manager) EndSession() error {
 	if sm.RunStore == nil {
 		return errMissingRunStore
 	}
@@ -107,7 +107,7 @@ func (sm *SessionManager) EndSession() error {
 	return nil
 }
 
-func (sm *SessionManager) writeLock(runID string) error {
+func (sm *Manager) writeLock(runID string) error {
 	lockPath := sm.lockPath()
 	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
 		return fmt.Errorf("create lock directory: %w", err)
@@ -124,7 +124,7 @@ func (sm *SessionManager) writeLock(runID string) error {
 
 	payload := strings.Join(lines, "\n")
 	tmp := lockPath + ".tmp"
-	if err := os.WriteFile(tmp, []byte(payload), 0o644); err != nil {
+	if err := os.WriteFile(tmp, []byte(payload), 0o600); err != nil {
 		return fmt.Errorf("write temporary lock file: %w", err)
 	}
 	if err := os.Rename(tmp, lockPath); err != nil {
@@ -134,7 +134,7 @@ func (sm *SessionManager) writeLock(runID string) error {
 	return nil
 }
 
-func (sm *SessionManager) readLock() (string, error) {
+func (sm *Manager) readLock() (string, error) {
 	data, err := os.ReadFile(sm.lockPath())
 	if os.IsNotExist(err) {
 		return "", ErrNoActiveSession
@@ -160,7 +160,7 @@ func (sm *SessionManager) readLock() (string, error) {
 	return strings.TrimSpace(lines[0]), nil
 }
 
-func (sm *SessionManager) lockPath() string {
+func (sm *Manager) lockPath() string {
 	if sm.LockPath == "" {
 		return defaultSessionLockPath
 	}

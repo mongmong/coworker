@@ -19,8 +19,8 @@ type JobCreator interface {
 	CreateJob(ctx context.Context, job *core.Job) error
 }
 
-// HumanEditRecorder emits synthetic jobs for human commit activity.
-type HumanEditRecorder struct {
+// Recorder emits synthetic jobs for human commit activity.
+type Recorder struct {
 	JobStore    JobCreator
 	EventWriter core.EventWriter
 	RepoPath    string
@@ -43,7 +43,7 @@ func runGitCommand(ctx context.Context, repoPath string, args ...string) (string
 }
 
 // RecordCommit emits a synthetic completed human-edit job and a human-edit event.
-func (r *HumanEditRecorder) RecordCommit(ctx context.Context, runID, commitSHA string) error {
+func (r *Recorder) RecordCommit(ctx context.Context, runID, commitSHA string) error {
 	logger := r.Logger
 	if logger == nil {
 		logger = slog.Default()

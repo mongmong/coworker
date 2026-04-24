@@ -14,19 +14,19 @@ const (
 
 // AttentionItem is a unified human-input request blocking a run or job.
 type AttentionItem struct {
-	ID          string            `json:"id"`
-	RunID       string            `json:"run_id"`
-	Kind        AttentionKind     `json:"kind"`
-	Source      string            `json:"source"`
-	JobID       string            `json:"job_id,omitempty"`
-	Question    string            `json:"question,omitempty"`
-	Options     []string          `json:"options,omitempty"`
-	PresentedOn []string          `json:"presented_on,omitempty"` // e.g., ["tui", "cli_pane_1"]
-	AnsweredOn  []string          `json:"answered_on,omitempty"`
-	AnsweredBy  string            `json:"answered_by,omitempty"`
-	Answer      string            `json:"answer,omitempty"`
-	CreatedAt   time.Time         `json:"created_at"`
-	ResolvedAt  *time.Time        `json:"resolved_at,omitempty"`
+	ID          string        `json:"id"`
+	RunID       string        `json:"run_id"`
+	Kind        AttentionKind `json:"kind"`
+	Source      string        `json:"source"`
+	JobID       string        `json:"job_id,omitempty"`
+	Question    string        `json:"question,omitempty"`
+	Options     []string      `json:"options,omitempty"`
+	PresentedOn []string      `json:"presented_on,omitempty"` // e.g., ["tui", "cli_pane_1"]
+	AnsweredOn  []string      `json:"answered_on,omitempty"`
+	AnsweredBy  string        `json:"answered_by,omitempty"`
+	Answer      string        `json:"answer,omitempty"`
+	CreatedAt   time.Time     `json:"created_at"`
+	ResolvedAt  *time.Time    `json:"resolved_at,omitempty"`
 }
 
 // IsAnswered returns true if the item has been answered.

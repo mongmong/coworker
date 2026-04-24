@@ -32,7 +32,7 @@ func runConfigInspect(cmd *cobra.Command) error {
 		return fmt.Errorf("resolve HOME directory: %w", err)
 	}
 
-	loader := &policypkg.PolicyLoader{
+	loader := &policypkg.Loader{
 		GlobalConfigPath: filepath.Join(home, ".config", "coworker", "policy.yaml"),
 		RepoConfigPath:   filepath.Join(".coworker", "policy.yaml"),
 	}

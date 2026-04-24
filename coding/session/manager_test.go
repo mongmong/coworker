@@ -8,22 +8,22 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
 	"testing"
+	"time"
 
 	"github.com/chris/coworker/core"
 	"github.com/chris/coworker/store"
 )
 
-func TestSessionManager_StartSession(t *testing.T) {
+func TestManager_StartSession(t *testing.T) {
 	t.Parallel()
 
-	db, runStore := setupSessionManagerDependencies(t)
+	db, runStore := setupManagerDependencies(t)
 	defer db.Close()
 
 	dir := t.TempDir()
 	lockPath := filepath.Join(dir, ".coworker", "session.lock")
-	sm := &SessionManager{RunStore: runStore, LockPath: lockPath}
+	sm := &Manager{RunStore: runStore, LockPath: lockPath}
 
 	runID, err := sm.StartSession()
 	if err != nil {
@@ -56,15 +56,15 @@ func TestSessionManager_StartSession(t *testing.T) {
 	}
 }
 
-func TestSessionManager_CurrentSession(t *testing.T) {
+func TestManager_CurrentSession(t *testing.T) {
 	t.Parallel()
 
-	db, runStore := setupSessionManagerDependencies(t)
+	db, runStore := setupManagerDependencies(t)
 	defer db.Close()
 
 	dir := t.TempDir()
 	lockPath := filepath.Join(dir, "session.lock")
-	sm := &SessionManager{RunStore: runStore, LockPath: lockPath}
+	sm := &Manager{RunStore: runStore, LockPath: lockPath}
 
 	runID := "run_current_1"
 	if err := runStore.CreateRun(context.Background(), &core.Run{
@@ -75,7 +75,7 @@ func TestSessionManager_CurrentSession(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("create run: %v", err)
 	}
-	if err := os.WriteFile(lockPath, []byte(fmt.Sprintf("%s\n%d", runID, os.Getpid())), 0o644); err != nil {
+	if err := os.WriteFile(lockPath, []byte(fmt.Sprintf("%s\n%d", runID, os.Getpid())), 0o600); err != nil {
 		t.Fatalf("write lock file: %v", err)
 	}
 
@@ -88,15 +88,15 @@ func TestSessionManager_CurrentSession(t *testing.T) {
 	}
 }
 
-func TestSessionManager_EndSession(t *testing.T) {
+func TestManager_EndSession(t *testing.T) {
 	t.Parallel()
 
-	db, runStore := setupSessionManagerDependencies(t)
+	db, runStore := setupManagerDependencies(t)
 	defer db.Close()
 
 	dir := t.TempDir()
 	lockPath := filepath.Join(dir, "session.lock")
-	sm := &SessionManager{RunStore: runStore, LockPath: lockPath}
+	sm := &Manager{RunStore: runStore, LockPath: lockPath}
 
 	runID, err := sm.StartSession()
 	if err != nil {
@@ -120,13 +120,13 @@ func TestSessionManager_EndSession(t *testing.T) {
 	}
 }
 
-func TestSessionManager_CurrentSession_NoActiveSession(t *testing.T) {
-	db, runStore := setupSessionManagerDependencies(t)
+func TestManager_CurrentSession_NoActiveSession(t *testing.T) {
+	db, runStore := setupManagerDependencies(t)
 	defer db.Close()
 
 	dir := t.TempDir()
 	lockPath := filepath.Join(dir, "session.lock")
-	sm := &SessionManager{RunStore: runStore, LockPath: lockPath}
+	sm := &Manager{RunStore: runStore, LockPath: lockPath}
 
 	_, err := sm.CurrentSession()
 	if err == nil {
@@ -137,13 +137,13 @@ func TestSessionManager_CurrentSession_NoActiveSession(t *testing.T) {
 	}
 }
 
-func TestSessionManager_CurrentSession_StaleLock(t *testing.T) {
-	db, runStore := setupSessionManagerDependencies(t)
+func TestManager_CurrentSession_StaleLock(t *testing.T) {
+	db, runStore := setupManagerDependencies(t)
 	defer db.Close()
 
 	dir := t.TempDir()
 	lockPath := filepath.Join(dir, "session.lock")
-	sm := &SessionManager{RunStore: runStore, LockPath: lockPath}
+	sm := &Manager{RunStore: runStore, LockPath: lockPath}
 
 	staleRunID := "run_stale"
 	if err := runStore.CreateRun(context.Background(), &core.Run{
@@ -157,7 +157,7 @@ func TestSessionManager_CurrentSession_StaleLock(t *testing.T) {
 	if err := runStore.CompleteRun(context.Background(), staleRunID, core.RunStateCompleted); err != nil {
 		t.Fatalf("complete stale run: %v", err)
 	}
-	if err := os.WriteFile(lockPath, []byte(fmt.Sprintf("%s\n%d", staleRunID, 99999)), 0o644); err != nil {
+	if err := os.WriteFile(lockPath, []byte(fmt.Sprintf("%s\n%d", staleRunID, 99999)), 0o600); err != nil {
 		t.Fatalf("write lock file: %v", err)
 	}
 
@@ -170,7 +170,7 @@ func TestSessionManager_CurrentSession_StaleLock(t *testing.T) {
 	}
 }
 
-func setupSessionManagerDependencies(t *testing.T) (*store.DB, *store.RunStore) {
+func setupManagerDependencies(t *testing.T) (*store.DB, *store.RunStore) {
 	db, err := store.Open(":memory:")
 	if err != nil {
 		t.Fatalf("open db: %v", err)

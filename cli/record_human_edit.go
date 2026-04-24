@@ -54,7 +54,7 @@ Example:
 func init() {
 	recordHumanEditCmd.Flags().StringVar(&recordHumanEditDBPath, "db", "", "Path to SQLite database (default: .coworker/state.db)")
 	recordHumanEditCmd.Flags().StringVar(&recordHumanEditCommit, "commit", "", "Git commit SHA to record (required)")
-	recordHumanEditCmd.MarkFlagRequired("commit")
+	_ = recordHumanEditCmd.MarkFlagRequired("commit")
 	rootCmd.AddCommand(recordHumanEditCmd)
 }
 
@@ -77,7 +77,7 @@ func runRecordHumanEdit(cmd *cobra.Command) error {
 
 	eventStore := store.NewEventStore(db)
 	runStore := store.NewRunStore(db, eventStore)
-	sm := &session.SessionManager{
+	sm := &session.Manager{
 		RunStore: runStore,
 		LockPath: filepath.Join(".coworker", "session.lock"),
 	}
@@ -86,7 +86,7 @@ func runRecordHumanEdit(cmd *cobra.Command) error {
 		return fmt.Errorf("read session: %w", err)
 	}
 
-	recorder := &humanedit.HumanEditRecorder{
+	recorder := &humanedit.Recorder{
 		JobStore:    store.NewJobStore(db, eventStore),
 		EventWriter: &recordHumanEditEventWriter{store: eventStore},
 		RepoPath:    ".",

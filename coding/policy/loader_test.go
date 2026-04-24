@@ -11,7 +11,7 @@ import (
 func TestLoadPolicy_Defaults(t *testing.T) {
 	t.Parallel()
 
-	loader := &PolicyLoader{}
+	loader := &Loader{}
 	policy, err := loader.LoadPolicy()
 	if err != nil {
 		t.Fatalf("LoadPolicy: %v", err)
@@ -66,7 +66,7 @@ workflow_overrides:
 		t.Fatalf("write repo policy: %v", err)
 	}
 
-	loader := &PolicyLoader{
+	loader := &Loader{
 		GlobalConfigPath: globalPath,
 		RepoConfigPath:   repoPath,
 	}
@@ -113,7 +113,7 @@ func TestLoadPolicy_InvalidYAML(t *testing.T) {
 		t.Fatalf("write bad policy: %v", err)
 	}
 
-	loader := &PolicyLoader{GlobalConfigPath: globalPath}
+	loader := &Loader{GlobalConfigPath: globalPath}
 	if _, err := loader.LoadPolicy(); err == nil {
 		t.Fatal("expected error for invalid YAML, got nil")
 	}

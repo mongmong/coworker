@@ -150,7 +150,7 @@ supervisor_limits:
 		t.Fatalf("write policy.yaml: %v", err)
 	}
 
-	loaded, err := (&policy.PolicyLoader{RepoConfigPath: policyPath}).LoadPolicy()
+	loaded, err := (&policy.Loader{RepoConfigPath: policyPath}).LoadPolicy()
 	if err != nil {
 		t.Fatalf("LoadPolicy() error = %v", err)
 	}
@@ -171,4 +171,3 @@ supervisor_limits:
 		t.Fatalf("checkpoint ready-to-ship source = %q, want built-in default", got)
 	}
 }
-

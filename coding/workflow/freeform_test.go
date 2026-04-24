@@ -32,10 +32,10 @@ func TestFreeformWorkflow_Dispatch(t *testing.T) {
 	tmpDir := t.TempDir()
 	diffPath := filepath.Join(tmpDir, "diff.txt")
 	specPath := filepath.Join(tmpDir, "spec.md")
-	if err := os.WriteFile(diffPath, []byte("diff content"), 0o644); err != nil {
+	if err := os.WriteFile(diffPath, []byte("diff content"), 0o600); err != nil {
 		t.Fatalf("write diff file: %v", err)
 	}
-	if err := os.WriteFile(specPath, []byte("spec content"), 0o644); err != nil {
+	if err := os.WriteFile(specPath, []byte("spec content"), 0o600); err != nil {
 		t.Fatalf("write spec file: %v", err)
 	}
 

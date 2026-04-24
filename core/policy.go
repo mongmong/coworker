@@ -29,10 +29,10 @@ type PermissionPolicy struct {
 
 // Policy represents the merged policy configuration.
 type Policy struct {
-	Checkpoints       map[string]CheckpointAction         `yaml:"checkpoints" json:"checkpoints"`
-	SupervisorLimits  SupervisorLimits                    `yaml:"supervisor_limits" json:"supervisor_limits"`
-	ConcurrencyLimits ConcurrencyLimits                   `yaml:"concurrency" json:"concurrency"`
-	PermissionPolicy  PermissionPolicy                    `yaml:"permissions" json:"permissions"`
-	WorkflowOverrides map[string]map[string][]string      `yaml:"workflow_overrides" json:"workflow_overrides"`
-	Source            map[string]string                   `json:"-" yaml:"-"`
+	Checkpoints       map[string]CheckpointAction    `yaml:"checkpoints" json:"checkpoints"`
+	SupervisorLimits  SupervisorLimits               `yaml:"supervisor_limits" json:"supervisor_limits"`
+	ConcurrencyLimits ConcurrencyLimits              `yaml:"concurrency" json:"concurrency"`
+	PermissionPolicy  PermissionPolicy               `yaml:"permissions" json:"permissions"`
+	WorkflowOverrides map[string]map[string][]string `yaml:"workflow_overrides" json:"workflow_overrides"`
+	Source            map[string]string              `json:"-" yaml:"-"`
 }

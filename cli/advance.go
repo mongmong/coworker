@@ -47,7 +47,7 @@ func runAdvance(cmd *cobra.Command, args []string) error {
 	}
 	defer db.Close()
 
-	sm := &session.SessionManager{
+	sm := &session.Manager{
 		RunStore: store.NewRunStore(db, store.NewEventStore(db)),
 		LockPath: filepath.Join(".coworker", "session.lock"),
 	}
