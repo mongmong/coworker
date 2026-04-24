@@ -584,21 +584,28 @@ func BuildRenderedPrompt(roleName string, inputs map[string]string, roleDir, pro
 
 **Critical**
 
-1. `[OPEN]` **TOCTOU race in ClaimNextDispatch — double-claim possible.** `store/dispatch_store.go:87-154`. SELECT outside tx then UPDATE inside tx. Two concurrent callers can claim the same dispatch. Fix: use `UPDATE ... WHERE state='pending' AND role=? ORDER BY created_at LIMIT 1 RETURNING *` in a single atomic statement.
+1. `[FIXED]` **TOCTOU race in ClaimNextDispatch — double-claim possible.**
+   → Response: Rewrote to SELECT+UPDATE inside single tx with `AND state='pending'` guard + RowsAffected check.
 
-2. `[OPEN]` **CompleteDispatch missing state guard.** `store/dispatch_store.go:197-203`. UPDATE is unconditional — allows completing non-leased dispatches. Fix: add `AND state = 'leased'` guard, check rows affected.
+2. `[FIXED]` **CompleteDispatch missing state guard.**
+   → Response: Added `AND state = 'leased'` + RowsAffected check. Returns error if not in leased state.
 
 **Important**
 
-3. `[OPEN]` **ExpireLeases not atomic per row — can revert completed dispatches.** `store/dispatch_store.go:206-267`. SELECT then individual UPDATEs without state guards. Fix: add `AND state = 'leased'` to the UPDATE.
+3. `[FIXED]` **ExpireLeases not atomic per row.**
+   → Response: Added `AND state = 'leased'` guard. Silently skips concurrently completed dispatches.
 
-4. `[OPEN]` **core.EventWriter interface signature mismatch.** `core/event.go:55` vs `store/event_store.go:28`. Interface uses `func(tx interface{})`, store uses `func(tx *sql.Tx)`. EventStore doesn't satisfy EventWriter. Fix: align signatures.
+4. `[FIXED]` **core.EventWriter interface signature mismatch.**
+   → Response: Changed to `func(tx any) error` — identical to `interface{}` in Go, existing implementations still satisfy.
 
-5. `[OPEN]` **Silent error drops in handleJobComplete and handleAttentionAnswer.** `mcp/handlers_dispatch.go:209-214`. `_ = err` with no slog.Warn. Fix: add structured logging.
+5. `[FIXED]` **Silent error drops in handleJobComplete and handleAttentionAnswer.**
+   → Response: Replaced `_ = err` with `slog.Warn(...)` in both locations.
 
-6. `[OPEN]` **Zero tests for orch_next_dispatch and orch_job_complete MCP handlers.** `mcp/handlers_dispatch_test.go`. Core pull-model tools completely untested at the handler level.
+6. `[FIXED]` **Zero tests for orch_next_dispatch and orch_job_complete MCP handlers.**
+   → Response: Added 11 new handler tests covering idle, dispatch, errors, and full cycle.
 
-7. `[OPEN]` **DispatchStateExpired never written to DB.** `core/dispatch.go:12`. Dead constant. Fix: remove or use.
+7. `[FIXED]` **DispatchStateExpired never written to DB.**
+   → Response: Removed dead constant, added clarifying comment.
 
 8. `[OPEN]` **No post-execution report; decisions.md not updated for Plan 104.** Per CLAUDE.md critical rules.
 
