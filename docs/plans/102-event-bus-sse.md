@@ -80,7 +80,7 @@ type EventBus interface {
 
 5. `store.EventStore` gets an optional `Bus core.EventBus` field. Publication happens only after `tx.Commit()` succeeds; failed transactions never publish.
 
-6. The snapshot helper must normalize volatile IDs while preserving event ordering, kinds, schema versions, and meaningful payload fields. Plan 100 integration tests currently generate random run/job/finding IDs and timestamps, so a raw event dump would produce unstable goldens.
+6. The snapshot helper must normalize volatile IDs while preserving event ordering, kinds, schema versions, and meaningful payload fields. It intentionally omits volatile timestamps from the golden snapshot so Plan 100 integration tests stay deterministic without rewriting the runtime clock first.
 
 7. This plan does not add a replay buffer or server bootstrap. The reusable SSE handler is the production contract; the process that owns the HTTP server mounts it at `/events`. Tests use `httptest.NewServer` to verify the contract end-to-end before a daemon command exists.
 
@@ -125,132 +125,132 @@ import (
 	"github.com/chris/coworker/core"
 )
 
-	func TestInMemoryBus_SubscribePublishUnsubscribe(t *testing.T) {
-		t.Parallel()
+func TestInMemoryBus_SubscribePublishUnsubscribe(t *testing.T) {
+	t.Parallel()
 
-		bus := NewInMemoryBus()
-		sub := make(chan *core.Event, 1)
-		bus.Subscribe(sub)
+	bus := NewInMemoryBus()
+	sub := make(chan *core.Event, 1)
+	bus.Subscribe(sub)
 
-		event := &core.Event{
-			ID:            "evt_subscribe",
-			RunID:         "run_subscribe",
-			Sequence:      1,
-			Kind:          core.EventRunCreated,
-			SchemaVersion: 1,
-			Payload:       `{"run_id":"run_subscribe"}`,
-			CreatedAt:     time.Unix(1, 0).UTC(),
+	event := &core.Event{
+		ID:            "evt_subscribe",
+		RunID:         "run_subscribe",
+		Sequence:      1,
+		Kind:          core.EventRunCreated,
+		SchemaVersion: 1,
+		Payload:       `{"run_id":"run_subscribe"}`,
+		CreatedAt:     time.Unix(1, 0).UTC(),
+	}
+
+	bus.Publish(event)
+
+	select {
+	case got := <-sub:
+		if got != event {
+			t.Fatalf("received event pointer %p, want %p", got, event)
 		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for published event")
+	}
 
+	bus.Unsubscribe(sub)
+	bus.Publish(&core.Event{ID: "evt_after_unsubscribe"})
+
+	select {
+	case got := <-sub:
+		t.Fatalf("received event after unsubscribe: %+v", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestInMemoryBus_SlowSubscriberDoesNotBlock(t *testing.T) {
+	t.Parallel()
+
+	bus := NewInMemoryBus()
+	slow := make(chan *core.Event)
+	fast := make(chan *core.Event, 1)
+
+	bus.Subscribe(slow)
+	bus.Subscribe(fast)
+
+	done := make(chan struct{})
+	event := &core.Event{
+		ID:            "evt_non_blocking",
+		RunID:         "run_non_blocking",
+		Sequence:      1,
+		Kind:          core.EventJobCreated,
+		SchemaVersion: 1,
+		Payload:       `{"job_id":"job_1"}`,
+		CreatedAt:     time.Unix(2, 0).UTC(),
+	}
+
+	go func() {
 		bus.Publish(event)
+		close(done)
+	}()
 
-		select {
-		case got := <-sub:
-			if got != event {
-				t.Fatalf("received event pointer %p, want %p", got, event)
-			}
-		case <-time.After(time.Second):
-			t.Fatal("timed out waiting for published event")
-		}
-
-		bus.Unsubscribe(sub)
-		bus.Publish(&core.Event{ID: "evt_after_unsubscribe"})
-
-		select {
-		case got := <-sub:
-			t.Fatalf("received event after unsubscribe: %+v", got)
-		case <-time.After(50 * time.Millisecond):
-		}
+	select {
+	case <-done:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("Publish blocked on a slow subscriber")
 	}
 
-	func TestInMemoryBus_SlowSubscriberDoesNotBlock(t *testing.T) {
-		t.Parallel()
-
-		bus := NewInMemoryBus()
-		slow := make(chan *core.Event)
-		fast := make(chan *core.Event, 1)
-
-		bus.Subscribe(slow)
-		bus.Subscribe(fast)
-
-		done := make(chan struct{})
-		event := &core.Event{
-			ID:            "evt_non_blocking",
-			RunID:         "run_non_blocking",
-			Sequence:      1,
-			Kind:          core.EventJobCreated,
-			SchemaVersion: 1,
-			Payload:       `{"job_id":"job_1"}`,
-			CreatedAt:     time.Unix(2, 0).UTC(),
+	select {
+	case got := <-fast:
+		if got != event {
+			t.Fatalf("fast subscriber received %p, want %p", got, event)
 		}
+	case <-time.After(time.Second):
+		t.Fatal("fast subscriber did not receive the event")
+	}
+}
 
+func TestInMemoryBus_ConcurrentPublishIsSafe(t *testing.T) {
+	t.Parallel()
+
+	const (
+		publishers         = 8
+		eventsPerPublisher = 25
+		totalEvents        = publishers * eventsPerPublisher
+	)
+
+	bus := NewInMemoryBus()
+	sub := make(chan *core.Event, totalEvents)
+	bus.Subscribe(sub)
+
+	var wg sync.WaitGroup
+	for publisher := 0; publisher < publishers; publisher++ {
+		publisher := publisher
+		wg.Add(1)
 		go func() {
-			bus.Publish(event)
-			close(done)
+			defer wg.Done()
+			for i := 0; i < eventsPerPublisher; i++ {
+				bus.Publish(&core.Event{
+					ID:            fmt.Sprintf("evt_%d_%d", publisher, i),
+					RunID:         "run_concurrent",
+					Sequence:      publisher*eventsPerPublisher + i + 1,
+					Kind:          core.EventJobCompleted,
+					SchemaVersion: 1,
+					Payload:       fmt.Sprintf(`{"publisher":%d,"index":%d}`, publisher, i),
+					CreatedAt:     time.Unix(int64(i+1), 0).UTC(),
+				})
+			}
 		}()
-
-		select {
-		case <-done:
-		case <-time.After(250 * time.Millisecond):
-			t.Fatal("Publish blocked on a slow subscriber")
-		}
-
-		select {
-		case got := <-fast:
-			if got != event {
-				t.Fatalf("fast subscriber received %p, want %p", got, event)
-			}
-		case <-time.After(time.Second):
-			t.Fatal("fast subscriber did not receive the event")
-		}
 	}
 
-	func TestInMemoryBus_ConcurrentPublishIsSafe(t *testing.T) {
-		t.Parallel()
+	wg.Wait()
 
-		const (
-			publishers        = 8
-			eventsPerPublisher = 25
-			totalEvents        = publishers * eventsPerPublisher
-		)
-
-		bus := NewInMemoryBus()
-		sub := make(chan *core.Event, totalEvents)
-		bus.Subscribe(sub)
-
-		var wg sync.WaitGroup
-		for publisher := 0; publisher < publishers; publisher++ {
-			publisher := publisher
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				for i := 0; i < eventsPerPublisher; i++ {
-					bus.Publish(&core.Event{
-						ID:            fmt.Sprintf("evt_%d_%d", publisher, i),
-						RunID:         "run_concurrent",
-						Sequence:      publisher*eventsPerPublisher + i + 1,
-						Kind:          core.EventJobCompleted,
-						SchemaVersion: 1,
-						Payload:       fmt.Sprintf(`{"publisher":%d,"index":%d}`, publisher, i),
-						CreatedAt:     time.Unix(int64(i+1), 0).UTC(),
-					})
-				}
-			}()
-		}
-
-		wg.Wait()
-
-		received := 0
-		deadline := time.After(2 * time.Second)
-		for received < totalEvents {
-			select {
-			case <-sub:
-				received++
-			case <-deadline:
-				t.Fatalf("received %d events, want %d", received, totalEvents)
-			}
+	received := 0
+	deadline := time.After(2 * time.Second)
+	for received < totalEvents {
+		select {
+		case <-sub:
+			received++
+		case <-deadline:
+			t.Fatalf("received %d events, want %d", received, totalEvents)
 		}
 	}
+}
 ```
 
 ### Step 1.3: Run the new tests and confirm they fail on missing implementation
@@ -919,7 +919,7 @@ func TestWatchStream_PrintsMatchingEvents(t *testing.T) {
 	if strings.Contains(got, "job_skip_run") {
 		t.Fatalf("unexpected output for filtered run: %q", got)
 	}
-	if strings.Contains(got, "evt_skip_kind") {
+	if strings.Contains(got, "run.created") {
 		t.Fatalf("unexpected output for filtered kind: %q", got)
 	}
 }
@@ -1176,6 +1176,8 @@ Expected: one commit for the CLI surface.
 
 - [ ] Create `store/snapshot_test_helper.go`:
 
+This helper is intentionally aimed at the current integration-test shape: one runtime run per test database. It snapshots the full `events` table ordered by `sequence`, which matches the Plan 100 end-to-end test and the spec's "sequence defines strict ordering within a run" rule.
+
 ```go
 package store
 
@@ -1308,7 +1310,7 @@ func loadEventSnapshot(db *DB) ([]eventSnapshot, error) {
 			COALESCE(idempotency_key, ''), COALESCE(causation_id, ''), COALESCE(correlation_id, ''),
 			payload
 		FROM events
-		ORDER BY run_id ASC, sequence ASC`,
+		ORDER BY sequence ASC`,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("query events for snapshot: %w", err)

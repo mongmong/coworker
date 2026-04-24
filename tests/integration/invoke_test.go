@@ -138,44 +138,7 @@ func TestInvokeReviewerArch_EndToEnd(t *testing.T) {
 		t.Errorf("job role = %q, want %q", job.Role, "reviewer.arch")
 	}
 
-	// Verify event log sequence.
-	es := store.NewEventStore(db)
-	events, err := es.ListEvents(ctx, result.RunID)
-	if err != nil {
-		t.Fatalf("ListEvents: %v", err)
-	}
-
-	// Expected event sequence:
-	// 1. run.created
-	// 2. job.created
-	// 3. job.leased (dispatched)
-	// 4. finding.created
-	// 5. finding.created
-	// 6. job.completed
-	// 7. run.completed
-	expectedKinds := []core.EventKind{
-		core.EventRunCreated,
-		core.EventJobCreated,
-		core.EventJobLeased,
-		core.EventFindingCreated,
-		core.EventFindingCreated,
-		core.EventJobCompleted,
-		core.EventRunCompleted,
-	}
-
-	if len(events) != len(expectedKinds) {
-		t.Errorf("event count = %d, want %d", len(events), len(expectedKinds))
-		for i, e := range events {
-			t.Logf("  event[%d]: seq=%d kind=%s", i, e.Sequence, e.Kind)
-		}
-	} else {
-		for i, e := range events {
-			if e.Kind != expectedKinds[i] {
-				t.Errorf("event[%d].kind = %q, want %q", i, e.Kind, expectedKinds[i])
-			}
-			if e.Sequence != i+1 {
-				t.Errorf("event[%d].sequence = %d, want %d", i, e.Sequence, i+1)
-			}
-		}
-	}
+	// Verify the durable event log against the normalized golden snapshot.
+	goldenFile := filepath.Join(repoRoot, "testdata", "events", "invoke_reviewer_arch.golden.json")
+	store.AssertGoldenEvents(t, db, result.RunID, goldenFile)
 }

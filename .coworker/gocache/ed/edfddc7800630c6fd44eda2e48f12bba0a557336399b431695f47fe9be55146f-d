@@ -1,0 +1,6 @@
+./engine.go
+./loader.go
+./predicates.go
+./engine_test.go
+./loader_test.go
+./predicates_test.go

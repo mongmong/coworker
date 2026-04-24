@@ -1,0 +1,87 @@
+[
+  {
+    "sequence": 1,
+    "kind": "run.created",
+    "schema_version": 1,
+    "run_id": "run_1",
+    "payload": {
+      "mode": "interactive",
+      "run_id": "run_1"
+    }
+  },
+  {
+    "sequence": 2,
+    "kind": "job.created",
+    "schema_version": 1,
+    "run_id": "run_1",
+    "correlation_id": "job_1",
+    "payload": {
+      "cli": "codex",
+      "job_id": "job_1",
+      "role": "reviewer.arch",
+      "run_id": "run_1"
+    }
+  },
+  {
+    "sequence": 3,
+    "kind": "job.leased",
+    "schema_version": 1,
+    "run_id": "run_1",
+    "correlation_id": "job_1",
+    "payload": {
+      "job_id": "job_1",
+      "state": "dispatched"
+    }
+  },
+  {
+    "sequence": 4,
+    "kind": "finding.created",
+    "schema_version": 1,
+    "run_id": "run_1",
+    "correlation_id": "job_1",
+    "payload": {
+      "finding_id": "finding_1",
+      "fingerprint": "55eb886424455398387affa472545e19",
+      "job_id": "job_1",
+      "line": 42,
+      "path": "main.go",
+      "severity": "important"
+    }
+  },
+  {
+    "sequence": 5,
+    "kind": "finding.created",
+    "schema_version": 1,
+    "run_id": "run_1",
+    "correlation_id": "job_1",
+    "payload": {
+      "finding_id": "finding_2",
+      "fingerprint": "c1e7112ce44f290140cb5f7f78719b9d",
+      "job_id": "job_1",
+      "line": 17,
+      "path": "store.go",
+      "severity": "minor"
+    }
+  },
+  {
+    "sequence": 6,
+    "kind": "job.completed",
+    "schema_version": 1,
+    "run_id": "run_1",
+    "correlation_id": "job_1",
+    "payload": {
+      "job_id": "job_1",
+      "state": "complete"
+    }
+  },
+  {
+    "sequence": 7,
+    "kind": "run.completed",
+    "schema_version": 1,
+    "run_id": "run_1",
+    "payload": {
+      "run_id": "run_1",
+      "state": "completed"
+    }
+  }
+]

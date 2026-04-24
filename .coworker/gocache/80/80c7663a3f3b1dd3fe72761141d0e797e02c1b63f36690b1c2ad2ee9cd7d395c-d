@@ -1,0 +1,11 @@
+./agent.go
+./artifact.go
+./bus.go
+./doc.go
+./event.go
+./finding.go
+./id.go
+./job.go
+./role.go
+./run.go
+./supervisor.go
