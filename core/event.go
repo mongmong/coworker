@@ -17,6 +17,18 @@ const (
 	EventJobFailed       EventKind = "job.failed"
 	EventFindingCreated  EventKind = "finding.created"
 	EventArtifactCreated EventKind = "artifact.created"
+
+	// Dispatch lifecycle events — emitted by the MCP pull-dispatch protocol.
+	EventDispatchQueued    EventKind = "dispatch.queued"
+	EventDispatchLeased    EventKind = "dispatch.leased"
+	EventDispatchCompleted EventKind = "dispatch.completed"
+	EventDispatchExpired   EventKind = "dispatch.expired"
+
+	// Worker registry events — emitted when persistent CLI workers connect
+	// and disconnect via the MCP server.
+	EventWorkerRegistered   EventKind = "worker.registered"
+	EventWorkerHeartbeat    EventKind = "worker.heartbeat"
+	EventWorkerDeregistered EventKind = "worker.deregistered"
 )
 
 // Event is a single entry in the append-only event log.
