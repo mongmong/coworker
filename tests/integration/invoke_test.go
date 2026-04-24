@@ -12,6 +12,7 @@ import (
 	"github.com/chris/coworker/agent"
 	"github.com/chris/coworker/coding"
 	"github.com/chris/coworker/core"
+	"github.com/chris/coworker/internal/testutil"
 	"github.com/chris/coworker/store"
 )
 
@@ -140,5 +141,5 @@ func TestInvokeReviewerArch_EndToEnd(t *testing.T) {
 
 	// Verify the durable event log against the normalized golden snapshot.
 	goldenFile := filepath.Join(repoRoot, "testdata", "events", "invoke_reviewer_arch.golden.json")
-	store.AssertGoldenEvents(t, db, result.RunID, goldenFile)
+	testutil.AssertGoldenEvents(t, store.NewEventStore(db), result.RunID, goldenFile)
 }

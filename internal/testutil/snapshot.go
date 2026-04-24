@@ -1,4 +1,4 @@
-package store
+package testutil
 
 import (
 	"bytes"
@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/chris/coworker/core"
+	"github.com/chris/coworker/store"
 )
 
 type eventSnapshot struct {
@@ -123,8 +124,8 @@ func (n *snapshotNormalizers) normalizeValue(field string, value any) any {
 	}
 }
 
-func loadEventSnapshot(ctx context.Context, db *DB, runID string) ([]eventSnapshot, error) {
-	events, err := NewEventStore(db).ListEvents(ctx, runID)
+func loadEventSnapshot(ctx context.Context, eventStore *store.EventStore, runID string) ([]eventSnapshot, error) {
+	events, err := eventStore.ListEvents(ctx, runID)
 	if err != nil {
 		return nil, fmt.Errorf("list events for snapshot: %w", err)
 	}
@@ -160,10 +161,10 @@ func loadEventSnapshot(ctx context.Context, db *DB, runID string) ([]eventSnapsh
 
 // AssertGoldenEvents compares normalized events for one run against a golden file.
 // Set GOLDEN_UPDATE=1 to rewrite the golden snapshot in place.
-func AssertGoldenEvents(t *testing.T, db *DB, runID string, goldenFile string) {
+func AssertGoldenEvents(t *testing.T, eventStore *store.EventStore, runID string, goldenFile string) {
 	t.Helper()
 
-	snapshots, err := loadEventSnapshot(context.Background(), db, runID)
+	snapshots, err := loadEventSnapshot(context.Background(), eventStore, runID)
 	if err != nil {
 		t.Fatalf("load event snapshot: %v", err)
 	}

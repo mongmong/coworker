@@ -6,6 +6,7 @@
 # Test output
 *.test
 *.out
+*.actual
 coverage.*
 *.prof
 

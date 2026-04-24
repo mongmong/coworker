@@ -28,7 +28,7 @@ func TestWatchStream_PrintsMatchingEvents(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	var out bytes.Buffer
+	var out lockedBuffer
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- watchStream(ctx, client, "http://coworker.test/events?run_id=run_live&kind=job.created", &out)
@@ -93,10 +93,51 @@ func TestWatchStream_PrintsMatchingEvents(t *testing.T) {
 	}
 }
 
+func TestWatchBackoffAfterStream_ResetsAfterStableRun(t *testing.T) {
+	t.Parallel()
+
+	startedAt := time.Unix(100, 0)
+	endedAt := startedAt.Add(11 * time.Second)
+
+	got := watchBackoffAfterStream(2*time.Second, startedAt, endedAt, nil)
+	if got != 250*time.Millisecond {
+		t.Fatalf("watchBackoffAfterStream(...) = %s, want %s", got, 250*time.Millisecond)
+	}
+}
+
+func TestWatchBackoffAfterStream_DoesNotResetOnError(t *testing.T) {
+	t.Parallel()
+
+	startedAt := time.Unix(200, 0)
+	endedAt := startedAt.Add(11 * time.Second)
+
+	got := watchBackoffAfterStream(2*time.Second, startedAt, endedAt, context.DeadlineExceeded)
+	if got != 2*time.Second {
+		t.Fatalf("watchBackoffAfterStream(...) = %s, want %s", got, 2*time.Second)
+	}
+}
+
 type roundTripperFunc func(req *http.Request) (*http.Response, error)
 
 func (fn roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return fn(req)
+}
+
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 type pipeResponseWriter struct {

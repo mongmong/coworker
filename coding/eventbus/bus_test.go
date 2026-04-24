@@ -1,7 +1,9 @@
 package eventbus
 
 import (
+	"context"
 	"fmt"
+	"log/slog"
 	"sync"
 	"testing"
 	"time"
@@ -134,4 +136,86 @@ func TestInMemoryBus_ConcurrentPublishIsSafe(t *testing.T) {
 			t.Fatalf("received %d events, want %d", received, totalEvents)
 		}
 	}
+}
+
+func TestInMemoryBus_PublishLogsDroppedEvents(t *testing.T) {
+	bus := NewInMemoryBus()
+	slow := make(chan *core.Event)
+	bus.Subscribe(slow)
+
+	handler := &captureHandler{}
+	previous := slog.Default()
+	slog.SetDefault(slog.New(handler))
+	defer slog.SetDefault(previous)
+
+	bus.Publish(&core.Event{
+		ID:            "evt_dropped",
+		RunID:         "run_dropped",
+		Sequence:      1,
+		Kind:          core.EventJobCreated,
+		SchemaVersion: 1,
+		Payload:       `{"job_id":"job_dropped"}`,
+		CreatedAt:     time.Unix(40, 0).UTC(),
+	})
+
+	records := handler.Records()
+	if len(records) != 1 {
+		t.Fatalf("captured %d log records, want 1", len(records))
+	}
+	if records[0].message != "event dropped for slow subscriber" {
+		t.Fatalf("log message = %q, want %q", records[0].message, "event dropped for slow subscriber")
+	}
+	if got := records[0].attrs["event_kind"]; got != string(core.EventJobCreated) {
+		t.Fatalf("event_kind = %v, want %q", got, core.EventJobCreated)
+	}
+	if got := records[0].attrs["run_id"]; got != "run_dropped" {
+		t.Fatalf("run_id = %v, want %q", got, "run_dropped")
+	}
+}
+
+type capturedRecord struct {
+	message string
+	attrs   map[string]any
+}
+
+type captureHandler struct {
+	mu      sync.Mutex
+	records []capturedRecord
+}
+
+func (h *captureHandler) Enabled(context.Context, slog.Level) bool {
+	return true
+}
+
+func (h *captureHandler) Handle(_ context.Context, record slog.Record) error {
+	captured := capturedRecord{
+		message: record.Message,
+		attrs:   make(map[string]any),
+	}
+	record.Attrs(func(attr slog.Attr) bool {
+		captured.attrs[attr.Key] = attr.Value.Any()
+		return true
+	})
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.records = append(h.records, captured)
+	return nil
+}
+
+func (h *captureHandler) WithAttrs([]slog.Attr) slog.Handler {
+	return h
+}
+
+func (h *captureHandler) WithGroup(string) slog.Handler {
+	return h
+}
+
+func (h *captureHandler) Records() []capturedRecord {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	records := make([]capturedRecord, len(h.records))
+	copy(records, h.records)
+	return records
 }

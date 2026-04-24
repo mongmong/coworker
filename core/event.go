@@ -22,16 +22,16 @@ const (
 // Event is a single entry in the append-only event log.
 // The events table is the authoritative history of a run.
 type Event struct {
-	ID             string
-	RunID          string
-	Sequence       int
-	Kind           EventKind
-	SchemaVersion  int
-	IdempotencyKey string
-	CausationID    string
-	CorrelationID  string
-	Payload        string // JSON
-	CreatedAt      time.Time
+	ID             string    `json:"id"`
+	RunID          string    `json:"run_id"`
+	Sequence       int       `json:"sequence"`
+	Kind           EventKind `json:"kind"`
+	SchemaVersion  int       `json:"schema_version"`
+	IdempotencyKey string    `json:"idempotency_key,omitempty"`
+	CausationID    string    `json:"causation_id,omitempty"`
+	CorrelationID  string    `json:"correlation_id,omitempty"`
+	Payload        string    `json:"payload"`
+	CreatedAt      time.Time `json:"created_at"`
 }
 
 // EventWriter is the interface for writing events to the event log.

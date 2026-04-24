@@ -1,6 +1,7 @@
 package eventbus
 
 import (
+	"log/slog"
 	"sync"
 
 	"github.com/chris/coworker/core"
@@ -37,6 +38,7 @@ func (b *InMemoryBus) Publish(event *core.Event) {
 		select {
 		case ch <- event:
 		default:
+			slog.Warn("event dropped for slow subscriber", "event_kind", string(event.Kind), "run_id", event.RunID)
 		}
 	}
 }

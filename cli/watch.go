@@ -74,10 +74,13 @@ func watchLoop(ctx context.Context, client *http.Client, streamURL string, out, 
 	backoff := 250 * time.Millisecond
 
 	for {
+		startedAt := time.Now()
 		err := watchStream(ctx, client, streamURL, out)
 		if ctx.Err() != nil {
 			return nil
 		}
+
+		backoff = watchBackoffAfterStream(backoff, startedAt, time.Now(), err)
 
 		if err != nil && errOut != nil {
 			if _, writeErr := fmt.Fprintf(errOut, "coworker watch: %v; reconnecting in %s\n", err, backoff); writeErr != nil {
@@ -102,6 +105,13 @@ func watchLoop(ctx context.Context, client *http.Client, streamURL string, out, 
 			}
 		}
 	}
+}
+
+func watchBackoffAfterStream(backoff time.Duration, startedAt, endedAt time.Time, err error) time.Duration {
+	if err == nil && endedAt.Sub(startedAt) > 10*time.Second {
+		return 250 * time.Millisecond
+	}
+	return backoff
 }
 
 func watchStream(ctx context.Context, client *http.Client, streamURL string, out io.Writer) error {
