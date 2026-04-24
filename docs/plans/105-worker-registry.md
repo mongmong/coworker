@@ -1,0 +1,1414 @@
+# Plan 105 — Worker Registry + Persistent Pull Dispatch
+
+**Status:** Ready for implementation
+**Branch:** `feature/plan-105-worker-registry`
+**Blocks on:** Plan 104 (dispatch queue + MCP server foundation)
+**Blocked by:** Plan 108 (Claude Code plugin)
+
+---
+
+## Overview
+
+Plan 104 built the pull-dispatch queue (`dispatches` table + `orch_next_dispatch` /
+`orch_job_complete` tools) but left the registry half of the story unimplemented.
+Right now `ClaimNextDispatch` selects the oldest pending dispatch for a role
+without knowing whether a live CLI session actually registered for that role.
+Any caller can poll for any role — there is no concept of a "live claim."
+
+Plan 105 closes that gap by introducing:
+
+1. A `workers` table (migration 004) and `WorkerStore` for CRUD + heartbeat
+   update.
+2. Three new MCP tools — `orch_register`, `orch_heartbeat`, `orch_deregister` —
+   that CLI plugins call on boot, on a 15-second timer, and on clean shutdown.
+3. A `HeartbeatWatchdog` background goroutine that evicts workers that miss
+   three consecutive heartbeat windows (default: 45 s).
+4. A `DispatchRouter` in `coding/` that queries the registry at dispatch time
+   and routes work either to live workers (persistent mode) or falls back to
+   ephemeral spawning.
+5. In-flight requeue: when a worker is evicted, its leased dispatches are reset
+   to `pending` so the next available worker (or ephemeral fallback) picks them
+   up.
+6. Tests covering every layer.
+
+After this plan, coworker honours the spec's "lifecycle is emergent from the
+registry" invariant: spawning a Claude Code session with the `coworker-orchy`
+skill causes subsequent jobs for that role to be routed to the live session
+automatically, without any configuration change.
+
+---
+
+## Architecture
+
+```
+core/
+└── worker.go                    # Worker struct, WorkerState constants
+
+store/
+├── migrations/004_workers.sql
+├── worker_store.go              # WorkerStore CRUD + heartbeat + eviction
+└── worker_store_test.go
+
+mcp/
+├── handlers_registry.go         # orch_register, orch_heartbeat, orch_deregister
+├── handlers_registry_test.go
+├── watchdog.go                  # HeartbeatWatchdog goroutine
+└── watchdog_test.go
+
+coding/
+├── router.go                    # DispatchRouter: check registry → route or ephemeral
+└── router_test.go
+```
+
+Import rules remain unchanged: `coding/` may import `core/` and `store/`; `core/`
+imports nothing from either.
+
+---
+
+## Data Model
+
+### `core/worker.go`
+
+```go
+package core
+
+import "time"
+
+// WorkerState represents the lifecycle state of a registered persistent worker.
+type WorkerState string
+
+const (
+    WorkerStateLive    WorkerState = "live"
+    WorkerStateStale   WorkerState = "stale"
+    WorkerStateEvicted WorkerState = "evicted"
+)
+
+// Worker represents a registered persistent CLI worker session.
+// Written to the workers table; updated on every heartbeat and eviction.
+type Worker struct {
+    Handle        string      // unique opaque ID returned by orch_register
+    Role          string      // role name (matches roles/*.yaml)
+    PID           int         // OS PID of the CLI process (0 if unknown)
+    SessionID     string      // tmux session or equivalent; may be empty
+    CLI           string      // "claude-code" | "codex" | "opencode"
+    RegisteredAt  time.Time
+    LastHeartbeat time.Time
+    State         WorkerState // live | stale | evicted
+}
+```
+
+### `store/migrations/004_workers.sql`
+
+```sql
+-- Plan 105: persistent worker registry.
+-- Persistent CLI workers register here on boot and heartbeat every 15 s.
+-- State: live -> stale -> evicted (watchdog transitions; see WorkerStore).
+
+CREATE TABLE IF NOT EXISTS workers (
+    handle            TEXT PRIMARY KEY,
+    role              TEXT NOT NULL,
+    pid               INTEGER NOT NULL DEFAULT 0,
+    session_id        TEXT NOT NULL DEFAULT '',
+    cli               TEXT NOT NULL,
+    registered_at     TEXT NOT NULL,
+    last_heartbeat_at TEXT NOT NULL,
+    state             TEXT NOT NULL DEFAULT 'live'
+);
+
+CREATE INDEX IF NOT EXISTS idx_workers_role_state
+    ON workers (role, state);
+```
+
+---
+
+## Phase 1 — `workers` Table + WorkerStore
+
+### Task 1.1 — Migration 004
+
+File: `store/migrations/004_workers.sql`
+
+Content is the SQL shown in Data Model above. The existing `db.go` migration
+runner auto-discovers numbered `.sql` files, so no runner changes are needed.
+
+### Task 1.2 — `store/worker_store.go`
+
+```go
+package store
+
+import (
+    "context"
+    "database/sql"
+    "encoding/json"
+    "fmt"
+    "time"
+
+    "github.com/chris/coworker/core"
+)
+
+// WorkerStore manages the workers table: registration, heartbeat, and eviction.
+type WorkerStore struct {
+    db    *DB
+    event *EventStore
+}
+
+// NewWorkerStore creates a WorkerStore.
+func NewWorkerStore(db *DB, event *EventStore) *WorkerStore {
+    return &WorkerStore{db: db, event: event}
+}
+
+// Register inserts a new live worker row and emits a worker.registered event.
+// The handle is caller-supplied (generated by the MCP handler via core.NewID()).
+func (s *WorkerStore) Register(ctx context.Context, w *core.Worker) error {
+    now := w.RegisteredAt
+    if now.IsZero() {
+        now = time.Now()
+        w.RegisteredAt = now
+    }
+    w.LastHeartbeat = now
+    w.State = core.WorkerStateLive
+
+    payload, err := json.Marshal(map[string]interface{}{
+        "handle":     w.Handle,
+        "role":       w.Role,
+        "pid":        w.PID,
+        "session_id": w.SessionID,
+        "cli":        w.CLI,
+    })
+    if err != nil {
+        return fmt.Errorf("marshal worker.registered payload: %w", err)
+    }
+
+    // Worker events are not run-scoped; use a sentinel run_id of "" which
+    // maps to NULL in the event row (run_id is nullable for worker events).
+    event := &core.Event{
+        ID:            core.NewID(),
+        RunID:         "",
+        Kind:          core.EventWorkerRegistered,
+        SchemaVersion: 1,
+        CorrelationID: w.Handle,
+        Payload:       string(payload),
+        CreatedAt:     now,
+    }
+
+    return s.event.WriteEventThenRow(ctx, event, func(tx *sql.Tx) error {
+        _, err := tx.ExecContext(ctx,
+            `INSERT INTO workers
+                (handle, role, pid, session_id, cli, registered_at, last_heartbeat_at, state)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            w.Handle, w.Role, w.PID, w.SessionID, w.CLI,
+            now.UTC().Format(time.RFC3339),
+            now.UTC().Format(time.RFC3339),
+            string(w.State),
+        )
+        return err
+    })
+}
+
+// Heartbeat updates last_heartbeat_at to now and emits a worker.heartbeat event.
+// Returns an error if the handle is not found or the worker is not live.
+func (s *WorkerStore) Heartbeat(ctx context.Context, handle string) error {
+    now := time.Now()
+
+    payload, err := json.Marshal(map[string]string{
+        "handle": handle,
+    })
+    if err != nil {
+        return fmt.Errorf("marshal worker.heartbeat payload: %w", err)
+    }
+
+    event := &core.Event{
+        ID:            core.NewID(),
+        RunID:         "",
+        Kind:          core.EventWorkerHeartbeat,
+        SchemaVersion: 1,
+        CorrelationID: handle,
+        Payload:       string(payload),
+        CreatedAt:     now,
+    }
+
+    return s.event.WriteEventThenRow(ctx, event, func(tx *sql.Tx) error {
+        result, err := tx.ExecContext(ctx,
+            `UPDATE workers SET last_heartbeat_at = ?, state = 'live'
+             WHERE handle = ? AND state != 'evicted'`,
+            now.UTC().Format(time.RFC3339), handle,
+        )
+        if err != nil {
+            return err
+        }
+        n, err := result.RowsAffected()
+        if err != nil {
+            return fmt.Errorf("rows affected: %w", err)
+        }
+        if n == 0 {
+            return fmt.Errorf("worker %q not found or already evicted", handle)
+        }
+        return nil
+    })
+}
+
+// Deregister marks a worker as evicted (clean shutdown) and emits a
+// worker.deregistered event. Leased dispatches for the handle are NOT
+// automatically requeued here — that is the watchdog's responsibility
+// (and it handles deregistered workers the same as evicted ones).
+func (s *WorkerStore) Deregister(ctx context.Context, handle string) error {
+    now := time.Now()
+
+    payload, err := json.Marshal(map[string]string{
+        "handle": handle,
+    })
+    if err != nil {
+        return fmt.Errorf("marshal worker.deregistered payload: %w", err)
+    }
+
+    event := &core.Event{
+        ID:            core.NewID(),
+        RunID:         "",
+        Kind:          core.EventWorkerDeregistered,
+        SchemaVersion: 1,
+        CorrelationID: handle,
+        Payload:       string(payload),
+        CreatedAt:     now,
+    }
+
+    return s.event.WriteEventThenRow(ctx, event, func(tx *sql.Tx) error {
+        result, err := tx.ExecContext(ctx,
+            `UPDATE workers SET state = 'evicted'
+             WHERE handle = ? AND state != 'evicted'`,
+            handle,
+        )
+        if err != nil {
+            return err
+        }
+        n, err := result.RowsAffected()
+        if err != nil {
+            return fmt.Errorf("rows affected: %w", err)
+        }
+        if n == 0 {
+            return fmt.Errorf("worker %q not found or already evicted", handle)
+        }
+        return nil
+    })
+}
+
+// LiveWorkersForRole returns all workers in state 'live' for the given role,
+// ordered by registered_at ascending (oldest first = primary worker).
+func (s *WorkerStore) LiveWorkersForRole(ctx context.Context, role string) ([]core.Worker, error) {
+    rows, err := s.db.QueryContext(ctx,
+        `SELECT handle, role, pid, session_id, cli, registered_at, last_heartbeat_at, state
+         FROM workers
+         WHERE role = ? AND state = 'live'
+         ORDER BY registered_at ASC`,
+        role,
+    )
+    if err != nil {
+        return nil, fmt.Errorf("query live workers: %w", err)
+    }
+    defer rows.Close()
+
+    var workers []core.Worker
+    for rows.Next() {
+        var w core.Worker
+        var regAt, hbAt, stateStr string
+        if err := rows.Scan(
+            &w.Handle, &w.Role, &w.PID, &w.SessionID, &w.CLI,
+            &regAt, &hbAt, &stateStr,
+        ); err != nil {
+            return nil, fmt.Errorf("scan worker: %w", err)
+        }
+        w.RegisteredAt, _ = time.Parse(time.RFC3339, regAt)
+        w.LastHeartbeat, _ = time.Parse(time.RFC3339, hbAt)
+        w.State = core.WorkerState(stateStr)
+        workers = append(workers, w)
+    }
+    return workers, rows.Err()
+}
+
+// MarkStale transitions all live workers whose last_heartbeat_at is older than
+// cutoff to state 'stale'. Returns the handles of newly-stale workers.
+func (s *WorkerStore) MarkStale(ctx context.Context, cutoff time.Time) ([]string, error) {
+    cutoffStr := cutoff.UTC().Format(time.RFC3339)
+
+    rows, err := s.db.QueryContext(ctx,
+        `SELECT handle FROM workers
+         WHERE state = 'live' AND last_heartbeat_at < ?`,
+        cutoffStr,
+    )
+    if err != nil {
+        return nil, fmt.Errorf("query stale candidates: %w", err)
+    }
+    defer rows.Close()
+
+    var handles []string
+    for rows.Next() {
+        var h string
+        if err := rows.Scan(&h); err != nil {
+            return nil, fmt.Errorf("scan handle: %w", err)
+        }
+        handles = append(handles, h)
+    }
+    if err := rows.Err(); err != nil {
+        return nil, err
+    }
+
+    if len(handles) == 0 {
+        return nil, nil
+    }
+
+    // Bulk update without individual events — the watchdog emits a single
+    // eviction event per handle in its own loop.
+    _, err = s.db.ExecContext(ctx,
+        `UPDATE workers SET state = 'stale'
+         WHERE state = 'live' AND last_heartbeat_at < ?`,
+        cutoffStr,
+    )
+    if err != nil {
+        return nil, fmt.Errorf("mark stale: %w", err)
+    }
+
+    return handles, nil
+}
+
+// MarkEvicted transitions stale workers with last_heartbeat_at older than
+// cutoff to state 'evicted' and emits a worker.deregistered event for each.
+// Returns the handles of newly-evicted workers so the caller can requeue
+// their leased dispatches.
+func (s *WorkerStore) MarkEvicted(ctx context.Context, cutoff time.Time) ([]string, error) {
+    cutoffStr := cutoff.UTC().Format(time.RFC3339)
+
+    rows, err := s.db.QueryContext(ctx,
+        `SELECT handle FROM workers
+         WHERE state = 'stale' AND last_heartbeat_at < ?`,
+        cutoffStr,
+    )
+    if err != nil {
+        return nil, fmt.Errorf("query eviction candidates: %w", err)
+    }
+    defer rows.Close()
+
+    var handles []string
+    for rows.Next() {
+        var h string
+        if err := rows.Scan(&h); err != nil {
+            return nil, fmt.Errorf("scan handle: %w", err)
+        }
+        handles = append(handles, h)
+    }
+    if err := rows.Err(); err != nil {
+        return nil, err
+    }
+
+    now := time.Now()
+    for _, h := range handles {
+        payload, _ := json.Marshal(map[string]string{"handle": h, "reason": "heartbeat_timeout"})
+        event := &core.Event{
+            ID:            core.NewID(),
+            RunID:         "",
+            Kind:          core.EventWorkerDeregistered,
+            SchemaVersion: 1,
+            CorrelationID: h,
+            Payload:       string(payload),
+            CreatedAt:     now,
+        }
+        handle := h // capture
+        if err := s.event.WriteEventThenRow(ctx, event, func(tx *sql.Tx) error {
+            _, err := tx.ExecContext(ctx,
+                `UPDATE workers SET state = 'evicted'
+                 WHERE handle = ? AND state = 'stale'`,
+                handle,
+            )
+            return err
+        }); err != nil {
+            return nil, fmt.Errorf("evict worker %q: %w", h, err)
+        }
+    }
+
+    return handles, nil
+}
+
+// RequeueLeasedDispatches resets all dispatches leased by the given worker
+// handle to 'pending' and emits dispatch.expired events for each.
+// Called by the watchdog immediately after MarkEvicted.
+func (s *WorkerStore) RequeueLeasedDispatches(ctx context.Context, handle string, ds *DispatchStore) error {
+    return ds.RequeueByWorker(ctx, handle)
+}
+```
+
+### Task 1.3 — `DispatchStore.RequeueByWorker`
+
+Add to `store/dispatch_store.go`:
+
+```go
+// RequeueByWorker resets all dispatches leased by the given worker handle to
+// 'pending', clearing worker_handle and leased_at, and emits a dispatch.expired
+// event for each. Called when a worker is evicted.
+func (s *DispatchStore) RequeueByWorker(ctx context.Context, workerHandle string) error {
+    rows, err := s.db.QueryContext(ctx,
+        `SELECT id, run_id FROM dispatches
+         WHERE state = 'leased' AND worker_handle = ?`,
+        workerHandle,
+    )
+    if err != nil {
+        return fmt.Errorf("query leased dispatches for worker %q: %w", workerHandle, err)
+    }
+    defer rows.Close()
+
+    type row struct{ id, runID string }
+    var leased []row
+    for rows.Next() {
+        var r row
+        if err := rows.Scan(&r.id, &r.runID); err != nil {
+            return fmt.Errorf("scan dispatch: %w", err)
+        }
+        leased = append(leased, r)
+    }
+    if err := rows.Err(); err != nil {
+        return err
+    }
+
+    now := time.Now()
+    for _, r := range leased {
+        payload, _ := json.Marshal(map[string]string{
+            "dispatch_id":   r.id,
+            "run_id":        r.runID,
+            "worker_handle": workerHandle,
+            "reason":        "worker_evicted",
+        })
+        event := &core.Event{
+            ID:            core.NewID(),
+            RunID:         r.runID,
+            Kind:          core.EventDispatchExpired,
+            SchemaVersion: 1,
+            CorrelationID: r.id,
+            Payload:       string(payload),
+            CreatedAt:     now,
+        }
+        dispatchID := r.id
+        if err := s.event.WriteEventThenRow(ctx, event, func(tx *sql.Tx) error {
+            _, err := tx.ExecContext(ctx,
+                `UPDATE dispatches
+                 SET state = 'pending', worker_handle = NULL, leased_at = NULL
+                 WHERE id = ? AND state = 'leased'`,
+                dispatchID,
+            )
+            return err
+        }); err != nil {
+            return fmt.Errorf("requeue dispatch %q: %w", r.id, err)
+        }
+    }
+    return nil
+}
+```
+
+### Task 1.4 — Wire WorkerStore into `mcp.stores`
+
+In `mcp/server.go`, add `worker *store.WorkerStore` to the `stores` struct and
+instantiate it inside `NewServer` when `cfg.DB != nil`:
+
+```go
+type stores struct {
+    run       *store.RunStore
+    event     *store.EventStore
+    dispatch  *store.DispatchStore
+    job       *store.JobStore
+    attention *store.AttentionStore
+    finding   *store.FindingStore
+    artifact  *store.ArtifactStore
+    worker    *store.WorkerStore   // Plan 105
+}
+
+// inside NewServer, after existing store creation:
+s.stores.worker = store.NewWorkerStore(cfg.DB, es)
+```
+
+### Task 1.5 — Event sequence for worker events
+
+Worker events have `run_id = ""`. The existing `WriteEventThenRow` computes
+sequence as `MAX(sequence)+1 WHERE run_id = ?` — for an empty run_id this
+always returns 1 because no rows match. This is acceptable for Plan 105:
+worker events are not run-scoped and sequence ordering within the global event
+log is by `created_at`, not `sequence`. If strict global ordering is needed in a
+future plan, a global sequence column can be added.
+
+**Note:** The `events` table DDL (migration 001) must allow `run_id` to be
+empty or NULL. Check `store/migrations/001_init.sql` and add a nullable
+adjustment if needed. If `run_id` has a NOT NULL constraint, add a separate
+migration `005_events_run_id_nullable.sql` that does:
+
+```sql
+-- Plan 105: allow worker events with no run_id.
+-- SQLite cannot drop a NOT NULL constraint; we recreate the table.
+-- This migration is a no-op if run_id is already nullable.
+PRAGMA foreign_keys=OFF;
+
+CREATE TABLE IF NOT EXISTS events_new (
+    id              TEXT PRIMARY KEY,
+    run_id          TEXT,  -- nullable for worker-scope events
+    sequence        INTEGER NOT NULL DEFAULT 0,
+    kind            TEXT NOT NULL,
+    schema_version  INTEGER NOT NULL DEFAULT 1,
+    idempotency_key TEXT,
+    causation_id    TEXT,
+    correlation_id  TEXT,
+    payload         TEXT NOT NULL DEFAULT '{}',
+    created_at      TEXT NOT NULL
+);
+
+INSERT INTO events_new SELECT * FROM events;
+DROP TABLE events;
+ALTER TABLE events_new RENAME TO events;
+
+CREATE INDEX IF NOT EXISTS idx_events_run_id ON events(run_id);
+CREATE INDEX IF NOT EXISTS idx_events_kind   ON events(kind);
+
+PRAGMA foreign_keys=ON;
+```
+
+If `run_id` is already nullable, skip this migration (or make it a safe no-op
+by checking the schema first). During Task 1.5 implementation, inspect the
+existing DDL and decide which path to take.
+
+---
+
+## Phase 2 — MCP Tools: `orch_register`, `orch_heartbeat`, `orch_deregister`
+
+### Task 2.1 — `mcp/handlers_registry.go`
+
+```go
+package mcp
+
+import (
+    "context"
+    "fmt"
+    "time"
+
+    "github.com/modelcontextprotocol/go-sdk/mcp"
+
+    "github.com/chris/coworker/core"
+    "github.com/chris/coworker/store"
+)
+
+// --- orch_register -----------------------------------------------------------
+
+type registerInput struct {
+    Role      string `json:"role"`
+    PID       int    `json:"pid"`
+    SessionID string `json:"session_id"`
+    CLI       string `json:"cli"`
+}
+
+type registerOutput struct {
+    Handle string `json:"handle"`
+    Status string `json:"status"`
+}
+
+func handleRegister(ws *store.WorkerStore) mcp.ToolHandlerFor[registerInput, registerOutput] {
+    return func(
+        ctx context.Context,
+        _ *mcp.CallToolRequest,
+        in registerInput,
+    ) (*mcp.CallToolResult, registerOutput, error) {
+        if in.Role == "" {
+            return nil, registerOutput{}, fmt.Errorf("role is required")
+        }
+        if in.CLI == "" {
+            return nil, registerOutput{}, fmt.Errorf("cli is required")
+        }
+
+        w := &core.Worker{
+            Handle:       core.NewID(),
+            Role:         in.Role,
+            PID:          in.PID,
+            SessionID:    in.SessionID,
+            CLI:          in.CLI,
+            RegisteredAt: time.Now(),
+        }
+
+        if err := ws.Register(ctx, w); err != nil {
+            return nil, registerOutput{}, fmt.Errorf("register worker: %w", err)
+        }
+
+        return nil, registerOutput{Handle: w.Handle, Status: "registered"}, nil
+    }
+}
+
+// CallRegister is an exported test helper.
+func CallRegister(ctx context.Context, ws *store.WorkerStore, role, cli, sessionID string, pid int) (map[string]interface{}, error) {
+    h := handleRegister(ws)
+    _, out, err := h(ctx, nil, registerInput{Role: role, PID: pid, SessionID: sessionID, CLI: cli})
+    if err != nil {
+        return nil, err
+    }
+    return toMap(out)
+}
+
+// --- orch_heartbeat ----------------------------------------------------------
+
+type heartbeatInput struct {
+    Handle string `json:"handle"`
+}
+
+type heartbeatOutput struct {
+    Status string `json:"status"`
+}
+
+func handleHeartbeat(ws *store.WorkerStore) mcp.ToolHandlerFor[heartbeatInput, heartbeatOutput] {
+    return func(
+        ctx context.Context,
+        _ *mcp.CallToolRequest,
+        in heartbeatInput,
+    ) (*mcp.CallToolResult, heartbeatOutput, error) {
+        if in.Handle == "" {
+            return nil, heartbeatOutput{}, fmt.Errorf("handle is required")
+        }
+
+        if err := ws.Heartbeat(ctx, in.Handle); err != nil {
+            return nil, heartbeatOutput{}, fmt.Errorf("heartbeat: %w", err)
+        }
+
+        return nil, heartbeatOutput{Status: "ok"}, nil
+    }
+}
+
+// CallHeartbeat is an exported test helper.
+func CallHeartbeat(ctx context.Context, ws *store.WorkerStore, handle string) (map[string]interface{}, error) {
+    h := handleHeartbeat(ws)
+    _, out, err := h(ctx, nil, heartbeatInput{Handle: handle})
+    if err != nil {
+        return nil, err
+    }
+    return toMap(out)
+}
+
+// --- orch_deregister ---------------------------------------------------------
+
+type deregisterInput struct {
+    Handle string `json:"handle"`
+}
+
+type deregisterOutput struct {
+    Status string `json:"status"`
+}
+
+func handleDeregister(ws *store.WorkerStore) mcp.ToolHandlerFor[deregisterInput, deregisterOutput] {
+    return func(
+        ctx context.Context,
+        _ *mcp.CallToolRequest,
+        in deregisterInput,
+    ) (*mcp.CallToolResult, deregisterOutput, error) {
+        if in.Handle == "" {
+            return nil, deregisterOutput{}, fmt.Errorf("handle is required")
+        }
+
+        if err := ws.Deregister(ctx, in.Handle); err != nil {
+            return nil, deregisterOutput{}, fmt.Errorf("deregister: %w", err)
+        }
+
+        return nil, deregisterOutput{Status: "deregistered"}, nil
+    }
+}
+
+// CallDeregister is an exported test helper.
+func CallDeregister(ctx context.Context, ws *store.WorkerStore, handle string) (map[string]interface{}, error) {
+    h := handleDeregister(ws)
+    _, out, err := h(ctx, nil, deregisterInput{Handle: handle})
+    if err != nil {
+        return nil, err
+    }
+    return toMap(out)
+}
+```
+
+### Task 2.2 — Wire tools into `mcp/server.go`
+
+In `registerTools()`, add a registry section after the existing dispatch tools
+block. The pattern mirrors existing tool registration:
+
+```go
+// --- registry tools ----------------------------------------------------------
+
+if s.stores.worker != nil {
+    mcp.AddTool(s.inner,
+        &mcp.Tool{
+            Name:        "orch_register",
+            Description: "Register a persistent CLI worker for a role. Returns a handle used for subsequent heartbeat and deregister calls.",
+        },
+        handleRegister(s.stores.worker),
+    )
+    mcp.AddTool(s.inner,
+        &mcp.Tool{
+            Name:        "orch_heartbeat",
+            Description: "Send a heartbeat for a registered worker. Must be called every 15 s to maintain live status.",
+        },
+        handleHeartbeat(s.stores.worker),
+    )
+    mcp.AddTool(s.inner,
+        &mcp.Tool{
+            Name:        "orch_deregister",
+            Description: "Deregister a persistent worker on clean shutdown.",
+        },
+        handleDeregister(s.stores.worker),
+    )
+} else {
+    for _, name := range []string{"orch_register", "orch_heartbeat", "orch_deregister"} {
+        n := name
+        mcp.AddTool(s.inner,
+            &mcp.Tool{Name: n},
+            func(_ context.Context, _ *mcp.CallToolRequest, _ emptyInput) (*mcp.CallToolResult, notImplemented, error) {
+                return nil, stubResult(), nil
+            },
+        )
+    }
+}
+```
+
+Also update `Tools()` to include the three new names:
+
+```go
+func (s *Server) Tools() []string {
+    return []string{
+        "orch_run_status",
+        "orch_run_inspect",
+        "orch_role_invoke",
+        "orch_next_dispatch",
+        "orch_job_complete",
+        "orch_ask_user",
+        "orch_attention_list",
+        "orch_attention_answer",
+        "orch_findings_list",
+        "orch_artifact_read",
+        "orch_artifact_write",
+        "orch_register",      // Plan 105
+        "orch_heartbeat",     // Plan 105
+        "orch_deregister",    // Plan 105
+    }
+}
+```
+
+---
+
+## Phase 3 — Heartbeat Watchdog
+
+### Task 3.1 — `mcp/watchdog.go`
+
+The watchdog runs as a goroutine inside the MCP server's process. The
+`ServerConfig` gains a `WatchdogConfig` field; defaults are used when it is
+zero.
+
+```go
+package mcp
+
+import (
+    "context"
+    "log/slog"
+    "time"
+
+    "github.com/chris/coworker/store"
+)
+
+// WatchdogConfig controls heartbeat watchdog timing.
+// Zero values use the spec defaults.
+type WatchdogConfig struct {
+    // Interval is how often the watchdog runs. Default: 15 s.
+    Interval time.Duration
+    // StaleAfter is how long since the last heartbeat before a worker
+    // transitions to 'stale'. Default: 45 s (3 missed 15-second heartbeats).
+    StaleAfter time.Duration
+    // EvictAfter is how long since the last heartbeat before a stale worker
+    // is evicted and its dispatches are requeued. Default: same as StaleAfter
+    // (eviction happens on the same pass as stale detection; the two-step
+    // transition — live→stale, then stale→evicted — uses the same cutoff so
+    // a single missed window does not evict. Workers must be stale for a full
+    // Interval before eviction fires).
+    EvictAfter time.Duration
+}
+
+func (c WatchdogConfig) interval() time.Duration {
+    if c.Interval <= 0 {
+        return 15 * time.Second
+    }
+    return c.Interval
+}
+
+func (c WatchdogConfig) staleAfter() time.Duration {
+    if c.StaleAfter <= 0 {
+        return 45 * time.Second
+    }
+    return c.StaleAfter
+}
+
+func (c WatchdogConfig) evictAfter() time.Duration {
+    if c.EvictAfter <= 0 {
+        return c.staleAfter()
+    }
+    return c.EvictAfter
+}
+
+// HeartbeatWatchdog checks live workers on a fixed interval, marks stale
+// workers, evicts those that stay stale, and requeues their dispatches.
+// It runs until ctx is cancelled.
+//
+// The two-phase transition (live→stale, stale→evicted) gives workers one
+// extra watchdog interval to recover before dispatch requeue. With defaults
+// (interval=15s, staleAfter=45s), a worker must miss heartbeats for ~60 s
+// before its dispatches are requeued.
+type HeartbeatWatchdog struct {
+    workers  *store.WorkerStore
+    dispatch *store.DispatchStore
+    cfg      WatchdogConfig
+    logger   *slog.Logger
+}
+
+// NewHeartbeatWatchdog creates a watchdog. Pass a nil logger to use slog.Default().
+func NewHeartbeatWatchdog(
+    workers *store.WorkerStore,
+    dispatch *store.DispatchStore,
+    cfg WatchdogConfig,
+    logger *slog.Logger,
+) *HeartbeatWatchdog {
+    if logger == nil {
+        logger = slog.Default()
+    }
+    return &HeartbeatWatchdog{
+        workers:  workers,
+        dispatch: dispatch,
+        cfg:      cfg,
+        logger:   logger,
+    }
+}
+
+// Run starts the watchdog loop. It blocks until ctx is cancelled.
+// Call it in a goroutine; the caller is responsible for context lifecycle.
+func (w *HeartbeatWatchdog) Run(ctx context.Context) {
+    ticker := time.NewTicker(w.cfg.interval())
+    defer ticker.Stop()
+
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        case <-ticker.C:
+            w.tick(ctx)
+        }
+    }
+}
+
+func (w *HeartbeatWatchdog) tick(ctx context.Context) {
+    now := time.Now()
+
+    // Phase 1: mark live workers that missed StaleAfter as stale.
+    staleCutoff := now.Add(-w.cfg.staleAfter())
+    stale, err := w.workers.MarkStale(ctx, staleCutoff)
+    if err != nil {
+        w.logger.Error("watchdog: mark stale failed", "error", err)
+    } else if len(stale) > 0 {
+        w.logger.Warn("watchdog: marked workers stale", "count", len(stale), "handles", stale)
+    }
+
+    // Phase 2: evict workers that have been stale since EvictAfter.
+    evictCutoff := now.Add(-w.cfg.evictAfter())
+    evicted, err := w.workers.MarkEvicted(ctx, evictCutoff)
+    if err != nil {
+        w.logger.Error("watchdog: evict failed", "error", err)
+        return
+    }
+
+    for _, handle := range evicted {
+        w.logger.Warn("watchdog: evicting worker, requeueing dispatches", "handle", handle)
+        if err := w.dispatch.RequeueByWorker(ctx, handle); err != nil {
+            w.logger.Error("watchdog: requeue dispatches failed", "handle", handle, "error", err)
+        }
+    }
+}
+```
+
+### Task 3.2 — Start watchdog from `NewServer`
+
+Add `WatchdogConfig` to `ServerConfig` and a `watchdog` field to `Server`:
+
+```go
+type ServerConfig struct {
+    DB             *store.DB
+    Dispatcher     *coding.Dispatcher
+    EventBus       *eventbus.InMemoryBus
+    WatchdogConfig WatchdogConfig  // Plan 105; zero value uses spec defaults
+}
+
+type Server struct {
+    inner    *mcp.Server
+    cfg      ServerConfig
+    stores   stores
+    watchdog *HeartbeatWatchdog  // Plan 105; nil when worker store absent
+}
+```
+
+In `NewServer`, after wiring `s.stores.worker`:
+
+```go
+if s.stores.worker != nil && s.stores.dispatch != nil {
+    s.watchdog = NewHeartbeatWatchdog(
+        s.stores.worker,
+        s.stores.dispatch,
+        cfg.WatchdogConfig,
+        nil, // use slog.Default()
+    )
+}
+```
+
+In `Run`, start the watchdog before blocking on transport:
+
+```go
+func (s *Server) Run(ctx context.Context) error {
+    if s.watchdog != nil {
+        go s.watchdog.Run(ctx)
+    }
+    if err := s.inner.Run(ctx, &mcp.StdioTransport{}); err != nil {
+        return fmt.Errorf("mcp server: %w", err)
+    }
+    return nil
+}
+```
+
+The goroutine inherits the same context as the server; cancellation propagates
+cleanly.
+
+---
+
+## Phase 4 — Dispatch Routing
+
+### Task 4.1 — `coding/router.go`
+
+The `DispatchRouter` sits between the orchestration layer and the dispatch
+queue. When `Dispatcher.Orchestrate` needs to send work, it goes through
+`DispatchRouter.Route` instead of directly calling agent.Dispatch. For Plan 105
+the router is self-contained and the existing `Dispatcher` is **not** modified
+— the router is wired in alongside the dispatcher in future plans (Plan 108).
+
+```go
+package coding
+
+import (
+    "context"
+    "fmt"
+    "log/slog"
+
+    "github.com/chris/coworker/core"
+    "github.com/chris/coworker/store"
+)
+
+// RouteMode describes how a dispatch was routed.
+type RouteMode string
+
+const (
+    RouteModeWorker    RouteMode = "worker"    // routed to a live registered worker
+    RouteModeEphemeral RouteMode = "ephemeral" // no live worker; caller should spawn ephemeral
+)
+
+// RouteResult is returned by DispatchRouter.Route.
+type RouteResult struct {
+    Mode    RouteMode
+    // Workers contains the handles that received the dispatch (Mode=worker).
+    // Empty when Mode=ephemeral.
+    Workers []string
+    // DispatchIDs are the IDs of the enqueued dispatch rows, one per worker
+    // (or one for ephemeral).
+    DispatchIDs []string
+}
+
+// DispatchRouter routes a job dispatch to live registered workers when they
+// exist, or signals the caller to fall back to ephemeral spawning.
+//
+// Routing rules (from spec §Lifecycle):
+//   - single concurrency: route to the oldest live worker. If none, ephemeral.
+//     If >1, use oldest and log a warning.
+//   - many concurrency: route to every live worker. If none, ephemeral (one job).
+type DispatchRouter struct {
+    workers  *store.WorkerStore
+    dispatch *store.DispatchStore
+    logger   *slog.Logger
+}
+
+// NewDispatchRouter creates a DispatchRouter.
+func NewDispatchRouter(ws *store.WorkerStore, ds *store.DispatchStore, logger *slog.Logger) *DispatchRouter {
+    if logger == nil {
+        logger = slog.Default()
+    }
+    return &DispatchRouter{workers: ws, dispatch: ds, logger: logger}
+}
+
+// Route resolves live workers for the given dispatch template and enqueues
+// rows in the dispatches table. It does NOT spawn ephemeral processes — the
+// caller is responsible for that when Mode == RouteModeEphemeral.
+func (r *DispatchRouter) Route(ctx context.Context, d *core.Dispatch, concurrency string) (*RouteResult, error) {
+    live, err := r.workers.LiveWorkersForRole(ctx, d.Role)
+    if err != nil {
+        return nil, fmt.Errorf("query live workers: %w", err)
+    }
+
+    switch concurrency {
+    case "single", "":
+        return r.routeSingle(ctx, d, live)
+    case "many":
+        return r.routeMany(ctx, d, live)
+    default:
+        return nil, fmt.Errorf("unknown concurrency %q (want 'single' or 'many')", concurrency)
+    }
+}
+
+func (r *DispatchRouter) routeSingle(ctx context.Context, d *core.Dispatch, live []core.Worker) (*RouteResult, error) {
+    if len(live) == 0 {
+        return &RouteResult{Mode: RouteModeEphemeral}, nil
+    }
+
+    if len(live) > 1 {
+        r.logger.Warn("multiple live workers for single-concurrency role; routing to oldest",
+            "role", d.Role, "count", len(live))
+    }
+
+    target := live[0] // oldest (registered_at ASC)
+    return r.enqueue(ctx, d, []core.Worker{target})
+}
+
+func (r *DispatchRouter) routeMany(ctx context.Context, d *core.Dispatch, live []core.Worker) (*RouteResult, error) {
+    if len(live) == 0 {
+        return &RouteResult{Mode: RouteModeEphemeral}, nil
+    }
+    return r.enqueue(ctx, d, live)
+}
+
+// enqueue creates one dispatch row per worker, setting worker_handle.
+func (r *DispatchRouter) enqueue(ctx context.Context, template *core.Dispatch, workers []core.Worker) (*RouteResult, error) {
+    result := &RouteResult{Mode: RouteModeWorker}
+
+    for _, w := range workers {
+        d := &core.Dispatch{
+            ID:           core.NewID(),
+            RunID:        template.RunID,
+            Role:         template.Role,
+            JobID:        template.JobID,
+            Prompt:       template.Prompt,
+            Inputs:       template.Inputs,
+            WorkerHandle: w.Handle,
+        }
+        if err := r.dispatch.EnqueueDispatch(ctx, d); err != nil {
+            return nil, fmt.Errorf("enqueue dispatch for worker %q: %w", w.Handle, err)
+        }
+        result.Workers = append(result.Workers, w.Handle)
+        result.DispatchIDs = append(result.DispatchIDs, d.ID)
+    }
+
+    return result, nil
+}
+```
+
+### Task 4.2 — Wire `worker_handle` into `ClaimNextDispatch`
+
+The existing `ClaimNextDispatch` selects the oldest pending dispatch for a role
+without filtering by `worker_handle`. In the persistent model, each dispatch row
+has a specific `worker_handle` set by the router. Workers should only claim
+dispatches assigned to them.
+
+Modify `ClaimNextDispatch` to accept an optional handle parameter:
+
+```go
+// ClaimNextDispatch atomically claims the oldest pending dispatch for the
+// given role. If handle is non-empty, only dispatches assigned to that
+// worker (worker_handle = handle) are eligible; dispatches with a NULL
+// worker_handle are eligible for any caller (ephemeral compatibility).
+func (s *DispatchStore) ClaimNextDispatch(ctx context.Context, role, handle string) (*core.Dispatch, error) {
+```
+
+The SQL changes to:
+
+```sql
+-- When handle is provided:
+SELECT ... FROM dispatches
+WHERE state = 'pending' AND role = ?
+  AND (worker_handle = ? OR worker_handle IS NULL)
+ORDER BY created_at ASC LIMIT 1
+
+-- When handle is "" (ephemeral / unregistered caller):
+SELECT ... FROM dispatches
+WHERE state = 'pending' AND role = ?
+  AND worker_handle IS NULL
+ORDER BY created_at ASC LIMIT 1
+```
+
+The MCP handler `handleNextDispatch` must pass the caller's handle. Update its
+input type:
+
+```go
+type nextDispatchInput struct {
+    Role   string `json:"role"`
+    Handle string `json:"handle,omitempty"` // optional; empty for ephemeral callers
+}
+```
+
+And pass `in.Handle` to `ClaimNextDispatch`.
+
+**Backward compatibility:** existing tests call `ClaimNextDispatch(ctx, role)` with
+one argument. Update all call sites (dispatch_store_test.go,
+handlers_dispatch_test.go) to the new two-argument signature. Ephemeral tests
+pass `""` as handle.
+
+---
+
+## Phase 5 — In-Flight Requeue (watchdog integration)
+
+This is already handled by `WorkerStore.MarkEvicted` + `DispatchStore.RequeueByWorker`
+wired in `HeartbeatWatchdog.tick`. No additional code is needed beyond what is
+specified in Phases 1 and 3.
+
+The complete eviction flow is:
+
+```
+watchdog.tick():
+  1. MarkStale(cutoff=now-45s)
+     → UPDATE workers SET state='stale' WHERE state='live' AND last_heartbeat_at < cutoff
+  2. MarkEvicted(cutoff=now-45s)
+     → for each handle WHERE state='stale' AND last_heartbeat_at < cutoff:
+         a. WriteEventThenRow(worker.deregistered, UPDATE workers SET state='evicted')
+         b. RequeueByWorker(handle)
+            → for each leased dispatch with worker_handle=handle:
+                WriteEventThenRow(dispatch.expired, UPDATE dispatches SET state='pending', ...)
+```
+
+After step 2b, the dispatch is pending with `worker_handle = NULL`. The next
+call to `ClaimNextDispatch` by any eligible worker (or ephemeral mode) will pick
+it up.
+
+---
+
+## Phase 6 — Tests
+
+### Task 6.1 — `store/worker_store_test.go`
+
+```
+TestWorkerStore_Register         happy path: insert row, check event emitted
+TestWorkerStore_Register_Empty   missing role → error
+TestWorkerStore_Heartbeat        update last_heartbeat_at, state reset to live
+TestWorkerStore_Heartbeat_Evicted evicted worker returns error
+TestWorkerStore_Deregister       sets state=evicted, emits worker.deregistered
+TestWorkerStore_Deregister_Unknown unknown handle → error
+TestWorkerStore_LiveWorkersForRole returns only live, correct role
+TestWorkerStore_MarkStale        transitions live→stale for old heartbeats only
+TestWorkerStore_MarkEvicted      transitions stale→evicted, emits events
+TestWorkerStore_RequeueLeasedDispatches resets leased→pending, emits dispatch.expired
+```
+
+Each test uses an in-memory DB (`store.Open(":memory:")`). No goroutines; use
+`time.Now().Add(-2*time.Minute)` to simulate stale timestamps.
+
+### Task 6.2 — `mcp/handlers_registry_test.go`
+
+```
+TestHandleRegister_Happy         returns handle, status=registered
+TestHandleRegister_MissingRole   returns error
+TestHandleRegister_MissingCLI    returns error
+TestHandleHeartbeat_Happy        status=ok
+TestHandleHeartbeat_Unknown      returns error
+TestHandleDeregister_Happy       status=deregistered
+TestHandleDeregister_Unknown     returns error
+```
+
+Use `store.Open(":memory:")` + `store.NewWorkerStore`. Tests call the exported
+`Call*` helpers directly (same pattern as `mcp/handlers_dispatch_test.go`).
+
+### Task 6.3 — `mcp/watchdog_test.go`
+
+```
+TestWatchdog_MarksStaleMissedHeartbeat
+    Register worker. Set last_heartbeat_at to now-60s directly in DB.
+    Run one watchdog tick (call tick() directly, not Run()).
+    Assert state='evicted'.
+
+TestWatchdog_RequeuesLeasedDispatch
+    Register worker. Create run + dispatch leased to that worker.
+    Manually set last_heartbeat_at = now-60s.
+    Run one tick.
+    Assert dispatch state='pending', worker_handle=NULL, dispatch.expired event emitted.
+
+TestWatchdog_LiveWorkerNotEvicted
+    Register worker. Heartbeat is recent (now).
+    Run one tick.
+    Assert state='live', no eviction events.
+
+TestWatchdog_RunCancels
+    Create watchdog with Interval=10ms.
+    Start Run() in goroutine. Cancel context after 50ms.
+    Assert Run() returns promptly (within 200ms).
+```
+
+Use a short interval (10 ms) and manipulate `last_heartbeat_at` via direct DB
+updates to avoid sleeping in tests.
+
+### Task 6.4 — `coding/router_test.go`
+
+```
+TestDispatchRouter_SingleConcurrency_NoWorkers   → RouteMode=ephemeral
+TestDispatchRouter_SingleConcurrency_OneWorker   → RouteMode=worker, one dispatch
+TestDispatchRouter_SingleConcurrency_MultiWorker → RouteMode=worker, routes to oldest, warns
+TestDispatchRouter_ManyConcurrency_NoWorkers     → RouteMode=ephemeral
+TestDispatchRouter_ManyConcurrency_TwoWorkers    → RouteMode=worker, two dispatches
+
+TestDispatchRouter_EnqueueSetsWorkerHandle
+    After Route(), query dispatches table.
+    Assert worker_handle equals the targeted worker handle.
+
+TestDispatchRouter_EphemeralDispatchNullHandle
+    Route to ephemeral. Verify no dispatch row is created by the router
+    (caller is responsible for spawning).
+```
+
+Note: when `Mode=ephemeral`, the router does NOT create any dispatch row — it
+signals the caller to spawn an ephemeral process. The ephemeral process then
+calls `ClaimNextDispatch` with an empty handle, which selects dispatches with
+`worker_handle IS NULL`.
+
+Wait — this contradicts the current design where ephemeral callers themselves
+poll for dispatches. The correct flow for ephemeral mode is:
+
+1. Scheduler calls `router.Route()` → returns `RouteModeEphemeral`.
+2. Scheduler creates a dispatch row with `worker_handle = NULL` (via
+   `DispatchStore.EnqueueDispatch`).
+3. Scheduler spawns the ephemeral CLI process.
+4. Ephemeral CLI calls `orch_next_dispatch(role="...", handle="")`.
+5. `ClaimNextDispatch` with `handle=""` claims the NULL-handle dispatch.
+
+Update `routeSingle` and `routeMany` to enqueue a NULL-handle dispatch when
+returning `RouteModeEphemeral`:
+
+```go
+func (r *DispatchRouter) routeSingle(ctx context.Context, d *core.Dispatch, live []core.Worker) (*RouteResult, error) {
+    if len(live) == 0 {
+        // Enqueue a dispatch with no worker_handle for ephemeral pickup.
+        ephemeral := &core.Dispatch{
+            ID:     core.NewID(),
+            RunID:  d.RunID,
+            Role:   d.Role,
+            JobID:  d.JobID,
+            Prompt: d.Prompt,
+            Inputs: d.Inputs,
+            // WorkerHandle: "" (NULL)
+        }
+        if err := r.dispatch.EnqueueDispatch(ctx, ephemeral); err != nil {
+            return nil, fmt.Errorf("enqueue ephemeral dispatch: %w", err)
+        }
+        return &RouteResult{
+            Mode:        RouteModeEphemeral,
+            DispatchIDs: []string{ephemeral.ID},
+        }, nil
+    }
+    // ... rest unchanged
+}
+```
+
+And similarly for `routeMany` ephemeral case (enqueue one dispatch, not N).
+
+### Task 6.5 — Update `ClaimNextDispatch` call sites
+
+Search for `ClaimNextDispatch` across the codebase and update the signature:
+
+- `store/dispatch_store_test.go` — add `""` as handle
+- `mcp/handlers_dispatch_test.go` — add `""` as handle
+- Any other callers discovered during implementation
+
+---
+
+## Phase 6.6 — Integration: `mcp/server_test.go`
+
+The existing `TestNewServer_ToolNames` test asserts the full tool list. Update it
+to include the three new registry tools:
+
+```go
+"orch_register",
+"orch_heartbeat",
+"orch_deregister",
+```
+
+---
+
+## Invariants and Correctness Notes
+
+**Event-log-before-state invariant** is upheld in all `WorkerStore` methods: every
+state change (`Register`, `Heartbeat`, `Deregister`, `MarkEvicted`) goes through
+`WriteEventThenRow`. `MarkStale` is an internal transition that does not emit an
+event (it is not visible to external observers and is reversed by a heartbeat).
+
+**No silent failure.** `MarkEvicted` iterates handles and returns the first error;
+the watchdog logs it and continues on the next tick rather than crashing.
+`RequeueByWorker` similarly surfaces errors for logging.
+
+**Concurrent registration.** Two goroutines cannot register with the same handle
+because `handle` is `PRIMARY KEY` — the second insert fails. `core.NewID()` uses
+a UUID-style random ID; collision probability is negligible.
+
+**Dispatch routing atomicity.** `enqueue()` creates multiple dispatch rows in
+separate `WriteEventThenRow` calls (one per worker). This is not atomic across
+workers. In a crash between rows, the subsequent run creates the remaining
+dispatches when the scheduler retries. For `single` concurrency (one dispatch),
+this is a non-issue.
+
+**Pull-model contract.** Workers only receive work they explicitly request via
+`orch_next_dispatch`. The watchdog never pushes work. Tmux send-keys is
+deliberately not used for dispatch content.
+
+---
+
+## File Checklist
+
+- [ ] `store/migrations/004_workers.sql`
+- [ ] `store/migrations/005_events_run_id_nullable.sql` (if needed after inspecting 001)
+- [ ] `core/worker.go`
+- [ ] `store/worker_store.go`
+- [ ] `store/worker_store_test.go`
+- [ ] `store/dispatch_store.go` — add `RequeueByWorker`, update `ClaimNextDispatch` signature
+- [ ] `store/dispatch_store_test.go` — update call sites
+- [ ] `mcp/handlers_registry.go`
+- [ ] `mcp/handlers_registry_test.go`
+- [ ] `mcp/watchdog.go`
+- [ ] `mcp/watchdog_test.go`
+- [ ] `mcp/server.go` — wire worker store, register tools, start watchdog in Run
+- [ ] `mcp/server_test.go` — update tool name list
+- [ ] `mcp/handlers_dispatch.go` — update `handleNextDispatch` input + `ClaimNextDispatch` call
+- [ ] `mcp/handlers_dispatch_test.go` — update call sites
+- [ ] `coding/router.go`
+- [ ] `coding/router_test.go`
+
+---
+
+## Commit Strategy
+
+Each phase is one commit (or two if a phase has a large test file):
+
+1. `Plan 105 Phase 1: workers table + WorkerStore + RequeueByWorker`
+2. `Plan 105 Phase 2: orch_register / orch_heartbeat / orch_deregister MCP tools`
+3. `Plan 105 Phase 3: HeartbeatWatchdog goroutine`
+4. `Plan 105 Phase 4: DispatchRouter (single vs many, live vs ephemeral)`
+5. `Plan 105 Phase 5: watchdog integration — eviction triggers requeue (covered by phase 3 commit)`
+6. `Plan 105 Phase 6: full test suite`
+
+---
+
+## Verification
+
+Before PR:
+
+```bash
+go build ./...
+go test ./... -count=1 -timeout 60s
+golangci-lint run ./...
+```
+
+All must pass green. No new lint suppressions without justification.
+
+---
+
+## Code Review
+
+_(To be filled in after implementation.)_
+
+---
+
+## Post-Execution Report
+
+_(To be filled in after implementation.)_
