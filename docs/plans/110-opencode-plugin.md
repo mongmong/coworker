@@ -89,6 +89,25 @@ Retrospective review against shipped files in `plugins/coworker-opencode/` and `
 
 ## Post-Execution Report
 
-Implemented as part of Plans 109+110 in a single commit on branch
-`feature/plan-109-110-codex-opencode-plugins`. All files created. Go build
-and tests pass. See Plan 109 for Codex parallel implementation.
+**Shipped:** 2026-04-20 on `feature/plan-109-110-codex-opencode-plugins`.
+
+**Files created:**
+- `plugins/coworker-opencode/.mcp.json` — MCP server registration for `orch` tools
+- `plugins/coworker-opencode/settings.json` — OpenCode settings snippet
+- `plugins/coworker-opencode/skills/coworker-orchy.md` — HTTP dual-mode (daemon + interactive MCP) dispatch
+- `plugins/coworker-opencode/skills/coworker-role-developer.md` — OpenCode developer role skill (worktree-scoped)
+- `plugins/coworker-opencode/skills/coworker-role-reviewer.md` — OpenCode reviewer role skill
+- `plugins/coworker-opencode/commands/{status,approve,invoke}.md` — command definitions with abort support
+
+**Go changes:** `cli/plugin_install.go` extended with `installOpenCodePlugin` branch. Copies plugin files to `.opencode/coworker/` in project root, merges `.mcp.json` (same logic as Claude Code path). Prints HTTP dispatch instructions.
+
+**Tests:** Test coverage for `.mcp.json` merge logic. Full suite: 0 failures, 0 regressions. `golangci-lint run ./...` — 0 issues.
+
+**Key implementation notes:**
+- HTTP-primary dispatch (`POST /session` + `POST /session/{id}/message`) documented alongside interactive MCP fallback.
+- SSE event types documented (`session.idle` as primary completion signal).
+- Interactive MCP mode uses namespaced tool names (`mcp__coworker__*`), consistent with Claude Code.
+- Worktree isolation documented in role skills — each `opencode serve` binds to its cwd.
+- Abort support (`POST /session/{id}/abort`) documented in invoke command and orchy skill.
+
+**Deferred:** HTTP dispatch daemon loop (Plan 114+) implements session lifecycle, SSE polling, and completion gate.

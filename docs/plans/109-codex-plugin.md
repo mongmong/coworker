@@ -86,6 +86,24 @@ Retrospective review against shipped files in `plugins/coworker-codex/` and `cli
 
 ## Post-Execution Report
 
-Implemented as part of Plans 109+110 in a single commit on branch
-`feature/plan-109-110-codex-opencode-plugins`. All files created. Go build
-and tests pass. See Plan 110 for OpenCode parallel implementation.
+**Shipped:** 2026-04-20 on `feature/plan-109-110-codex-opencode-plugins`.
+
+**Files created:**
+- `plugins/coworker-codex/setup.md` — installation + MCP registration instructions
+- `plugins/coworker-codex/settings.toml` — config.toml snippet for MCP registration
+- `plugins/coworker-codex/skills/coworker-orchy.md` — bare tool names + danger-full-access sandbox requirement
+- `plugins/coworker-codex/skills/coworker-role-developer.md` — Codex developer role skill
+- `plugins/coworker-codex/skills/coworker-role-reviewer.md` — Codex reviewer role skill
+- `plugins/coworker-codex/commands/{status,approve,invoke}.md` — command definitions
+
+**Go changes:** `cli/plugin_install.go` extended with `installCodexPlugin` branch. Copies plugin files to `~/.codex/coworker/`, prints MCP registration instructions and danger-full-access warning. No `.mcp.json` merge (Codex uses `config.toml`).
+
+**Tests:** 3 new install tests pass. Full suite: 0 failures, 0 regressions. `golangci-lint run ./...` — 0 issues.
+
+**Key implementation notes:**
+- All `orch_*` tool references use bare names (no `mcp__coworker__` namespace), per spike findings.
+- Sandbox requirement (`--sandbox danger-full-access`) documented prominently in setup and install output.
+- No idle-wake polling instructions — Codex persistent mode relies on explicit turns.
+- Developer and reviewer skills remind users of `--output-schema` strict requirements.
+
+**Deferred:** Actual Codex dispatch loop (Plan 114+) handles MCP registration and persistent mode lifecycle.
