@@ -29,6 +29,11 @@ type Finding struct {
 	Fingerprint     string
 	ResolvedByJobID string
 	ResolvedAt      *time.Time
+
+	// SourceJobIDs is populated in-memory during fan-in deduplication to record
+	// all job IDs that produced the same fingerprint. It is NOT persisted to
+	// SQLite — the individual per-job findings already carry their own JobID.
+	SourceJobIDs []string `json:"-" yaml:"-"`
 }
 
 // ComputeFingerprint generates a stable fingerprint for deduplication.

@@ -36,6 +36,14 @@ const (
 
 	// Cost events — emitted by the scheduler when token usage is recorded.
 	EventCostDelta EventKind = "cost.delta"
+
+	// Phase lifecycle events — emitted by the phase loop executor.
+	EventPhaseStarted   EventKind = "phase.started"
+	EventPhaseCompleted EventKind = "phase.completed"
+	EventPhaseFailed    EventKind = "phase.failed"
+	// EventPhaseClean is a checkpoint event emitted when the fix-loop
+	// exhausts max_fix_cycles_per_phase without converging to zero findings.
+	EventPhaseClean EventKind = "phase.clean"
 )
 
 // Event is a single entry in the append-only event log.

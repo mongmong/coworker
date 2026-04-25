@@ -6,16 +6,17 @@ import (
 	"log/slog"
 
 	"github.com/chris/coworker/coding/manifest"
+	"github.com/chris/coworker/coding/phaseloop"
 	"github.com/chris/coworker/core"
 )
 
 // BuildFromPRDWorkflow is the autopilot workflow that drives the
 // PRD → spec → plans → PRs pipeline.
 //
-// In Plan 106 this is a scaffold: it loads the manifest, schedules the first
-// batch of ready plans, and creates worktrees for parallel plans. The full
-// phase loop (developer → reviewer → tester → shipper) is implemented in
-// Plan 114.
+// Plan 106 added manifest scheduling and worktree management.
+// Plan 114 adds the PhaseExecutor field and RunPhasesForPlan method,
+// implementing the developer → reviewer/tester → dedupe → fix-loop inner loop.
+// Plan 115 will add the shipper role and PR creation.
 type BuildFromPRDWorkflow struct {
 	// ManifestPath is the path to the plan manifest YAML file.
 	ManifestPath string
@@ -31,6 +32,11 @@ type BuildFromPRDWorkflow struct {
 	// BaseBranch is the git branch that feature branches are created from.
 	// Defaults to "main" if empty.
 	BaseBranch string
+
+	// PhaseExecutor runs the developer → reviewer/tester → dedupe → fix-loop
+	// for each phase of a plan. May be nil when only scheduling/worktree
+	// management is needed (e.g., in Plan 106 integration tests).
+	PhaseExecutor *phaseloop.PhaseExecutor
 
 	// Logger is the structured logger. Uses slog.Default() if nil.
 	Logger *slog.Logger
@@ -124,9 +130,12 @@ func (w *BuildFromPRDWorkflow) PrepareWorktrees(
 // Run loads the manifest, schedules ready plans, creates worktrees, and
 // returns the set of plans and their worktree paths.
 //
-// TODO(Plan 114): dispatch architect → planner → phase loop for each plan.
+// The caller is responsible for iterating over ReadyPlans and calling
+// RunPhasesForPlan for each plan. This separation allows the caller to
+// manage parallel execution and inter-plan dependencies.
 //
-// Returns errNoReadyPlans when no plans are ready (all done or all blocked).
+// Returns an empty ReadyPlans slice when no plans are ready (all done or
+// all blocked).
 func (w *BuildFromPRDWorkflow) Run(
 	ctx context.Context,
 	completed map[int]bool,
@@ -157,6 +166,59 @@ func (w *BuildFromPRDWorkflow) Run(
 		ReadyPlans: ready,
 		Worktrees:  worktrees,
 	}, nil
+}
+
+// RunPhasesForPlan executes the phase loop for each phase of the given plan
+// in sequence. It requires PhaseExecutor to be set; returns an error if it is nil.
+//
+// inputs is passed directly to PhaseExecutor.Execute for each phase. Callers
+// typically supply at minimum "diff_path" and "spec_path" for reviewer roles.
+//
+// Returns a slice of PhaseResult, one per phase, in order. If any phase
+// returns an error the method stops and returns that error along with the
+// results collected so far.
+func (w *BuildFromPRDWorkflow) RunPhasesForPlan(
+	ctx context.Context,
+	runID string,
+	plan manifest.PlanEntry,
+	inputs map[string]string,
+) ([]*phaseloop.PhaseResult, error) {
+	if w.PhaseExecutor == nil {
+		return nil, fmt.Errorf("build-from-prd: PhaseExecutor is required for RunPhasesForPlan")
+	}
+
+	log := w.logger()
+	log.Info("running phases for plan",
+		"plan_id", plan.ID,
+		"plan_title", plan.Title,
+		"phases", len(plan.Phases),
+	)
+
+	results := make([]*phaseloop.PhaseResult, 0, len(plan.Phases))
+	for i, phaseName := range plan.Phases {
+		log.Info("executing phase",
+			"plan_id", plan.ID,
+			"phase_index", i,
+			"phase_name", phaseName,
+		)
+
+		result, err := w.PhaseExecutor.Execute(ctx, runID, plan.ID, i, phaseName, inputs)
+		if err != nil {
+			return results, fmt.Errorf("plan %d phase %d (%q): %w", plan.ID, i, phaseName, err)
+		}
+		results = append(results, result)
+
+		log.Info("phase result",
+			"plan_id", plan.ID,
+			"phase_index", i,
+			"phase_name", phaseName,
+			"clean", result.Clean,
+			"fix_cycles", result.FixCycles,
+			"findings", len(result.Findings),
+		)
+	}
+
+	return results, nil
 }
 
 // BuildFromPRDResult holds the output of one scheduling iteration.

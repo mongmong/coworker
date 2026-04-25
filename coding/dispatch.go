@@ -49,10 +49,11 @@ type DispatchInput struct {
 
 // DispatchResult contains the output of a dispatch operation.
 type DispatchResult struct {
-	RunID    string
-	JobID    string
-	Findings []core.Finding
-	ExitCode int
+	RunID     string
+	JobID     string
+	Findings  []core.Finding
+	Artifacts []core.Artifact
+	ExitCode  int
 
 	// SupervisorVerdict is the final verdict from the last evaluation.
 	// Nil if no supervisor engine was configured.
@@ -200,6 +201,7 @@ func (d *Dispatcher) Orchestrate(ctx context.Context, input *DispatchInput) (*Di
 		RunID:             runID,
 		JobID:             lastJobID,
 		Findings:          lastResult.Findings,
+		Artifacts:         lastResult.Artifacts,
 		ExitCode:          lastResult.ExitCode,
 		SupervisorVerdict: lastVerdict,
 		RetryCount:        retryCount,
