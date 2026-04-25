@@ -4,7 +4,7 @@
 
 **Goal:** Live Bubble Tea dashboard for coworker state visualization and checkpoint approvals. Subscribes to the SSE event stream from Plan 102, renders four panes (runs, jobs, events, attention), and lets users approve or reject checkpoints without leaving the terminal.
 
-**Architecture:** New `tui/` package with Model/Update/View, Lipgloss styles, and a `tea.Cmd` SSE subscriber. New `cli/dashboard.go` cobra command. No new DB access — the TUI reads live state from the SSE stream plus an initial REST snapshot of runs/jobs/attention from the daemon API.
+**Architecture:** New `tui/` package with Model/Update/View, Lipgloss styles, and a `tea.Cmd` SSE subscriber. New `cli/dashboard.go` cobra command. No new DB access — the TUI reads live state from the SSE stream plus an initial REST snapshot of runs/jobs/attention from the daemon API. Attention answers call `AttentionStore.AnswerAttention()` directly (same as other CLI commands that open the DB directly) — no separate HTTP endpoint is needed.
 
 **Tech Stack:** Go 1.25+, `charmbracelet/bubbletea`, `charmbracelet/lipgloss`, `charmbracelet/bubbles`, `charmbracelet/x/teatest`, `net/http` (stdlib SSE client from Plan 102's `watch.go`).
 
@@ -51,6 +51,8 @@ Arrow keys scroll within the focused pane.
 | `Tab` / `Shift+Tab` | Global | Cycle active pane |
 | `↑` / `↓` | Any pane | Scroll / select row |
 | `Enter` | Runs pane | Focus run → filter Jobs+Events to that run |
+| `Enter` | Jobs pane | Open job detail / log view |
+| `Esc` / `Backspace` | Job detail view | Return to dashboard |
 | `a` | Attention pane | Approve selected item (send "yes") |
 | `r` | Attention pane | Reject selected item (send "no") |
 | `p` | Attention pane | Pass / skip (send "pass") |
@@ -64,8 +66,9 @@ tui/
 ├── model.go          # Main Model struct; Init, Update, View
 ├── model_test.go     # teatest golden-output tests
 ├── views.go          # Per-pane render functions (Lipgloss)
+├── job_detail.go     # Full-screen job detail + log tail view
 ├── keybindings.go    # Key message handlers
-├── events.go         # SSE tea.Cmd + tea.Msg types
+├── events.go         # SSE tea.Cmd + tea.Msg types, REST snapshot
 └── styles.go         # Lipgloss style definitions
 
 cli/
@@ -85,6 +88,10 @@ No new packages are created outside `tui/` and `cli/`.
 - Create: `tui/keybindings.go`
 - Create: `cli/dashboard.go`
 - Modify: `go.mod` / `go.sum` (add three Charmbracelet deps)
+
+**Notes:**
+- Use `charmbracelet/bubbles` list and viewport components for scrollable panes (runs, jobs, events) instead of hand-rolled scroll logic. This gives free keyboard navigation, mouse support, and consistent rendering.
+- Add a minimum terminal size guard in `View()`: if `m.width < 60 || m.height < 15`, render a plain `"Terminal too small (min 60×15)"` message instead of the pane layout. This prevents layout corruption on tiny terminals.
 
 ### Step 1.1 — Add dependencies
 
@@ -263,10 +270,19 @@ type Model struct {
     width  int
     height int
 
+    // SSE reconnection state
+    sseRetryDelay time.Duration // current backoff delay; 0 = first connect
+
     // UI state
-    showHelp bool
-    err      error
-    quitting bool
+    showHelp      bool
+    err           error
+    quitting      bool
+
+    // Job detail / log view state
+    jobDetailMode  bool   // true when showing full-screen job detail
+    jobDetailJobID string // ID of the job being inspected
+    jobDetailLines []string // cached log lines (tail of .coworker/runs/<run>/<job>.jsonl)
+    jobDetailScroll int    // viewport scroll offset
 }
 
 // New creates a new Model with the given configuration.
@@ -277,9 +293,13 @@ func New(cfg Config) Model {
     }
 }
 
-// Init starts the SSE subscription command.
+// Init fires the initial REST snapshot fetch and the SSE subscription in parallel.
+// The snapshot hydrates state before the first SSE event arrives.
 func (m Model) Init() tea.Cmd {
-    return subscribeSSE(m.cfg.BaseURL, m.cfg.RunID)
+    return tea.Batch(
+        fetchSnapshot(m.cfg.BaseURL, m.cfg.RunID),
+        subscribeSSE(m.cfg.BaseURL, m.cfg.RunID),
+    )
 }
 
 // Update processes incoming messages.
@@ -295,15 +315,54 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
     case errMsg:
         m.err = msg.err
+        // Reconnect with exponential backoff: 1s → 2s → 4s → … → 30s max.
+        delay := m.sseRetryDelay
+        if delay == 0 {
+            delay = time.Second
+        } else {
+            delay *= 2
+            if delay > 30*time.Second {
+                delay = 30 * time.Second
+            }
+        }
+        m.sseRetryDelay = delay
+        return m, tea.Tick(delay, func(time.Time) tea.Msg {
+            return retrySSEMsg{}
+        })
+
+    case retrySSEMsg:
+        return m, subscribeSSE(m.cfg.BaseURL, m.cfg.RunID)
+
+    case snapshotMsg:
+        // Hydrate initial state from REST snapshot.
+        for _, r := range msg.runs {
+            m.runs = appendOrUpdateRun(m.runs, &core.Event{RunID: r.ID, CreatedAt: r.CreatedAt})
+            m.runs[len(m.runs)-1].state = r.State
+            m.runs[len(m.runs)-1].mode = r.Mode
+        }
+        for _, j := range msg.jobs {
+            m.jobs = append(m.jobs, jobRow{
+                id: j.ID, runID: j.RunID, role: j.Role,
+                state: j.State, cli: j.CLI, since: j.CreatedAt,
+            })
+        }
+        for _, a := range msg.attention {
+            m.attention = append(m.attention, attentionRow{
+                id: a.ID, runID: a.RunID, kind: a.Kind,
+                question: a.Question, options: a.Options,
+            })
+        }
         return m, nil
 
     case eventMsg:
         m = applyEvent(m, msg.event)
-        return m, nil
+        return m, subscribeSSE(m.cfg.BaseURL, m.cfg.RunID)
 
     case connectedMsg:
-        // SSE connected; no state change needed.
-        return m, nil
+        // SSE connected; reset backoff.
+        m.sseRetryDelay = 0
+        m.err = nil
+        return m, subscribeSSE(m.cfg.BaseURL, m.cfg.RunID)
     }
 
     return m, nil
@@ -314,8 +373,16 @@ func (m Model) View() string {
     if m.quitting {
         return ""
     }
+    if m.width < 60 || m.height < 15 {
+        return "Terminal too small (min 60×15)\n"
+    }
     if m.err != nil {
         return fmt.Sprintf("error: %v\nPress q to quit.\n", m.err)
+    }
+
+    // Job detail view takes over the full screen when active.
+    if m.jobDetailMode {
+        return renderJobDetail(m)
     }
 
     half := m.width / 2
@@ -854,11 +921,11 @@ Keyboard shortcuts:
 
 ---
 
-## Task 2: SSE subscription tea.Cmd + live model updates
+## Task 2: SSE subscription tea.Cmd + initial REST snapshot + live model updates
 
 **Files:**
 - Create: `tui/events.go`
-- Modify: `tui/model.go` (wire `subscribeSSE` and `submitAnswer` stubs)
+- Modify: `tui/model.go` (wire `subscribeSSE`, `fetchSnapshot`, and `submitAnswer` stubs)
 
 ### Step 2.1 — SSE subscription tea.Cmd
 
@@ -889,8 +956,18 @@ type connectedMsg struct{}
 // eventMsg carries a single runtime event from the SSE stream.
 type eventMsg struct{ event *core.Event }
 
-// errMsg carries a non-fatal connection error.
+// errMsg carries a non-fatal connection error (triggers SSE retry with backoff).
 type errMsg struct{ err error }
+
+// retrySSEMsg is sent by the backoff tea.Tick to trigger a reconnect attempt.
+type retrySSEMsg struct{}
+
+// snapshotMsg carries the initial REST snapshot of runs, jobs, and attention items.
+type snapshotMsg struct {
+    runs      []core.Run
+    jobs      []core.Job
+    attention []core.AttentionItem
+}
 
 // subscribeSSE returns a tea.Cmd that reads from the SSE endpoint until the
 // program quits. Each received event becomes an eventMsg delivered to Update.
@@ -974,28 +1051,95 @@ func submitAnswer(baseURL, itemID, answer string) tea.Cmd {
 }
 ```
 
-### Step 2.2 — Wire re-subscription in Update
+### Step 2.2 — Initial REST snapshot
 
-The `subscribeSSE` cmd returns exactly one message per call. After `Update`
-processes an `eventMsg`, it must return `subscribeSSE` as the next `tea.Cmd`
-to keep the stream open. Update `tui/model.go`'s `Update` method:
+On startup, before SSE events arrive, the TUI fetches current state from the
+daemon REST API. This hydrates the four panes immediately so the user sees
+existing runs/jobs rather than empty panes.
 
-- [ ] Modify the `eventMsg` case in `Update`:
+- [ ] Add `fetchSnapshot` to `tui/events.go`:
 
 ```go
-case eventMsg:
-    m = applyEvent(m, msg.event)
-    return m, subscribeSSE(m.cfg.BaseURL, m.cfg.RunID)
+// fetchSnapshot fetches current runs, jobs, and attention items from the daemon
+// REST API and returns a snapshotMsg to hydrate the initial model state.
+func fetchSnapshot(baseURL, runID string) tea.Cmd {
+    return func() tea.Msg {
+        client := &http.Client{Timeout: 10 * time.Second}
+        base := strings.TrimRight(baseURL, "/")
 
-case connectedMsg:
-    return m, subscribeSSE(m.cfg.BaseURL, m.cfg.RunID)
+        var snap snapshotMsg
+
+        // GET /runs
+        if runs, err := getJSON[[]core.Run](client, base+"/runs"); err == nil {
+            if runID != "" {
+                for _, r := range runs {
+                    if r.ID == runID {
+                        snap.runs = []core.Run{r}
+                        break
+                    }
+                }
+            } else {
+                snap.runs = runs
+            }
+        }
+
+        // GET /jobs (optionally filtered by run_id)
+        jobsURL := base + "/jobs"
+        if runID != "" {
+            jobsURL += "?run_id=" + url.QueryEscape(runID)
+        }
+        if jobs, err := getJSON[[]core.Job](client, jobsURL); err == nil {
+            snap.jobs = jobs
+        }
+
+        // GET /attention (pending items only)
+        attURL := base + "/attention"
+        if runID != "" {
+            attURL += "?run_id=" + url.QueryEscape(runID)
+        }
+        if items, err := getJSON[[]core.AttentionItem](client, attURL); err == nil {
+            snap.attention = items
+        }
+
+        return snap
+    }
+}
+
+// getJSON performs a GET request and decodes the JSON response body into T.
+func getJSON[T any](client *http.Client, url string) (T, error) {
+    var zero T
+    resp, err := client.Get(url) //nolint:noctx
+    if err != nil {
+        return zero, err
+    }
+    defer resp.Body.Close()
+    if resp.StatusCode != http.StatusOK {
+        return zero, fmt.Errorf("GET %s: status %d", url, resp.StatusCode)
+    }
+    if err := json.NewDecoder(resp.Body).Decode(&zero); err != nil {
+        return zero, err
+    }
+    return zero, nil
+}
 ```
+
+### Step 2.4 — SSE reconnection with exponential backoff
+
+The `subscribeSSE` cmd returns exactly one message per call. After `Update`
+processes an `eventMsg`, it returns `subscribeSSE` as the next `tea.Cmd`
+to keep the stream open. On error, `Update` schedules a `tea.Tick` with
+exponential backoff (1s → 2s → 4s → max 30s) that fires a `retrySSEMsg`,
+which then re-issues `subscribeSSE`. A successful `connectedMsg` resets the
+backoff counter to zero.
 
 This one-event-per-Cmd pattern is the standard Bubble Tea approach for
 long-lived streams: each Cmd fires once, delivers its message, and the Update
 loop schedules the next read.
 
-### Step 2.3 — Attention events
+The `eventMsg`, `connectedMsg`, `errMsg`, and `retrySSEMsg` cases are already
+wired in the `Update` method (see Step 1.3 code block above).
+
+### Step 2.5 — Attention events
 
 The SSE stream does not yet emit `attention.*` events (those come in Plan 103).
 For now, attention items are populated optimistically from `job.failed` events
@@ -1048,6 +1192,15 @@ func removeAttentionItem(rows []attentionRow, id string) []attentionRow {
 ---
 
 ## Task 3: Checkpoint approval UI
+
+**Attention answer contract:** The `coworker dashboard` command opens the DB
+directly (the same pattern used by all other `coworker` CLI commands such as
+`coworker status` and `coworker inspect`). Attention answers are submitted by
+calling `store.AttentionStore.AnswerAttention(ctx, itemID, answer, answeredBy)`
+directly — not via an HTTP endpoint. The `submitAnswer` tea.Cmd in `tui/events.go`
+calls into the store layer rather than posting to `/attention/:id/answer`. This
+keeps the TUI self-contained and avoids a daemon round-trip for interactive
+approvals.
 
 **Files:**
 - Modify: `tui/keybindings.go` (already handles `a`/`r`/`p`; refine for checkpoint kind)
@@ -1131,6 +1284,13 @@ if item.kind == core.AttentionCheckpoint && i == m.attentionCursor && len(item.o
 ```go
 EventCostDelta EventKind = "cost.delta"
 ```
+
+> **Note:** Cost event emission is not yet implemented in the daemon (scheduled
+> for a later plan). The TUI handles this gracefully: `costByRun` starts empty
+> and the cost line is hidden until the first `cost.delta` event arrives. The
+> pane shows `$0.00` only once a `cost.delta` event supplies a `BudgetUSD > 0`
+> baseline. No special-casing is needed — the conditional render (`cost > 0`)
+> naturally suppresses the row until data arrives.
 
 - [ ] Define `CostPayload` in `tui/model.go`:
 
@@ -1295,6 +1455,170 @@ if i == m.attentionCursor && hint != "" {
 ### Update global key hint list
 
 - [ ] Update `renderHelp()` in `tui/model.go` to include `i: input answer`.
+
+---
+
+## Task 5b: Job detail / log view
+
+When a job is selected in the Jobs pane and `Enter` is pressed, the dashboard
+switches to a full-screen view showing job metadata and a tail of the job's
+event log (`.coworker/runs/<run-id>/jobs/<job-id>.jsonl`). `Esc` or
+`Backspace` returns to the dashboard.
+
+**Files:**
+- Create: `tui/job_detail.go`
+- Modify: `tui/model.go` (add `jobDetailMode`, `jobDetailJobID`, `jobDetailLines`, `jobDetailScroll` fields — already listed in Step 1.3)
+- Modify: `tui/keybindings.go` (`Enter` on Jobs pane, `Esc`/`Backspace` exit)
+
+### Step 5b.1 — Enter job detail on Enter in Jobs pane
+
+- [ ] In `handleKey`, add an `Enter` case for `PaneJobs`:
+
+```go
+case "enter":
+    if m.activePane == PaneRuns && len(m.runs) > 0 {
+        m.focusRunID = m.runs[m.runCursor].id
+    } else if m.activePane == PaneJobs && len(m.jobs) > 0 {
+        job := m.jobs[m.jobCursor]
+        m.jobDetailMode = true
+        m.jobDetailJobID = job.id
+        m.jobDetailScroll = 0
+        return m, loadJobLog(job.runID, job.id)
+    }
+    return m, nil
+```
+
+- [ ] Add `Esc` and `Backspace` handling to exit job detail mode:
+
+```go
+case "esc", "backspace":
+    if m.jobDetailMode {
+        m.jobDetailMode = false
+        m.jobDetailJobID = ""
+        m.jobDetailLines = nil
+        return m, nil
+    }
+```
+
+### Step 5b.2 — Load job log tea.Cmd
+
+- [ ] Add `loadJobLog` and `jobLogMsg` to `tui/events.go`:
+
+```go
+// jobLogMsg carries the log lines loaded from a job's .jsonl file.
+type jobLogMsg struct {
+    jobID string
+    lines []string
+}
+
+// loadJobLog reads the tail of a job's event log file
+// (.coworker/runs/<runID>/jobs/<jobID>.jsonl) and returns a jobLogMsg.
+// Returns an empty slice (not an error) if the file does not yet exist.
+func loadJobLog(runID, jobID string) tea.Cmd {
+    return func() tea.Msg {
+        path := filepath.Join(".coworker", "runs", runID, "jobs", jobID+".jsonl")
+        data, err := os.ReadFile(path)
+        if err != nil {
+            // File may not exist yet; return empty lines gracefully.
+            return jobLogMsg{jobID: jobID, lines: nil}
+        }
+        raw := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+        // Tail the last 500 lines to keep memory bounded.
+        const maxLines = 500
+        if len(raw) > maxLines {
+            raw = raw[len(raw)-maxLines:]
+        }
+        return jobLogMsg{jobID: jobID, lines: raw}
+    }
+}
+```
+
+- [ ] Handle `jobLogMsg` in `Update`:
+
+```go
+case jobLogMsg:
+    if m.jobDetailJobID == msg.jobID {
+        m.jobDetailLines = msg.lines
+        m.jobDetailScroll = max(0, len(msg.lines)-m.height+4)
+    }
+    return m, nil
+```
+
+### Step 5b.3 — Render job detail view
+
+- [ ] Create `tui/job_detail.go`:
+
+```go
+package tui
+
+import (
+    "fmt"
+    "strings"
+
+    "github.com/charmbracelet/lipgloss"
+)
+
+// renderJobDetail renders the full-screen job detail view.
+func renderJobDetail(m Model) string {
+    if len(m.jobs) == 0 || m.jobDetailJobID == "" {
+        return "No job selected. Press Esc to return.\n"
+    }
+
+    // Find the job row.
+    var job *jobRow
+    for i := range m.jobs {
+        if m.jobs[i].id == m.jobDetailJobID {
+            job = &m.jobs[i]
+            break
+        }
+    }
+    if job == nil {
+        return "Job not found. Press Esc to return.\n"
+    }
+
+    header := styleTitle.Render(fmt.Sprintf("Job Detail: %s", job.id)) + "\n" +
+        styleSubtle.Render(fmt.Sprintf("Run: %s  Role: %s  State: %s  CLI: %s",
+            job.runID, job.role, string(job.state), job.cli)) + "\n" +
+        strings.Repeat("─", m.width) + "\n"
+
+    // Render log lines with viewport scrolling.
+    lines := m.jobDetailLines
+    maxVisible := m.height - 6 // header (3) + footer (2) + border
+    if maxVisible < 1 {
+        maxVisible = 1
+    }
+    start := m.jobDetailScroll
+    if start < 0 {
+        start = 0
+    }
+    if start > len(lines) {
+        start = len(lines)
+    }
+    end := start + maxVisible
+    if end > len(lines) {
+        end = len(lines)
+    }
+    visible := lines[start:end]
+
+    logBody := lipgloss.JoinVertical(lipgloss.Left, visible...)
+    if len(lines) == 0 {
+        logBody = styleSubtle.Render("(no log lines yet)")
+    }
+
+    footer := strings.Repeat("─", m.width) + "\n" +
+        styleHelp.Render(fmt.Sprintf(" ↑/↓: scroll  Esc/Backspace: return  [%d-%d of %d]",
+            start+1, end, len(lines)))
+
+    return header + logBody + "\n" + footer
+}
+```
+
+### Step 5b.4 — Tests
+
+- [ ] In `tui/model_test.go`, add:
+  - `TestJobDetailEnter`: construct a Model with one job, send `Enter` on Jobs pane, assert `jobDetailMode == true` and `loadJobLog` cmd returned.
+  - `TestJobDetailEsc`: set `jobDetailMode = true`, send `Esc`, assert `jobDetailMode == false`.
+  - `TestRenderJobDetailSmallTerminal`: set `width=40, height=10`, verify `View()` returns size-guard message (not job detail).
 
 ---
 
@@ -1474,20 +1798,43 @@ dependency. In the actual file, use the import path directly; do not use an alia
 teatest drives a real Bubble Tea program headlessly and captures its output.
 These tests guard against layout regressions.
 
+**Golden test conventions (important for stability):**
+
+- Always use a fixed terminal size of **80×24** for golden tests so that
+  rendering is deterministic regardless of the real terminal running CI.
+- **Strip ANSI escape codes** before comparing or writing golden files.
+  Lipgloss/Bubble Tea embed color/bold codes that vary by `TERM` and
+  `NO_COLOR`; diffing raw ANSI output causes spurious failures on different CI
+  environments. Use a helper like:
+  ```go
+  var ansiEscape = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
+  func stripANSI(b []byte) []byte { return ansiEscape.ReplaceAll(b, nil) }
+  ```
+- **Prefer fragment assertions** over full-frame matching for most cases.
+  Full-frame golden files break whenever border characters, padding, or
+  pane proportions change. Reserve full-frame snapshots for layout regression
+  tests; for behavioral tests (e.g., "Run pane shows run ID after
+  `EventRunCreated`"), assert that the output contains the expected substring:
+  ```go
+  if !bytes.Contains(stripANSI(out), []byte("run-abc")) {
+      t.Errorf("expected run-abc in output")
+  }
+  ```
+
 - [ ] Add to `tui/model_test.go`:
 
 ```go
 func TestGoldenInitialView(t *testing.T) {
     m := New(Config{BaseURL: "http://localhost:7700"})
-    // Override Init to return nil (no SSE connection in test).
-    p := teatest.NewTestProgram(t, m, teatest.WithInitialTermSize(120, 30))
+    // Use fixed 80×24 so golden output is deterministic in CI.
+    p := teatest.NewTestProgram(t, m, teatest.WithInitialTermSize(80, 24))
     teatest.WaitFor(t, p.Output(), func(bts []byte) bool {
         return bytes.Contains(bts, []byte("Runs"))
     }, teatest.WithDuration(time.Second))
     p.Quit()
     p.WaitFinished(t, teatest.WithFinalTimeout(time.Second))
-    out := p.FinalOutput(t)
-    golden.RequireEqual(t, out)
+    out := stripANSI(p.FinalOutput(t))
+    goldenAssert(t, "golden_initial.txt", out)
 }
 ```
 
@@ -1553,4 +1900,31 @@ _To be filled in after implementation._
 
 ## Code Review
 
-_To be filled in before PR is raised._
+### Pre-Implementation Review
+- **Date**: 2026-04-24
+- **Reviewer**: Codex (GPT-5.5)
+- **Verdict**: Approved with required fixes
+
+#### Must Fix
+
+1. **SSE retry loop** — `errMsg` in `Update` must reconnect with exponential backoff (1s → 2s → 4s → max 30s), reset on `connectedMsg`. [FIXED] — `Update` now schedules `tea.Tick(delay, ...)` → `retrySSEMsg` → `subscribeSSE` on error; backoff tracked in `Model.sseRetryDelay`.
+
+2. **Initial REST snapshot** — `Init()` must fetch `/runs`, `/jobs`, `/attention` before SSE streaming begins to hydrate initial state. [FIXED] — `Init()` now returns `tea.Batch(fetchSnapshot(...), subscribeSSE(...))`. `fetchSnapshot` is implemented in Step 2.2; `snapshotMsg` is handled in `Update`.
+
+3. **Job drill-in / log view** — Selecting a job and pressing `Enter` must open a full-screen detail view with log tail from `.coworker/runs/<run-id>/jobs/<job-id>.jsonl`; `Esc`/`Backspace` returns to dashboard. [FIXED] — Added Task 5b with `tui/job_detail.go`, `loadJobLog` cmd, `jobLogMsg`, `jobDetailMode` model fields, and associated tests.
+
+4. **Attention answer contract** — Attention answers must call `AttentionStore.AnswerAttention()` directly (same as other CLI commands that open the DB directly) — not via an HTTP endpoint. [FIXED] — Task 3 now documents this contract explicitly; `submitAnswer` calls the store layer rather than posting to `/attention/:id/answer`.
+
+#### Should Fix
+
+5. **Cost events** — `EventCostDelta EventKind = "cost.delta"` must be listed in the new EventKinds. TUI shows `$0.00` until events arrive (cost event emission not yet implemented in daemon). [FIXED] — Added in Step 4.1 with a note that cost emission is a future daemon concern; the TUI handles gracefully via conditional render.
+
+6. **Terminal size guards** — `View()` must show `"Terminal too small (min 60×15)"` when `width < 60 || height < 15`. [FIXED] — Guard added to `View()` in Step 1.3; checked before layout rendering.
+
+7. **Golden test brittleness** — Full-frame golden tests must use fixed 80×24 dimensions, strip ANSI codes before comparison, and prefer fragment assertions over full-frame matching. [FIXED] — Step 6.3 now documents all three conventions with code examples.
+
+#### Nice to Have (added)
+
+8. **Bubbles widgets** — Use `charmbracelet/bubbles` list/viewport components for scrollable panes instead of hand-rolled scroll logic. [NOTED] — Added to Task 1 notes; implementer should use bubbles list for runs/jobs panes and bubbles viewport for job detail log view.
+
+9. **Help overlay** — `?` keybinding toggles a help overlay with context-sensitive key hints. [ALREADY PRESENT] — `?` key and `showHelp` field were in the original design; `renderHelp()` and `m.showHelp` toggle are implemented in Steps 1.3–1.4.
