@@ -1,0 +1,34 @@
+name: planner
+concurrency: single
+cli: claude-code
+prompt_template: prompts/planner.md
+inputs:
+  required:
+    - spec_path
+    - plan_skeleton
+  optional:
+    - prior_reports
+outputs:
+  contract:
+    plan_file_written: true
+  emits:
+    plan_path: string
+    notes: string
+sandbox: read-only
+permissions:
+  allowed_tools:
+    - read
+    - grep
+    - glob
+    - write
+  never:
+    - "bash:rm"
+    - "bash:sudo"
+  requires_human: []
+budget:
+  max_tokens_per_job: 100000
+  max_wallclock_minutes: 30
+  max_cost_usd: 5.00
+retry_policy:
+  on_contract_fail: retry_with_feedback
+  on_job_error: retry_once

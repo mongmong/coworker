@@ -1,0 +1,35 @@
+name: architect
+concurrency: single
+cli: codex
+prompt_template: prompts/architect.md
+inputs:
+  required:
+    - prd_path
+  optional:
+    - repo_context
+outputs:
+  contract:
+    spec_file_written: true
+    manifest_file_written: true
+  emits:
+    spec_path: string
+    manifest_path: string
+    notes: string
+sandbox: read-only
+permissions:
+  allowed_tools:
+    - read
+    - grep
+    - glob
+    - write
+  never:
+    - "bash:rm"
+    - "bash:sudo"
+  requires_human: []
+budget:
+  max_tokens_per_job: 200000
+  max_wallclock_minutes: 60
+  max_cost_usd: 10.00
+retry_policy:
+  on_contract_fail: retry_with_feedback
+  on_job_error: retry_once
