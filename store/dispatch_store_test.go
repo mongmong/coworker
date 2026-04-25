@@ -332,6 +332,58 @@ func TestExpireLeases_SkipsNonExpired(t *testing.T) {
 	}
 }
 
+func TestRequeueByWorker_ClearsPendingTargetedDispatches(t *testing.T) {
+	db := setupTestDB(t)
+	es := NewEventStore(db)
+	rs := NewRunStore(db, es)
+	ds := NewDispatchStore(db, es)
+	ctx := context.Background()
+
+	createTestRun(t, rs, ctx, "run_d_pending_target")
+
+	// Enqueue a dispatch targeted to a specific worker handle.
+	workerHandle := "evicted-worker-handle"
+	d := &core.Dispatch{
+		RunID:        "run_d_pending_target",
+		Role:         "coder.impl",
+		WorkerHandle: workerHandle,
+		Inputs:       map[string]interface{}{},
+	}
+	if err := ds.EnqueueDispatch(ctx, d); err != nil {
+		t.Fatalf("EnqueueDispatch: %v", err)
+	}
+
+	// Dispatch is pending with a specific worker_handle.
+	got, err := ds.GetDispatch(ctx, d.ID)
+	if err != nil {
+		t.Fatalf("GetDispatch: %v", err)
+	}
+	if got.WorkerHandle != workerHandle {
+		t.Fatalf("worker_handle = %q, want %q", got.WorkerHandle, workerHandle)
+	}
+	if got.State != core.DispatchStatePending {
+		t.Fatalf("state = %q, want pending", got.State)
+	}
+
+	// Simulate worker eviction.
+	if err := ds.RequeueByWorker(ctx, workerHandle); err != nil {
+		t.Fatalf("RequeueByWorker: %v", err)
+	}
+
+	// Pending targeted dispatch should have its worker_handle cleared so any
+	// eligible worker can claim it.
+	after, err := ds.GetDispatch(ctx, d.ID)
+	if err != nil {
+		t.Fatalf("GetDispatch after requeue: %v", err)
+	}
+	if after.State != core.DispatchStatePending {
+		t.Errorf("state after requeue = %q, want pending", after.State)
+	}
+	if after.WorkerHandle != "" {
+		t.Errorf("worker_handle after requeue = %q, want empty", after.WorkerHandle)
+	}
+}
+
 func TestGetDispatch_NotFound(t *testing.T) {
 	db := setupTestDB(t)
 	es := NewEventStore(db)

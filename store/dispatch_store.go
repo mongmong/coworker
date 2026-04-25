@@ -377,10 +377,16 @@ func (s *DispatchStore) ExpireLeases(ctx context.Context, timeout time.Duration)
 	return nil
 }
 
-// RequeueByWorker resets all dispatches leased by the given worker handle to
-// 'pending', clearing worker_handle and leased_at, and emits a dispatch.expired
-// event for each. Called when a worker is evicted.
+// RequeueByWorker resets all dispatches associated with the given worker handle
+// back to a claimable state. Called when a worker is evicted.
+//
+// Two cases are handled:
+//  1. Leased dispatches — reset to 'pending', clear worker_handle and leased_at,
+//     and emit a dispatch.expired event for each.
+//  2. Pending targeted dispatches — clear worker_handle so any eligible worker
+//     can claim them (no event emitted; they were never leased).
 func (s *DispatchStore) RequeueByWorker(ctx context.Context, workerHandle string) error {
+	// --- Phase 1: requeue leased dispatches and emit events ---
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, run_id FROM dispatches
 		WHERE state = 'leased' AND worker_handle = ?`,
@@ -434,6 +440,19 @@ func (s *DispatchStore) RequeueByWorker(ctx context.Context, workerHandle string
 			return fmt.Errorf("requeue dispatch %q: %w", r.id, err)
 		}
 	}
+
+	// --- Phase 2: clear worker_handle on pending targeted dispatches ---
+	// These were enqueued for a specific worker that is now gone. Clearing
+	// worker_handle makes them claimable by any eligible worker of the same role.
+	// No event is emitted because the dispatch was never leased.
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE dispatches SET worker_handle = NULL
+		WHERE worker_handle = ? AND state = 'pending'`,
+		workerHandle,
+	); err != nil {
+		return fmt.Errorf("clear pending targeted dispatches for worker %q: %w", workerHandle, err)
+	}
+
 	return nil
 }
 

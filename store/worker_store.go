@@ -4,11 +4,18 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/chris/coworker/core"
 )
+
+// errSkipEviction is a sentinel returned by the MarkEvicted applyFn when
+// the UPDATE affects 0 rows (the worker recovered between SELECT and UPDATE).
+// WriteEventThenRow rolls back the entire transaction on this error, so no
+// phantom worker.deregistered event is committed.
+var errSkipEviction = errors.New("worker recovered before eviction: skip")
 
 // WorkerStore manages the workers table: registration, heartbeat, and eviction.
 type WorkerStore struct {
@@ -262,6 +269,7 @@ func (s *WorkerStore) MarkEvicted(ctx context.Context, cutoff time.Time) ([]stri
 	}
 
 	now := time.Now()
+	var evicted []string
 	for _, h := range handles {
 		payload, _ := json.Marshal(map[string]string{"handle": h, "reason": "heartbeat_timeout"})
 		event := &core.Event{
@@ -274,19 +282,38 @@ func (s *WorkerStore) MarkEvicted(ctx context.Context, cutoff time.Time) ([]stri
 			CreatedAt:     now,
 		}
 		handle := h // capture
-		if err := s.event.WriteEventThenRow(ctx, event, func(tx *sql.Tx) error {
-			_, err := tx.ExecContext(ctx,
+		evictErr := s.event.WriteEventThenRow(ctx, event, func(tx *sql.Tx) error {
+			result, err := tx.ExecContext(ctx,
 				`UPDATE workers SET state = 'evicted'
 				WHERE handle = ? AND state = 'stale'`,
 				handle,
 			)
-			return err
-		}); err != nil {
-			return nil, fmt.Errorf("evict worker %q: %w", h, err)
+			if err != nil {
+				return err
+			}
+			n, err := result.RowsAffected()
+			if err != nil {
+				return fmt.Errorf("rows affected: %w", err)
+			}
+			if n == 0 {
+				// Worker heartbeated between our SELECT and this UPDATE and is
+				// no longer stale. Roll back both the event and the UPDATE so
+				// no phantom worker.deregistered event is committed.
+				return errSkipEviction
+			}
+			return nil
+		})
+		if evictErr != nil {
+			if errors.Is(evictErr, errSkipEviction) {
+				// Worker recovered — omit from the evicted list.
+				continue
+			}
+			return nil, fmt.Errorf("evict worker %q: %w", h, evictErr)
 		}
+		evicted = append(evicted, h)
 	}
 
-	return handles, nil
+	return evicted, nil
 }
 
 // GetWorker retrieves a worker by handle. Returns nil if not found.

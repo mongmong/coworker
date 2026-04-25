@@ -17,11 +17,11 @@ type WatchdogConfig struct {
 	// transitions to 'stale'. Default: 45 s (3 missed 15-second heartbeats).
 	StaleAfter time.Duration
 	// EvictAfter is how long since the last heartbeat before a stale worker
-	// is evicted and its dispatches are requeued. Default: same as StaleAfter
-	// (eviction happens on the same pass as stale detection; the two-step
-	// transition — live→stale, then stale→evicted — uses the same cutoff so
-	// a single missed window does not evict. Workers must be stale for a full
-	// Interval before eviction fires).
+	// is evicted and its dispatches are requeued. Default: StaleAfter + Interval.
+	// This gives workers one full watchdog interval to recover from the stale
+	// state before eviction fires, making the two-phase transition (live→stale
+	// on one tick, stale→evicted on the next tick) effective even at default
+	// configuration.
 	EvictAfter time.Duration
 }
 
@@ -41,7 +41,10 @@ func (c WatchdogConfig) staleAfter() time.Duration {
 
 func (c WatchdogConfig) evictAfter() time.Duration {
 	if c.EvictAfter <= 0 {
-		return c.staleAfter()
+		// Default: one full interval beyond StaleAfter so the two-phase
+		// transition (live→stale, stale→evicted) always spans at least two
+		// watchdog ticks, even at default configuration.
+		return c.staleAfter() + c.interval()
 	}
 	return c.EvictAfter
 }
@@ -51,9 +54,12 @@ func (c WatchdogConfig) evictAfter() time.Duration {
 // It runs until ctx is cancelled.
 //
 // The two-phase transition (live→stale, stale→evicted) gives workers one
-// extra watchdog interval to recover before dispatch requeue. With defaults
-// (interval=15s, staleAfter=45s), a worker must miss heartbeats for ~60 s
-// before its dispatches are requeued.
+// full watchdog interval to recover before dispatch requeue:
+//   - Tick N:   last_heartbeat_at < now-StaleAfter  → live becomes stale
+//   - Tick N+1: last_heartbeat_at < now-EvictAfter  → stale becomes evicted
+//
+// With defaults (interval=15s, staleAfter=45s, evictAfter=60s), a worker
+// must miss heartbeats for ~75 s before its dispatches are requeued.
 type HeartbeatWatchdog struct {
 	workers  *store.WorkerStore
 	dispatch *store.DispatchStore

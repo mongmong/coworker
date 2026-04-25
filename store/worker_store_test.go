@@ -420,6 +420,68 @@ func TestWorkerStore_MarkEvicted_OnlyFromStale(t *testing.T) {
 	}
 }
 
+func TestWorkerStore_MarkEvicted_NoPhantomEventWhenWorkerRecovers(t *testing.T) {
+	// Regression test: if a worker heartbeats between MarkStale's SELECT and
+	// MarkEvicted's UPDATE, the Heartbeat call re-sets state to 'live'. The
+	// subsequent MarkEvicted UPDATE should affect 0 rows and must NOT commit a
+	// phantom worker.deregistered event.
+	db := setupTestDB(t)
+	es := NewEventStore(db)
+	ws := NewWorkerStore(db, es)
+	ctx := context.Background()
+
+	w := newTestWorker("coder.impl", "claude-code")
+	if err := ws.Register(ctx, w); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	// Mark the worker stale.
+	cutoff := time.Now().Add(1 * time.Hour)
+	if _, err := ws.MarkStale(ctx, cutoff); err != nil {
+		t.Fatalf("MarkStale: %v", err)
+	}
+
+	// Simulate the worker recovering by sending a heartbeat (state → live).
+	if err := ws.Heartbeat(ctx, w.Handle); err != nil {
+		t.Fatalf("Heartbeat (recovery): %v", err)
+	}
+
+	// MarkEvicted: the UPDATE will affect 0 rows because state is now 'live'.
+	// The worker should NOT appear in the returned evicted list, and no
+	// worker.deregistered event should be committed.
+	evicted, err := ws.MarkEvicted(ctx, cutoff)
+	if err != nil {
+		t.Fatalf("MarkEvicted: %v", err)
+	}
+	for _, h := range evicted {
+		if h == w.Handle {
+			t.Errorf("recovered worker %q appeared in evicted list", w.Handle)
+		}
+	}
+
+	// Worker should still be live.
+	got, err := ws.GetWorker(ctx, w.Handle)
+	if err != nil {
+		t.Fatalf("GetWorker: %v", err)
+	}
+	if got.State != core.WorkerStateLive {
+		t.Errorf("state = %q, want live (worker recovered)", got.State)
+	}
+
+	// Exactly one worker.deregistered event should exist (none — the worker
+	// never actually got evicted).
+	var count int
+	if err := db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM events WHERE kind = ? AND correlation_id = ?",
+		string(core.EventWorkerDeregistered), w.Handle,
+	).Scan(&count); err != nil {
+		t.Fatalf("query events: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("expected 0 worker.deregistered events for recovered worker, got %d", count)
+	}
+}
+
 func TestWorkerStore_GetWorker_NotFound(t *testing.T) {
 	db := setupTestDB(t)
 	es := NewEventStore(db)
