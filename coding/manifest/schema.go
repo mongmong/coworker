@@ -118,5 +118,45 @@ func (m *PlanManifest) Validate() error {
 		}
 	}
 
+	// Detect cycles using Kahn's algorithm (topological sort).
+	// Build in-degree map: for each plan, count how many plans it depends on.
+	inDegree := make(map[int]int, len(m.Plans))
+	// dependents maps a plan ID to the set of plans that list it in blocks_on.
+	dependents := make(map[int][]int, len(m.Plans))
+	for _, p := range m.Plans {
+		if _, ok := inDegree[p.ID]; !ok {
+			inDegree[p.ID] = 0
+		}
+		for _, dep := range p.BlocksOn {
+			inDegree[p.ID]++
+			dependents[dep] = append(dependents[dep], p.ID)
+		}
+	}
+
+	// Queue all plans with no dependencies.
+	queue := make([]int, 0, len(m.Plans))
+	for id, deg := range inDegree {
+		if deg == 0 {
+			queue = append(queue, id)
+		}
+	}
+
+	processed := 0
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		processed++
+		for _, dep := range dependents[cur] {
+			inDegree[dep]--
+			if inDegree[dep] == 0 {
+				queue = append(queue, dep)
+			}
+		}
+	}
+
+	if processed != len(m.Plans) {
+		return fmt.Errorf("manifest: blocks_on graph contains a cycle")
+	}
+
 	return nil
 }

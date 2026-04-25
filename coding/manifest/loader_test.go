@@ -173,6 +173,40 @@ func TestLoadManifest_FileNotFound(t *testing.T) {
 	}
 }
 
+func TestParseManifest_SelfReferenceCycle(t *testing.T) {
+	yaml := `
+spec_path: docs/specs/foo.md
+plans:
+  - id: 100
+    title: "Plan A"
+    phases: ["p1"]
+    blocks_on: [100]
+`
+	_, err := manifest.ParseManifest([]byte(yaml))
+	if err == nil {
+		t.Fatal("expected error for self-referencing plan (cycle), got nil")
+	}
+}
+
+func TestParseManifest_MutualCycle(t *testing.T) {
+	yaml := `
+spec_path: docs/specs/foo.md
+plans:
+  - id: 100
+    title: "Plan A"
+    phases: ["p1"]
+    blocks_on: [101]
+  - id: 101
+    title: "Plan B"
+    phases: ["p1"]
+    blocks_on: [100]
+`
+	_, err := manifest.ParseManifest([]byte(yaml))
+	if err == nil {
+		t.Fatal("expected error for mutual cycle (A blocks B, B blocks A), got nil")
+	}
+}
+
 func TestPlanSlug(t *testing.T) {
 	cases := []struct {
 		title string

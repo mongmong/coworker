@@ -48,8 +48,8 @@ func (s *DAGScheduler) ReadyPlans(completed map[int]bool, active map[int]bool) [
 		return nil
 	}
 
-	cap := s.MaxParallelPlans()
-	slots := cap - len(active)
+	maxParallel := s.MaxParallelPlans()
+	slots := maxParallel - len(active)
 	if slots <= 0 {
 		return nil
 	}
