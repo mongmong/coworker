@@ -4567,7 +4567,37 @@ Expected: 7 events in order: run.created, job.created, job.leased, finding.creat
 
 ## Post-Execution Report
 
-(To be filled after implementation.)
+**Implementation details**
+
+All nine tasks completed across 11 commits on `feature/plan-100-thin-end-to-end`. Built with Go 1.25.0 and `modernc.org/sqlite` (pure Go, no cgo). Key deliverables:
+
+- `core/` — domain types: `Run`, `Job`, `Event`, `Finding`, `Artifact`, `Role`, `Agent`/`JobHandle` interfaces, `NewID` helper.
+- `store/` — `DB` (Open + Migrate), `EventStore` (WriteEventThenRow + idempotency), `RunStore`, `JobStore`, `FindingStore` (immutable, fingerprinted), `ArtifactStore`. Schema in `store/migrations/001_init.sql`.
+- `agent/` — `CliAgent` wrapping `os/exec` with `stream-json` parsing via `json.Decoder` loop; `CliHandle` for async Wait.
+- `coding/roles/` — YAML role loader with Go `text/template` prompt rendering.
+- `coding/dispatch.go` — `Dispatcher` tying together role loader, agent spawn, finding persist, and event-first writes.
+- `cli/invoke.go` — `coworker invoke <role> --diff <path> --spec <path>` cobra command.
+- `testdata/mocks/codex` — mock Codex binary emitting canned stream-JSON findings.
+- `docs/architecture/decisions.md` — created with initial cross-cutting decisions (event-log-before-state, file-artifact-as-pointer, findings-immutable).
+
+**Deviations from plan**
+
+- A post-implementation lint pass (commit `39cc718`) was required to fix golangci-lint v2 issues: `errcheck` on `tx.Rollback()`, `gocyclo` excluding `_test.go`, `gofmt` formatting, `gosec` G204/G306/G202 suppressions.
+- `golangci-lint` v2 migration required `.golangci.yml` restructuring; `gocyclo` test exclusion was not anticipated in the plan.
+
+**Known limitations**
+
+- `coworker invoke` is ephemeral only — no persistent worker support (deferred to Plan 105).
+- No supervisor hook on dispatch (deferred to Plan 101).
+- No live event streaming (deferred to Plan 102).
+- `CliAgent` exits synchronously; truly async dispatch tracked by `JobHandle` but not exposed to CLI in V1.
+
+**Verification results**
+
+- Full suite: 21 packages pass, 0 failures. `go test ./... -count=1 -timeout 60s` green.
+- Integration test: `TestInvokeReviewerArch_EndToEnd` passes; event log snapshot matches golden file (7 events in correct order).
+- Architecture test: `TestCoreDoesNotImportCoding` passes.
+- Lint: clean after v2 migration fixes.
 
 ---
 

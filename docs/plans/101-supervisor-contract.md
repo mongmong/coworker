@@ -2651,7 +2651,34 @@ After all tasks are complete, verify:
 
 ## Post-Execution Report
 
-_To be written after implementation is complete._
+**Implementation details**
+
+All six tasks completed across 10 commits on `feature/plan-101-supervisor-contract`. Key deliverables:
+
+- `core/supervisor.go` — `SupervisorVerdict`, `RuleResult`, `EvalContext` types; `EventKindSupervisorVerdict`, `EventKindSupervisorRetry`, `EventKindComplianceBreach` event constants.
+- `coding/supervisor/loader.go` — `LoadRulesFromBytes` with YAML unmarshalling, role-glob compilation (`compiled []*regexp.Regexp` cached on Rule), `roleGlobMatches` helper, `sort.Slice` for deterministic rule order.
+- `coding/supervisor/predicates.go` — `all_findings_have`, `exit_code_is`, `git_current_branch_matches`, `last_commit_msg_contains` predicates; `ParseCheck` parser for structured check output.
+- `coding/supervisor/engine.go` — `Engine.Evaluate` runs all matching rules without short-circuit, returns slice of `RuleResult`s; pure logic, no `store/` import.
+- `coding/supervisor/rules.yaml` — seed rules for `reviewer.*`: severity-block, exit-code-nonzero, compliant-branch-name.
+- `coding/dispatch.go` — retry loop with supervisor hook (up to `MaxRetries`), emits `supervisor.verdict`, `supervisor.retry`, and `compliance-breach` events; nil-Supervisor path preserved for backward compatibility.
+- `tests/architecture/imports_test.go` — added `TestSupervisorDoesNotImportStore`.
+
+**Deviations from plan**
+
+- Post-implementation lint pass (commit `98b7c64`) fixed `gofmt` and `gocyclo` issues in `coding/dispatch.go` and `gosec` in predicates test.
+- `QuoteMeta` added to role-glob matching to prevent regex injection from literal dots/stars in role names.
+- Rules are sorted by Name after loading to ensure deterministic evaluation order (not in original spec).
+
+**Known limitations**
+
+- Git predicates (`git_current_branch_matches`, `last_commit_msg_contains`) run `git` as subprocess without `exec.CommandContext` — context cancellation not threaded through (deferred to Plan 103+).
+- Intermediate-attempt findings are discarded on retry by design; no aggregation of cross-attempt findings.
+
+**Verification results**
+
+- Supervisor package: 41 tests pass (`coding/supervisor`). Full suite: all 21 packages green.
+- Architecture tests: `TestCoreDoesNotImportCoding` and `TestSupervisorDoesNotImportStore` both pass.
+- Lint: clean after post-implementation fixes.
 
 ---
 

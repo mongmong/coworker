@@ -568,6 +568,44 @@ func BuildRenderedPrompt(roleName string, inputs map[string]string, roleDir, pro
 
 ---
 
+## Post-Execution Report
+
+**Implementation details**
+
+Six tasks completed across 11 commits on `feature/plan-104-mcp-server`. Key deliverables:
+
+- `mcp/server.go` — MCP server using the official `modelcontextprotocol/go-sdk`; `NewServer` registers all `orch.*` tool handlers; `StartStdio` runs the JSON-RPC transport.
+- `cli/daemon.go` — `coworker daemon` cobra command; wires `store.DB`, `store.EventStore`, `store.DispatchStore`, `store.AttentionStore`, `store.FindingStore`, `store.ArtifactStore`, and starts MCP server on stdio.
+- `mcp/handlers_run.go` — `orch.run.status` and `orch.run.inspect` handlers.
+- `mcp/handlers_dispatch.go` — `orch.role.invoke`, `orch.next_dispatch`, `orch.job_complete` handlers; `store.DispatchStore` with `EnqueueDispatch`, `ClaimNextDispatch` (atomic SELECT+UPDATE, single tx), `CompleteDispatch` (state-guarded), `ExpireLeases` (state-guarded).
+- `mcp/handlers_attention.go` — `orch.ask_user`, `orch.attention.list`, `orch.attention.answer` handlers.
+- `mcp/handlers_query.go` — `orch.findings.list`, `orch.artifact.read`, `orch.artifact.write` handlers.
+- `store/dispatch_store.go` — dispatch queue with `EnqueueDispatch`, `ClaimNextDispatch`, `CompleteDispatch`, `ExpireLeases`, `RequeueByWorker`, `GetDispatch`.
+
+**Deviations from plan**
+
+- Official `modelcontextprotocol/go-sdk` was viable and adopted (spike confirmed); `mark3labs/mcp-go` fallback not needed.
+- Daemon is stdio-only for V1; `--socket`/`--listen` flags not implemented (WONTFIX — plan updated).
+- `DispatchStateExpired` constant was dead code and removed.
+- `core.EventWriter` signature changed to `func(tx any) error` for compatibility.
+- Critical code-review fixes: TOCTOU race in `ClaimNextDispatch` fixed (atomic SELECT+UPDATE), `CompleteDispatch` state guard added (`AND state = 'leased'`), silent error drops replaced with `slog.Warn`.
+- 11 new handler tests added during code review fix pass covering `orch.next_dispatch`/`orch.job_complete` idle, dispatch, error, and full-cycle paths.
+- Worker registration tools (`orch.register`, `orch.heartbeat`, `orch.deregister`) and `orch.findings.create` deferred to Plan 105.
+
+**Known limitations**
+
+- No composite index on `(state, role, created_at)` in dispatch table — deferred until performance matters.
+- Worker registration/heartbeat/deregister MCP tools not present (Plan 105).
+- `orch.role.invoke` dispatches ephemerally only; persistent worker routing deferred to Plan 105.
+
+**Verification results**
+
+- `mcp/` package: 87 tests pass. Full suite: all 21 packages green.
+- `go build ./...` passes cleanly.
+- Lint: clean.
+
+---
+
 ## Code Review
 
 ### Review 1

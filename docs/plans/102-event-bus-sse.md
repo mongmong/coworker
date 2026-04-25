@@ -1625,3 +1625,42 @@ Expected: one line per matching event, formatted as `timestamp kind run=<id> pay
 10. `[WONTFIX]` `signal.NotifyContext` change undocumented — correct, no action.
 11. `[WONTFIX]` `recordingBus` test double — positive deviation, preserves import discipline.
 12. `[WONTFIX]` `summarizePayload` byte truncation — low-risk for V1 terminal output.
+
+---
+
+## Post-Execution Report
+
+**Implementation details**
+
+Five tasks completed across 9 commits on `feature/plan-102-event-bus-sse`. Key deliverables:
+
+- `core/bus.go` — `EventBus` interface (`Subscribe`, `Unsubscribe`, `Publish`).
+- `coding/eventbus/bus.go` — `InMemoryBus` with buffered-channel fan-out, slow-subscriber drop with `slog.Warn`, concurrent-safe subscriber map.
+- `coding/eventbus/sse.go` — `SSEHandler` serving `text/event-stream`; client-side filtering by `run_id` and `kind` query params.
+- `store/event_store.go` — optional `Bus core.EventBus` field; publishes committed `*core.Event` after successful `WriteEventThenRow` transaction.
+- `cli/watch.go` — `coworker watch` cobra command; SSE client with exponential-backoff reconnection (reset after >10s stable stream), pretty-print one line per event.
+- `internal/testutil/snapshot.go` — `AssertGoldenEvents` helper (moved from `store/snapshot_test_helper.go` to avoid linking `testing` into the production binary).
+- `testdata/events/invoke_reviewer_arch.golden.json` — golden snapshot for the Plan 100 integration test.
+- `core/Event` — added `json:"snake_case"` struct tags; golden snapshot regenerated.
+
+**Deviations from plan**
+
+- `store/snapshot_test_helper.go` was initially placed in the `store` package (compiling `testing` into the binary); moved to `internal/testutil/` in the code-review fix pass.
+- `httptest.ResponseRecorder` in SSE tests caused data races; replaced with mutex-guarded buffers in the fix pass.
+- Backoff-reset logic (reset after >10s stable stream) added during code review — not in the original plan.
+- `*.actual` added to `.gitignore` for snapshot test failure artifacts.
+- Lint pass (commit `6f33253`) removed accidentally tracked `.coworker/` state files and fixed gosec permission issue.
+
+**Known limitations**
+
+- SSE filter is client-side (after bus delivery) — accepted V1 trade-off; server-side filtering deferred.
+- `watchLoop` reconnect is not covered by tests — deferred until retry logic becomes more complex.
+- No SSE heartbeat comment — deferred until a real long-running client integration test exists.
+- SSE endpoint is live-only; historical replay uses SQLite event log directly.
+
+**Verification results**
+
+- `coding/eventbus` + `cli` packages: 23 tests pass. Full suite: all 21 packages green.
+- Race detector: `go test ./coding/eventbus -count=1 -race` passes.
+- Integration test `TestInvokeReviewerArch_EndToEnd` passes with golden snapshot assertion.
+- Lint: clean after gosec and gitignore fixes.

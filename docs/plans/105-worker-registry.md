@@ -1435,4 +1435,31 @@ All must pass green. No new lint suppressions without justification.
 
 ## Post-Execution Report
 
-_(To be filled in after implementation.)_
+**Implementation details**
+
+Six phases completed across 8 commits on `feature/plan-105-worker-registry`. Key deliverables:
+
+- `store/worker_store.go` — `WorkerStore` with `RegisterWorker`, `Heartbeat`, `Deregister`, `LiveWorkersForRole`, `MarkStale`, `MarkEvicted`, `GetWorker`, `RequeueLeasedDispatches`; all mutations go through `WriteEventThenRow`. Schema: `workers` table added to `store/migrations/001_init.sql`.
+- `store/dispatch_store.go` — `RequeueByWorker` (clears `worker_handle` on eviction to avoid orphaned pending dispatches) and `ClaimNextDispatch` extended with handle-filter logic (worker-targeted vs. ephemeral dispatch routing).
+- `mcp/handlers_registry.go` — `orch.register`, `orch.heartbeat`, `orch.deregister` MCP tool handlers; evicted-worker heartbeat rejection.
+- `mcp/watchdog.go` — `Watchdog` goroutine: periodic stale detection, eviction, and dispatch requeue; configurable `StaleAfter`, `EvictAfter` (default = `StaleAfter + Interval`), `Interval`; wired into `NewServer` via `WatchdogConfig`.
+- `coding/router.go` — `DispatchRouter` implementing single-concurrency (one worker targeted) and many-concurrency (fan-out to all live workers); `UnknownConcurrency` error for invalid role concurrency values.
+
+**Deviations from plan**
+
+- Critical code-review fix: `MarkEvicted` added `RowsAffected` guard to prevent phantom eviction events when a worker recovers between stale-check and eviction (commit `6c962ea`).
+- `RequeueByWorker` clears `worker_handle` on orphaned pending dispatches so they can be re-claimed by any worker (not just the evicted one).
+- `EvictAfter` default changed to `StaleAfter + Interval` (two-phase default) rather than a fixed constant — avoids premature eviction when Interval is large.
+- `RequeueLeasedDispatches` extracted as a named method on `WorkerStore` rather than inlined into eviction.
+
+**Known limitations**
+
+- Watchdog goroutine has no `WaitGroup` — relies on context cancellation for shutdown (accepted for V1).
+- Worker events stored with `run_id=''` (not NULL) — functionally correct under single-writer; schema constraint not enforced.
+- No composite index on `workers` for role+status queries — defer until performance matters.
+- `orch.findings.create` MCP tool still not implemented (not in scope for Plan 105).
+
+**Verification results**
+
+- `store/` package: 63 tests pass (17 worker store, 18 dispatch store, others). `mcp/` package: 87 tests pass (includes 5 registry + 4 watchdog tests). `coding/` package: 125 tests pass (8 router tests). Full suite: all 21 packages green.
+- Lint: clean.

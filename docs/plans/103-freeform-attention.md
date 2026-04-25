@@ -1840,4 +1840,37 @@ func TestAttentionFlow(t *testing.T) {
 
 ## Post-Execution Report
 
-*(To be filled after implementation is complete and verified)*
+**Implementation details**
+
+Seven tasks completed across 13 commits on `feature/plan-103-freeform-attention`. Key deliverables:
+
+- `store/attention_store.go` — `AttentionStore` with `InsertAttention`, `GetAttention`, `ListUnanswered`, `ResolveAttention`; correct `time.Time` scanning and NULL answer handling (Task 1 fix).
+- `store/migrations/` — schema migration for `attention` table (with FK to `runs`).
+- `coding/policy/loader.go` — `Loader` (renamed from `PolicyLoader` to avoid stutter) loading `.coworker/config.yaml` + `.coworker/policy.yaml` with repo-over-global layering; `defaults.go` for zero-value defaults.
+- `coding/workflow/freeform.go` — `FreeformWorkflow` implementing `core.Workflow` interface; dispatches any role ad hoc.
+- `core/workflow.go` — `Workflow` interface.
+- `coding/session/manager.go` — `Manager` (renamed from `SessionManager`) holding session envelope with SQLite-backed lock file; `repository.go` — `RunRepository` interface for lock-file isolation in tests.
+- `coding/humanedit/recorder.go` — `Recorder` (renamed from `HumanEditRecorder`) synthesising jobs from `git log` commits since session start.
+- `cli/session.go`, `cli/advance.go`, `cli/rollback.go`, `cli/record_human_edit.go` — four new cobra commands.
+- `cli/helpers.go` — `sessionLockPath()` helper shared across session commands.
+- `cli/config_inspect.go` — `coworker config inspect` command.
+- `tests/integration/` — `TestSessionLifecycle`, `TestPolicyLoading_RepoMerge`, `TestAttentionQueue`.
+
+**Deviations from plan**
+
+- Post-implementation lint pass (commit `16444b8`) required: `gofmt`, gosec permission fixes (0644→0600 in 6 files), revive stutter renames (`HumanEditRecorder→Recorder`, `PolicyLoader→Loader`, `SessionManager→Manager`) with all call-site updates, staticcheck `WriteString(Sprintf)→Fprintf`, errcheck for `MarkFlagRequired`.
+- Lock path was hardcoded independently in 4 CLI commands; extracted to `sessionLockPath()` helper in code review fix pass.
+- `answered_on` JSON tag added to `Attention` struct during review.
+- `RunRepository` interface extracted in `coding/session/` to enable lock-file isolation in tests.
+
+**Known limitations**
+
+- `ResolveAttention` and concurrent session paths not covered by integration tests (deferred — not critical for V1).
+- `config inspect` has no sibling subcommands; cobra hierarchy is cosmetic until `config` gains siblings.
+
+**Verification results**
+
+- Session/policy/humanedit/workflow packages: 22 tests pass. Full suite: all 21 packages green.
+- Integration tests: `TestSessionLifecycle`, `TestPolicyLoading_RepoMerge`, `TestAttentionQueue` all pass.
+- Architecture and import tests pass.
+- Lint: clean after post-implementation fixes.
