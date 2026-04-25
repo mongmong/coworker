@@ -66,6 +66,24 @@ plugins/coworker-codex/
 
 ---
 
+## Code Review
+
+### Review 1
+- **Date**: 2026-04-24
+- **Reviewer**: Claude (retrospective review)
+- **Verdict**: Approved
+
+Retrospective review against shipped files in `plugins/coworker-codex/` and `cli/plugin_install.go`.
+
+- **Bare tool names**: All `orch_*` references in `skills/coworker-orchy.md`, `skills/coworker-role-developer.md`, and `skills/coworker-role-reviewer.md` correctly use bare names (e.g. `orch_register`, not `mcp__coworker__orch_register`), matching the spike finding for codex-cli 0.122.0. [PASS]
+- **`danger-full-access` documented**: The sandbox requirement is called out prominently in both `setup.md` and the `coworker-orchy.md` skill header. The `plugin install` output also surfaces it. [PASS]
+- **No idle-wake polling**: The orchy skill correctly omits any timer-based polling instruction; persistent mode relies on explicit user turns only, per spike finding. [PASS]
+- **`--output-schema` tip**: Developer and reviewer skills remind Codex that `additionalProperties: false` and fully enumerated `required` arrays are needed — this matches the spike finding on schema enforcement. [PASS]
+- **Plugin structure**: File layout (`setup.md`, `settings.toml`, `skills/`, `commands/`) mirrors the Claude Code plugin pattern for consistency. [PASS]
+- **`installCodexPlugin` Go branch**: Copies to `~/.codex/coworker/` and prints MCP registration instructions; does not attempt `.mcp.json` merge since Codex uses `~/.codex/config.toml`. [PASS]
+
+---
+
 ## Post-Execution Report
 
 Implemented as part of Plans 109+110 in a single commit on branch

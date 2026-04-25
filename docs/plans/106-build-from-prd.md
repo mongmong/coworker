@@ -203,6 +203,20 @@ Reviewed by author after implementation.
 
 No open items.
 
+### Review 1
+- **Date**: 2026-04-24
+- **Reviewer**: Claude (retrospective review)
+- **Verdict**: Approved
+
+Retrospective review against shipped code in `coding/manifest/` and `coding/workflow/`.
+
+- **Cycle detection**: `Validate` in `schema.go` checks that `blocks_on` IDs reference IDs present in the manifest. Full DAG cycle detection (A→B→A) was added as a post-review fix; `Validate` now detects back-edges via a DFS traversal. [FIXED]
+- **`cap` variable rename**: The plan draft used `cap` as a local variable in `ReadyPlans`, shadowing the built-in. Renamed to `maxParallel` and the slot budget renamed to `slots`. [FIXED]
+- **Manifest schema quality**: `PlanSlug` correctly compiles regexps once as package-level vars, truncates at 40 chars, and trims trailing hyphens. `BranchName` and `WorktreeDirName` are trivially derivable — clean and testable. [PASS]
+- **DAG scheduler purity**: `DAGScheduler` has zero store imports. `ReadyPlans` slot calculation (`maxParallel - len(active)`) correctly prevents over-scheduling across the active+newly-ready set. [PASS]
+- **Worktree manager**: `Create` is idempotent via stat-before-shell-out. Branch-already-exists fallback attaches with `git worktree add <path> <branch>` (no `-b`). `Remove` calls `git worktree prune` best-effort. [PASS]
+- **`BuildFromPRDWorkflow`**: `PrepareWorktrees` skips worktree creation when manager is nil or single-plan — matches spec §Workspace model. Phase loop correctly stubbed as `TODO(Plan 114)`. [PASS]
+
 ---
 
 ## Post-Execution Report

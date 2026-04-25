@@ -69,6 +69,24 @@ plugins/coworker-opencode/
 
 ---
 
+## Code Review
+
+### Review 1
+- **Date**: 2026-04-24
+- **Reviewer**: Claude (retrospective review)
+- **Verdict**: Approved
+
+Retrospective review against shipped files in `plugins/coworker-opencode/` and `cli/plugin_install.go`.
+
+- **HTTP dual-mode documented**: `skills/coworker-orchy.md` clearly separates the HTTP-primary path (daemon-driven via `POST /session` + `POST /session/{id}/message`) from the interactive MCP fallback, with the daemon's `session.idle` completion gate explained. [PASS]
+- **SSE event types documented**: The orchy skill lists key SSE event types (`session.created`, `session.idle`, `message.updated`/`step-finish`, `session.status`) and identifies `session.idle` as the primary terminal signal. [PASS]
+- **Namespaced tool names**: Interactive MCP mode uses `mcp__coworker__*` names throughout, consistent with Claude Code — the spike did not contradict this for OpenCode's MCP client path. [PASS]
+- **Abort support**: `skills/coworker-orchy.md` and `commands/invoke.md` both document `POST /session/{id}/abort` and note that the aborted session remains usable. [PASS]
+- **Plugin structure**: File layout (`.mcp.json`, `settings.json`, `skills/`, `commands/`) mirrors the Claude Code plugin pattern. [PASS]
+- **`installOpenCodePlugin` Go branch**: Copies to `.opencode/coworker/` in project root and merges `.mcp.json` using the same merge logic as the Claude Code path. [PASS]
+
+---
+
 ## Post-Execution Report
 
 Implemented as part of Plans 109+110 in a single commit on branch

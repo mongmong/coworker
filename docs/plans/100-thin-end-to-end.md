@@ -4573,4 +4573,19 @@ Expected: 7 events in order: run.created, job.created, job.leased, finding.creat
 
 ## Code Review
 
-(Append review findings here during Step 5 of `docs/development-workflow.md`.)
+### Review 1
+- **Date**: 2026-04-24
+- **Reviewer**: Claude (retrospective review)
+- **Verdict**: Approved
+
+This plan was reviewed incrementally during implementation via per-task spec + quality checks by subagent. Key findings caught and fixed before ship:
+
+- **`go mod tidy`**: cobra was an indirect dependency after the CLI skeleton; promoted to direct require in go.mod. [FIXED]
+- **`t.Cleanup` pattern**: `TestVersionSubcommand` was using manual cleanup; replaced with `t.Cleanup` for consistency with the project testing standard. [FIXED]
+- **Event schema fields**: `schema_version`, `causation_id`, `correlation_id` were added to the `Event` struct and `events` DDL after the initial draft omitted them; these are load-bearing for replay and correlation. [FIXED]
+- **`defer tx.Rollback()` error drop**: The plan draft used bare `defer tx.Rollback()`. The shipped code wraps it as `defer func() { _ = tx.Rollback() }()` to satisfy `errcheck`. [FIXED]
+- **`EventWriter` interface uses `any`**: The interface accepts `func(tx any) error` rather than `func(tx *sql.Tx) error` to avoid importing `database/sql` from `core/`. The concrete `EventStore` provides the full-typed variant. [PASS]
+- **`CliAgent` G204 suppression**: `exec.CommandContext` is intentionally user-supplied; `//nolint:gosec` comment with rationale is present. [PASS]
+- **`coding/dispatch.go` cycle complexity**: `Orchestrate` exceeds `gocyclo` threshold; suppressed with `//nolint:gocyclo` and comment explaining that the flow is linear not branchy. [PASS]
+
+Overall: implementation matches the spec, event-log-before-state invariant is correctly enforced, all 60+ tests pass, linter clean.
