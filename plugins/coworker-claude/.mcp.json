@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "coworker": {
+      "command": "coworker",
+      "args": ["daemon"],
+      "type": "stdio"
+    }
+  }
+}

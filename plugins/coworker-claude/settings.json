@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__coworker__orch_register",
+      "mcp__coworker__orch_heartbeat",
+      "mcp__coworker__orch_deregister",
+      "mcp__coworker__orch_next_dispatch",
+      "mcp__coworker__orch_job_complete",
+      "mcp__coworker__orch_ask_user",
+      "mcp__coworker__orch_run_status",
+      "mcp__coworker__orch_run_inspect",
+      "mcp__coworker__orch_role_invoke",
+      "mcp__coworker__orch_checkpoint_list",
+      "mcp__coworker__orch_checkpoint_advance",
+      "mcp__coworker__orch_checkpoint_rollback",
+      "mcp__coworker__orch_findings_list",
+      "mcp__coworker__orch_artifact_read",
+      "mcp__coworker__orch_artifact_write",
+      "mcp__coworker__orch_attention_list",
+      "mcp__coworker__orch_attention_answer"
+    ]
+  }
+}
