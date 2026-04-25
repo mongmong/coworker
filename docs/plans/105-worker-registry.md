@@ -1405,7 +1405,31 @@ All must pass green. No new lint suppressions without justification.
 
 ## Code Review
 
-_(To be filled in after implementation.)_
+### Review 1
+
+- **Date**: 2026-04-23
+- **Reviewer**: Claude (full implementation review)
+- **Verdict**: Approved with required fixes
+
+**Critical**
+
+1. `[FIXED]` **MarkEvicted emits phantom events for recovered workers.** `store/worker_store.go:239`.
+   → Response: Added RowsAffected check + errSkipEviction sentinel. Tx rolls back atomically when worker recovered. Regression test added.
+
+**Important**
+
+2. `[FIXED]` **RequeueByWorker doesn't clear pending targeted dispatches.** `store/dispatch_store.go:383`.
+   → Response: Added Phase 2 UPDATE that clears worker_handle on pending targeted dispatches. Regression test added.
+
+3. `[FIXED]` **Two-phase eviction collapses to single-phase with default config.** `mcp/watchdog.go:19`.
+   → Response: Changed default `EvictAfter` to `StaleAfter + Interval` (60s with defaults). Updated doc comments.
+
+**Suggestions**
+
+4. `[WONTFIX]` RequeueLeasedDispatches cross-store coupling — only used in tests, not production.
+5. `[WONTFIX]` Stale "BEGIN IMMEDIATE" comment — accepted, will fix on next touch.
+6. `[WONTFIX]` Worker events stored as `run_id=''` not NULL — functionally correct under single-writer.
+7. `[WONTFIX]` Watchdog goroutine has no WaitGroup — context cancellation is sufficient for V1.
 
 ---
 
