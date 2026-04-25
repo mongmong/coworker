@@ -7,6 +7,8 @@ import (
 
 	"github.com/chris/coworker/coding/manifest"
 	"github.com/chris/coworker/coding/phaseloop"
+	"github.com/chris/coworker/coding/shipper"
+	"github.com/chris/coworker/coding/stages"
 	"github.com/chris/coworker/core"
 )
 
@@ -16,7 +18,8 @@ import (
 // Plan 106 added manifest scheduling and worktree management.
 // Plan 114 adds the PhaseExecutor field and RunPhasesForPlan method,
 // implementing the developer → reviewer/tester → dedupe → fix-loop inner loop.
-// Plan 115 will add the shipper role and PR creation.
+// Plan 115 adds the Shipper field (PR creation) and StageRegistry (Level 1
+// named-stage customization via policy.yaml workflow_overrides).
 type BuildFromPRDWorkflow struct {
 	// ManifestPath is the path to the plan manifest YAML file.
 	ManifestPath string
@@ -37,6 +40,15 @@ type BuildFromPRDWorkflow struct {
 	// for each phase of a plan. May be nil when only scheduling/worktree
 	// management is needed (e.g., in Plan 106 integration tests).
 	PhaseExecutor *phaseloop.PhaseExecutor
+
+	// Shipper creates the GitHub PR after all phases of a plan complete.
+	// When nil, the ship step is skipped (useful in tests that focus on
+	// scheduling or phase execution only).
+	Shipper *shipper.Shipper
+
+	// StageRegistry provides the role list for each named stage.
+	// When nil, defaults from coding/stages are used.
+	StageRegistry *stages.StageRegistry
 
 	// Logger is the structured logger. Uses slog.Default() if nil.
 	Logger *slog.Logger
@@ -169,20 +181,23 @@ func (w *BuildFromPRDWorkflow) Run(
 }
 
 // RunPhasesForPlan executes the phase loop for each phase of the given plan
-// in sequence. It requires PhaseExecutor to be set; returns an error if it is nil.
+// in sequence, then ships the plan as a PR when a Shipper is configured.
+//
+// It requires PhaseExecutor to be set; returns an error if it is nil.
 //
 // inputs is passed directly to PhaseExecutor.Execute for each phase. Callers
 // typically supply at minimum "diff_path" and "spec_path" for reviewer roles.
+// "branch" is used by the shipper to open the PR; defaults to "main" if absent.
 //
-// Returns a slice of PhaseResult, one per phase, in order. If any phase
-// returns an error the method stops and returns that error along with the
-// results collected so far.
+// Returns a RunPhasesResult holding phase results and, when shipping succeeded,
+// the ShipResult. If any phase returns an error the method stops and returns
+// that error along with the results collected so far.
 func (w *BuildFromPRDWorkflow) RunPhasesForPlan(
 	ctx context.Context,
 	runID string,
 	plan manifest.PlanEntry,
 	inputs map[string]string,
-) ([]*phaseloop.PhaseResult, error) {
+) (*RunPhasesResult, error) {
 	if w.PhaseExecutor == nil {
 		return nil, fmt.Errorf("build-from-prd: PhaseExecutor is required for RunPhasesForPlan")
 	}
@@ -194,7 +209,7 @@ func (w *BuildFromPRDWorkflow) RunPhasesForPlan(
 		"phases", len(plan.Phases),
 	)
 
-	results := make([]*phaseloop.PhaseResult, 0, len(plan.Phases))
+	phaseResults := make([]*phaseloop.PhaseResult, 0, len(plan.Phases))
 	for i, phaseName := range plan.Phases {
 		log.Info("executing phase",
 			"plan_id", plan.ID,
@@ -204,9 +219,9 @@ func (w *BuildFromPRDWorkflow) RunPhasesForPlan(
 
 		result, err := w.PhaseExecutor.Execute(ctx, runID, plan.ID, i, phaseName, inputs)
 		if err != nil {
-			return results, fmt.Errorf("plan %d phase %d (%q): %w", plan.ID, i, phaseName, err)
+			return &RunPhasesResult{PhaseResults: phaseResults}, fmt.Errorf("plan %d phase %d (%q): %w", plan.ID, i, phaseName, err)
 		}
-		results = append(results, result)
+		phaseResults = append(phaseResults, result)
 
 		log.Info("phase result",
 			"plan_id", plan.ID,
@@ -218,7 +233,36 @@ func (w *BuildFromPRDWorkflow) RunPhasesForPlan(
 		)
 	}
 
-	return results, nil
+	out := &RunPhasesResult{PhaseResults: phaseResults}
+
+	// Ship the plan as a PR after all phases complete.
+	if w.Shipper != nil {
+		branch := inputs["branch"]
+		if branch == "" {
+			branch = w.baseBranch()
+		}
+		shipResult, err := w.Shipper.Ship(ctx, runID, &plan, branch)
+		if err != nil {
+			return out, fmt.Errorf("plan %d ship: %w", plan.ID, err)
+		}
+		out.ShipResult = shipResult
+		log.Info("plan shipped",
+			"plan_id", plan.ID,
+			"pr_url", shipResult.PRURL,
+		)
+	}
+
+	return out, nil
+}
+
+// RunPhasesResult holds the aggregated output of RunPhasesForPlan.
+type RunPhasesResult struct {
+	// PhaseResults holds one PhaseResult per phase, in order.
+	PhaseResults []*phaseloop.PhaseResult
+
+	// ShipResult is the output of the ship step.
+	// Nil when no Shipper is configured or shipping was not attempted.
+	ShipResult *shipper.ShipResult
 }
 
 // BuildFromPRDResult holds the output of one scheduling iteration.

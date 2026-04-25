@@ -44,6 +44,9 @@ const (
 	// EventPhaseClean is a checkpoint event emitted when the fix-loop
 	// exhausts max_fix_cycles_per_phase without converging to zero findings.
 	EventPhaseClean EventKind = "phase.clean"
+
+	// Plan shipping events — emitted by the shipper after PR creation.
+	EventPlanShipped EventKind = "plan.shipped"
 )
 
 // Event is a single entry in the append-only event log.

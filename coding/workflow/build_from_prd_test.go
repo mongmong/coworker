@@ -6,10 +6,42 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/chris/coworker/coding"
 	"github.com/chris/coworker/coding/manifest"
+	"github.com/chris/coworker/coding/phaseloop"
+	"github.com/chris/coworker/coding/shipper"
 	"github.com/chris/coworker/coding/workflow"
 	"github.com/chris/coworker/core"
+	"github.com/chris/coworker/store"
 )
+
+// stubOrchestrator is a minimal Orchestrator stub for workflow-level tests.
+type stubOrchestrator struct{}
+
+func (s *stubOrchestrator) Orchestrate(_ context.Context, _ *coding.DispatchInput) (*coding.DispatchResult, error) {
+	return &coding.DispatchResult{ExitCode: 0}, nil
+}
+
+// openTestDB opens an in-memory SQLite database for workflow tests.
+func openTestDB(t *testing.T) *store.DB {
+	t.Helper()
+	db, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("store.Open(:memory:): %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	return db
+}
+
+// newTestPhaseExecutor creates a PhaseExecutor with a clean-always stub dispatcher.
+func newTestPhaseExecutor(t *testing.T) *phaseloop.PhaseExecutor {
+	t.Helper()
+	db := openTestDB(t)
+	return &phaseloop.PhaseExecutor{
+		Dispatcher: &stubOrchestrator{},
+		EventStore: store.NewEventStore(db),
+	}
+}
 
 const testManifestYAML = `
 spec_path: docs/specs/test.md
@@ -138,5 +170,95 @@ func TestBuildFromPRDWorkflow_PrepareWorktrees_SinglePlan(t *testing.T) {
 	}
 	if len(worktrees) != 0 {
 		t.Errorf("expected no worktrees for single plan, got %d", len(worktrees))
+	}
+}
+
+func TestBuildFromPRDWorkflow_RunPhasesForPlan_NilPhaseExecutor(t *testing.T) {
+	path := writeManifest(t, testManifestYAML)
+	w := workflow.NewBuildFromPRDWorkflow(path, nil)
+	// PhaseExecutor is nil → must return an error.
+	plan := manifest.PlanEntry{ID: 100, Title: "Core runtime", Phases: []string{"SQLite schema"}}
+	_, err := w.RunPhasesForPlan(context.Background(), "run-1", plan, nil)
+	if err == nil {
+		t.Fatal("expected error when PhaseExecutor is nil, got nil")
+	}
+}
+
+func TestBuildFromPRDWorkflow_RunPhasesForPlan_NoShipper(t *testing.T) {
+	// Phases complete cleanly; no shipper → ShipResult should be nil.
+	path := writeManifest(t, testManifestYAML)
+	w := workflow.NewBuildFromPRDWorkflow(path, nil)
+	w.PhaseExecutor = newTestPhaseExecutor(t)
+
+	plan := manifest.PlanEntry{ID: 100, Title: "Core runtime", Phases: []string{"SQLite schema"}}
+	result, err := w.RunPhasesForPlan(context.Background(), "run-no-ship", plan, map[string]string{
+		"diff_path": "/tmp/test.diff",
+		"spec_path": "/tmp/spec.md",
+	})
+	if err != nil {
+		t.Fatalf("RunPhasesForPlan: %v", err)
+	}
+	if len(result.PhaseResults) != 1 {
+		t.Errorf("expected 1 phase result, got %d", len(result.PhaseResults))
+	}
+	if result.ShipResult != nil {
+		t.Error("expected nil ShipResult when no Shipper configured")
+	}
+}
+
+func TestBuildFromPRDWorkflow_RunPhasesForPlan_WithShipper_DryRun(t *testing.T) {
+	// Full smoke: manifest → schedule → phase loop (stub) → ship (dry-run).
+	path := writeManifest(t, testManifestYAML)
+	w := workflow.NewBuildFromPRDWorkflow(path, nil)
+	w.PhaseExecutor = newTestPhaseExecutor(t)
+	w.Shipper = &shipper.Shipper{DryRun: true}
+
+	plan := manifest.PlanEntry{ID: 115, Title: "Shipper + workflow customization", Phases: []string{"build", "review"}}
+	result, err := w.RunPhasesForPlan(context.Background(), "run-smoke", plan, map[string]string{
+		"diff_path": "/tmp/test.diff",
+		"spec_path": "/tmp/spec.md",
+		"branch":    "feature/plan-115-shipper",
+	})
+	if err != nil {
+		t.Fatalf("RunPhasesForPlan: %v", err)
+	}
+
+	// Two phases should have completed.
+	if len(result.PhaseResults) != 2 {
+		t.Errorf("expected 2 phase results, got %d", len(result.PhaseResults))
+	}
+	for i, pr := range result.PhaseResults {
+		if !pr.Clean {
+			t.Errorf("phase %d: expected Clean=true", i)
+		}
+	}
+
+	// Ship step should have produced a result.
+	if result.ShipResult == nil {
+		t.Fatal("expected non-nil ShipResult when Shipper is configured")
+	}
+	if result.ShipResult.PRURL == "" {
+		t.Error("expected non-empty PRURL from dry-run shipper")
+	}
+}
+
+func TestBuildFromPRDWorkflow_RunPhasesForPlan_BranchFallback(t *testing.T) {
+	// When "branch" key is absent from inputs, baseBranch() ("main") is used.
+	path := writeManifest(t, testManifestYAML)
+	w := workflow.NewBuildFromPRDWorkflow(path, nil)
+	w.PhaseExecutor = newTestPhaseExecutor(t)
+	w.Shipper = &shipper.Shipper{DryRun: true}
+
+	plan := manifest.PlanEntry{ID: 100, Title: "Core runtime", Phases: []string{"p1"}}
+	result, err := w.RunPhasesForPlan(context.Background(), "run-branch-fallback", plan, map[string]string{
+		"diff_path": "/tmp/d.diff",
+		"spec_path": "/tmp/s.md",
+		// No "branch" key — should fall back to "main".
+	})
+	if err != nil {
+		t.Fatalf("RunPhasesForPlan: %v", err)
+	}
+	if result.ShipResult == nil {
+		t.Fatal("expected ShipResult even with branch fallback")
 	}
 }
