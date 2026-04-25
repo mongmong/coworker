@@ -29,6 +29,13 @@ const (
 	EventWorkerRegistered   EventKind = "worker.registered"
 	EventWorkerHeartbeat    EventKind = "worker.heartbeat"
 	EventWorkerDeregistered EventKind = "worker.deregistered"
+
+	// Attention events — emitted when human-input items are created/resolved.
+	EventAttentionCreated  EventKind = "attention.created"
+	EventAttentionResolved EventKind = "attention.resolved"
+
+	// Cost events — emitted by the scheduler when token usage is recorded.
+	EventCostDelta EventKind = "cost.delta"
 )
 
 // Event is a single entry in the append-only event log.

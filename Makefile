@@ -25,3 +25,7 @@ clean: ## Remove built artifacts and test cache.
 
 tidy: ## Tidy go.mod / go.sum.
 	go mod tidy
+
+.PHONY: golden-update
+golden-update: ## Regenerate TUI golden output files.
+	UPDATE_GOLDEN=1 go test ./tui/... -run TestGolden -count=1
