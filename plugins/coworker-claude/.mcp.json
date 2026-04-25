@@ -1,4 +1,5 @@
 {
+  "_comment": "coworker runs as an stdio MCP subprocess per Claude Code session. Each session gets its own instance sharing the same SQLite DB via WAL mode.",
   "mcpServers": {
     "coworker": {
       "command": "coworker",

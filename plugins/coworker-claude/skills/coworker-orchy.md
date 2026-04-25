@@ -22,8 +22,8 @@ Call `mcp__coworker__orch_register` with:
 
 Save the returned `handle`. You will need it for every subsequent call.
 
-Start a background heartbeat: every 15 seconds call
-`mcp__coworker__orch_heartbeat` with `{"handle": "<your handle>"}`. Missing
+On each turn, call `mcp__coworker__orch_heartbeat` with `{"handle": "<your handle>"}` before
+polling for dispatches. Do not attempt periodic timers between turns. Missing
 three consecutive heartbeats causes the daemon to evict this session and requeue
 any in-flight dispatch.
 

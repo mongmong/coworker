@@ -39,7 +39,7 @@ a retry.
    location.
 
 2. **Every finding must have a severity.** Use one of:
-   `critical | high | medium | low | info`.
+   `critical | important | minor | nit`.
 
 3. **No duplicate findings across reviewer instances.** The daemon deduplicates
    by fingerprint. If you are unsure whether a finding has been reported, report
@@ -65,7 +65,7 @@ include:
     {
       "path": "path/to/file.go",
       "line": 42,
-      "severity": "high",
+      "severity": "important",
       "body": "Explanation of the finding."
     }
   ]
