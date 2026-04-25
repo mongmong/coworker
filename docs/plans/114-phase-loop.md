@@ -212,6 +212,28 @@ The `Orchestrator` interface is defined in `coding/phaseloop/executor.go` (not i
 **[OK] `maxFixCycles` policy default**
 Zero or negative `MaxFixCyclesPerPhase` falls back to `DefaultMaxFixCycles = 5`. Nil policy also falls back. This matches the spec note "default 5".
 
+### Review 2
+
+**C1 [FIXED] Data race in `stubOrchestrator`**
+`coding/phaseloop/executor_test.go`: `stubOrchestrator` mutated `callCount` and `roleCounts` without synchronization while being called from concurrent goroutines in `fanOut`. Added `sync.Mutex` field; `Orchestrate` now locks before mutating and releases before invoking `fn` (to avoid holding the lock during potentially slow callbacks). Verified with `go test -race ./coding/phaseloop/... -count=1`.
+
+**S1 [FIXED] Closure-level `reviewerCallCount` in `TestPhaseExecutor_FixCycleThenClean`**
+The `int` variable captured by the stub closure was read/written from concurrent goroutines. Replaced with `atomic.Int32` (using `atomic.AddInt32` / `sync/atomic`) so the increment-and-read is race-free.
+
+**I1 [FIXED] `phase-clean` checkpoint doesn't create an attention item**
+`coding/phaseloop/executor.go`: After emitting the `phase.clean` event, the code now creates a `core.AttentionItem` (kind=`checkpoint`, source=`phase-loop`) via `AttentionStore.InsertAttention` when `e.AttentionStore` is non-nil. Added `AttentionStore *store.AttentionStore` field to `PhaseExecutor`; nil means no item (true blocking deferred to Plan 103). Insert errors are logged but do not fail the phase.
+
+**I2 [FIXED] `SourceJobIDs` aliasing in `DedupeFindings`**
+`coding/phaseloop/fanin.go`: The first-occurrence finding's `SourceJobIDs` and the group's `sourceJobs` shared the same backing array. Subsequent `append` in the duplicate path could silently overwrite the canonical finding's slice. Fixed by copying both at first-occurrence time and again after each duplicate accumulation.
+
+**I3 [WONTFIX] `capturingOrchestratorForFeedback` not mutex-protected**
+This stub is only used in `TestPhaseExecutor_FeedbackPassedToDevOnFixCycle`, which dispatches reviewers concurrently. However, the struct only captures inputs for the `developer` role, which is dispatched sequentially (never in the fan-out group). No concurrent writes occur, so no mutex is needed. Confirmed by reading the fan-out code: `developer` is dispatched before `g.Go` calls begin.
+
+**I4 [WONTFIX] `TestPhaseExecutor_ExhaustFixCycles` doesn't verify attention item**
+The test has no `AttentionStore` wired, so the attention path is not exercised. Adding a full `AttentionStore`-wired test for the exhaustion path is deferred; the existing test verifies the returned `PhaseResult` (Clean=false, FixCycles=max, Findings non-empty), which is the primary contract.
+
+**S2–S5 [WONTFIX]** Minor style notes (log field ordering, comment phrasing, redundant blank lines, consistent use of `t.Fatalf` vs `t.Errorf`). Not worth the churn; existing style is consistent within the file.
+
 ---
 
 ## Post-Execution Report
@@ -238,7 +260,9 @@ Plan 114 implemented in 5 phases over one session on branch `feature/plan-114-ph
 
 ### Test results
 
-All 21 packages pass. Zero lint issues (golangci-lint).
+All 21 packages pass with `-race`. Zero lint issues (golangci-lint).
+
+**Review 2 fixes applied (post-initial-ship):** critical data race in `stubOrchestrator` fixed via `sync.Mutex`; `reviewerCallCount` closure variable made race-free via `atomic.AddInt32`; `phase-clean` checkpoint now creates an `AttentionItem` when `AttentionStore` is wired; `SourceJobIDs` aliasing in `DedupeFindings` eliminated by defensive copying.
 
 ### Design decisions
 

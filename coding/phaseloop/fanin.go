@@ -78,7 +78,10 @@ func DedupeFindings(findings []core.Finding) []core.Finding {
 			// Duplicate — accumulate source job ID.
 			if f.JobID != "" {
 				g.sourceJobs = append(g.sourceJobs, f.JobID)
-				out[g.idx].SourceJobIDs = g.sourceJobs
+				// Copy to avoid sharing the backing array with g.sourceJobs.
+				jobsCopy := make([]string, len(g.sourceJobs))
+				copy(jobsCopy, g.sourceJobs)
+				out[g.idx].SourceJobIDs = jobsCopy
 			}
 			continue
 		}
@@ -89,7 +92,11 @@ func DedupeFindings(findings []core.Finding) []core.Finding {
 		if f.JobID != "" {
 			sourceJobs = append(sourceJobs, f.JobID)
 		}
-		f.SourceJobIDs = sourceJobs
+		// Copy before storing so the out slice element and the group's
+		// sourceJobs do not share the same backing array.
+		jobsCopy := make([]string, len(sourceJobs))
+		copy(jobsCopy, sourceJobs)
+		f.SourceJobIDs = jobsCopy
 		out = append(out, f)
 		seen[f.Fingerprint] = &group{idx: idx, sourceJobs: sourceJobs}
 	}

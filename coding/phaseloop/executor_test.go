@@ -3,6 +3,8 @@ package phaseloop
 import (
 	"context"
 	"fmt"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/chris/coworker/coding"
@@ -13,6 +15,8 @@ import (
 // stubOrchestrator is a test double for Orchestrator that allows configuring
 // per-role responses via a function.
 type stubOrchestrator struct {
+	mu sync.Mutex
+
 	// fn is called for each Orchestrate invocation. If nil, returns an empty
 	// DispatchResult with ExitCode 0.
 	fn func(role string, attempt int) (*coding.DispatchResult, error)
@@ -32,12 +36,15 @@ func newStubOrchestrator(fn func(role string, attempt int) (*coding.DispatchResu
 }
 
 func (s *stubOrchestrator) Orchestrate(_ context.Context, input *coding.DispatchInput) (*coding.DispatchResult, error) {
+	s.mu.Lock()
 	s.callCount++
 	s.roleCounts[input.RoleName]++
 	attempt := s.roleCounts[input.RoleName]
+	fn := s.fn
+	s.mu.Unlock()
 
-	if s.fn != nil {
-		return s.fn(input.RoleName, attempt)
+	if fn != nil {
+		return fn(input.RoleName, attempt)
 	}
 	return &coding.DispatchResult{ExitCode: 0}, nil
 }
@@ -98,12 +105,12 @@ func TestPhaseExecutor_CleanOnFirstPass(t *testing.T) {
 func TestPhaseExecutor_FixCycleThenClean(t *testing.T) {
 	// First developer pass → reviewer.arch emits a finding.
 	// Second developer pass (fix cycle 1) → no findings → clean.
-	reviewerCallCount := 0
+	var reviewerCallCount int32
 
 	orch := newStubOrchestrator(func(role string, attempt int) (*coding.DispatchResult, error) {
 		if role == "reviewer.arch" {
-			reviewerCallCount++
-			if reviewerCallCount == 1 {
+			n := atomic.AddInt32(&reviewerCallCount, 1)
+			if n == 1 {
 				// First reviewer pass: return one finding.
 				return &coding.DispatchResult{
 					ExitCode: 0,

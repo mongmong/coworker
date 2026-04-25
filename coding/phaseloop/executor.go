@@ -38,6 +38,12 @@ type PhaseExecutor struct {
 	// EventStore writes phase lifecycle events.
 	EventStore *store.EventStore
 
+	// AttentionStore, when non-nil, is used to create attention items when
+	// the fix-loop exhausts its budget without converging. The TUI/CLI can
+	// then surface these items to the operator. Nil means no attention item
+	// is created (true blocking is deferred to Plan 103).
+	AttentionStore *store.AttentionStore
+
 	// Policy controls fix-cycle limits and checkpoint behavior.
 	// May be nil; defaults are used when nil.
 	Policy *core.Policy
@@ -201,6 +207,25 @@ func (e *PhaseExecutor) runLoop(
 				"tests_passed": agg.TestsPassed,
 				"checkpoint":   "phase-clean",
 			})
+			// Create an attention item so the TUI/CLI can surface this
+			// checkpoint to the operator. True blocking (waiting for an
+			// answer) is deferred to Plan 103; here we only record the item.
+			if e.AttentionStore != nil {
+				item := &core.AttentionItem{
+					ID:       core.NewID(),
+					RunID:    runID,
+					Kind:     core.AttentionCheckpoint,
+					Source:   "phase-loop",
+					Question: fmt.Sprintf("Phase %d (%s) did not converge after %d fix cycles. %d findings remain.", phaseIndex, phaseName, maxCycles, len(deduped)),
+				}
+				if insertErr := e.AttentionStore.InsertAttention(ctx, item); insertErr != nil {
+					e.logger().Error("failed to insert phase-clean attention item",
+						"phase_index", phaseIndex,
+						"phase_name", phaseName,
+						"error", insertErr,
+					)
+				}
+			}
 			return &PhaseResult{
 				Findings:    deduped,
 				Artifacts:   agg.Artifacts,
