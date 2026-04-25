@@ -316,7 +316,14 @@ func applyEvent(m Model, ev *core.Event) Model {
 	case core.EventRunCreated:
 		m.runs = appendOrUpdateRun(m.runs, ev)
 	case core.EventRunCompleted:
-		m.runs = updateRunState(m.runs, ev.RunID, core.RunStateCompleted)
+		var p struct {
+			State core.RunState `json:"state"`
+		}
+		state := core.RunStateCompleted
+		if json.Unmarshal([]byte(ev.Payload), &p) == nil && p.State != "" {
+			state = p.State
+		}
+		m.runs = updateRunState(m.runs, ev.RunID, state)
 	case core.EventJobCreated:
 		m.jobs = appendOrUpdateJob(m.jobs, ev)
 	case core.EventJobLeased:

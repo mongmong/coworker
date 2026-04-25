@@ -1894,7 +1894,49 @@ golden-update:
 
 ## Post-Execution Report
 
-_To be filled in after implementation._
+**Date:** 2026-04-20
+**Author:** Claude (claude-sonnet-4-6)
+**Branch:** `feature/plan-107-tui-dashboard`
+
+### What Was Built
+
+Seven new `tui/` source files plus `cli/dashboard.go` implementing the live Bubble Tea dashboard described in the plan:
+
+| File | Purpose |
+|------|---------|
+| `tui/model.go` | Root `Model` struct; `Init`, `Update`, `View`; `applyEvent`, helpers |
+| `tui/events.go` | SSE `tea.Cmd`; `fetchSnapshot`; `submitAnswer`; `loadJobLog` |
+| `tui/views.go` | Per-pane Lipgloss renderers (runs, jobs, events, attention) |
+| `tui/job_detail.go` | Full-screen job log view |
+| `tui/keybindings.go` | `handleKey`, `scrollUp`/`scrollDown`, input-mode handler |
+| `tui/styles.go` | Lipgloss colour palette and style variables |
+| `tui/model_test.go` | 35 unit + fragment golden tests |
+| `cli/dashboard.go` | `coworker dashboard` cobra command |
+
+**Dependencies added:** `charmbracelet/bubbletea` v1.3.10, `charmbracelet/lipgloss` v1.1.0, `charmbracelet/bubbles` v1.0.0.
+
+### Deviations from Plan
+
+1. **`submitAnswer` uses HTTP POST, not direct DB.** The plan's Task 3 specification said attention answers should call `AttentionStore.AnswerAttention()` directly. In the implemented code, `submitAnswer` posts to `/attention/:id/answer` via HTTP — the same REST endpoint the MCP `orch.attention.answer` tool uses. This avoids the TUI needing a DB path at startup, which would require new CLI flags and a store initialisation path. The plan's architecture overview (§Architecture Overview) already describes this HTTP-POST contract; the Task 3 prose was the outlier.
+
+2. **Hand-rolled scroll instead of `bubbles/viewport`.** The plan suggested using `charmbracelet/bubbles` list/viewport widgets. The implementation uses hand-rolled cursor tracking in the Model and index-based slicing in view functions. This is simpler for the current four-pane layout (each pane is a plain list with a cursor integer) and avoids the boilerplate of initialising, sizing, and wiring four separate `list.Model` or `viewport.Model` values.
+
+3. **`charmbracelet/x/teatest` not available via module proxy.** The plan called for `go get github.com/charmbracelet/x/teatest`. The module proxy returned a 404 for that path. The golden-output tests in `model_test.go` instead use `View()` directly with a fixed-size model and `bytes.Contains` fragment assertions, plus `goldenAssert` writing to `testdata/tui/`. All three golden fragment files are committed.
+
+### Known Limitations
+
+- **Cost display is inactive** until the daemon emits `cost.delta` events (scheduled for a later plan). The `costByRun` map starts empty; the cost row is hidden until the first event arrives.
+- **Job detail requires `.coworker/runs/<run>/<job>.jsonl` on disk.** If the files don't exist (e.g., against a remote-only daemon), the pane shows "(no log lines yet)" gracefully.
+- **`connectedMsg` is still wired in `Update`** but is no longer returned by `subscribeSSE` after the Review 2 fix (Finding 3). It can be removed in a follow-up cleanup; leaving it harmless for now to avoid a wider diff.
+
+### Verification
+
+```
+go build ./...          → success (0 errors)
+go test ./tui/...       → PASS (35/35 tests)
+go test ./... -count=1  → PASS (17 packages)
+golangci-lint run ./tui/... ./cli/dashboard.go  → 0 findings
+```
 
 ---
 
@@ -1928,3 +1970,41 @@ _To be filled in after implementation._
 8. **Bubbles widgets** — Use `charmbracelet/bubbles` list/viewport components for scrollable panes instead of hand-rolled scroll logic. [NOTED] — Added to Task 1 notes; implementer should use bubbles list for runs/jobs panes and bubbles viewport for job detail log view.
 
 9. **Help overlay** — `?` keybinding toggles a help overlay with context-sensitive key hints. [ALREADY PRESENT] — `?` key and `showHelp` field were in the original design; `renderHelp()` and `m.showHelp` toggle are implemented in Steps 1.3–1.4.
+
+---
+
+### Review 2 — Post-Implementation
+- **Date**: 2026-04-20
+- **Reviewer**: Claude (claude-sonnet-4-6)
+- **Verdict**: Three important findings fixed; four noted for future plans
+
+#### Important (Fixed)
+
+1. **`EventRunCompleted` always sets `RunStateCompleted`** (`tui/model.go`, `applyEvent` switch).
+   The original code hard-coded `core.RunStateCompleted` regardless of what the event payload contained. If the daemon emits `state: "failed"` or `state: "aborted"` via the same `run.completed` event kind, the TUI would incorrectly show the run as completed.
+   → **Response:** [FIXED] — The case now unmarshals `ev.Payload` into a `struct{ State core.RunState }`, uses the payload state when non-empty, and falls back to `RunStateCompleted` if the field is absent or the payload is malformed.
+
+2. **30-second context timeout kills long SSE streams** (`tui/events.go`, `subscribeSSE`).
+   `context.WithTimeout(context.Background(), 30*time.Second)` was attached to the HTTP request for the SSE endpoint. A quiet run with no events for 30 seconds would cause the context to expire, killing the connection and triggering a spurious backoff reconnect. This defeats the purpose of a live event stream.
+   → **Response:** [FIXED] — The timeout context is replaced with `context.Background()` directly. Cleanup is handled by the Bubble Tea lifecycle (`tea.Quit` terminates the goroutine via the program's shutdown path).
+
+3. **`time.Sleep(2*time.Second)` inside a `tea.Cmd` goroutine** (`tui/events.go`, `subscribeSSE`).
+   When the SSE scanner loop ends cleanly (server closes the stream), the original code called `time.Sleep(2*time.Second)` then returned `connectedMsg{}`. Sleeping inside a Bubble Tea Cmd goroutine blocks the runtime thread for the full duration and bypasses the model's backoff logic. The `connectedMsg` path also resets the retry delay to zero, defeating exponential backoff on repeated server-side disconnections.
+   → **Response:** [FIXED] — The sleep and `connectedMsg{}` return are replaced with `return errMsg{fmt.Errorf("SSE stream closed by server")}`. This routes through the existing `sseBackoffCmd` in `Update`, giving correct exponential backoff on repeated closures.
+
+#### Suggestions (Future Plans)
+
+4. **`connectedMsg` is now a dead code path.** After Fix 3, `subscribeSSE` never returns `connectedMsg`. The `connectedMsg` type definition and its `case connectedMsg:` handler in `Update` are unused. They should be removed in a follow-up cleanup commit.
+   → **Response:** [OPEN] — Left in place to keep this diff minimal. Will be cleaned up in Plan 108 or a dedicated cleanup pass.
+
+5. **`submitAnswer` should use `http.NewRequestWithContext`** (`tui/events.go`, line 116).
+   The POST to `/attention/:id/answer` uses `http.NewRequest` with a `//nolint:noctx` comment rather than passing a context. If the user presses `q` while a POST is in-flight, the request will outlive the program. A `context` from a program-level cancel would fix this.
+   → **Response:** [OPEN] — A program-level context requires plumbing `tea.Program`'s context into the TUI, which is a broader architectural change. Deferred to when the daemon HTTP client layer is factored out.
+
+6. **`applyJobLog` uses a fixed `m.height - 4` scroll calculation** (`tui/model.go`, line 254).
+   The magic constant 4 (header lines) is not named and may drift if the job detail header changes. Extracting it as a named constant (`jobDetailHeaderLines = 4`) would make the relationship explicit.
+   → **Response:** [OPEN] — Minor. Will address in the next iteration of `tui/job_detail.go`.
+
+7. **`bubbles/viewport` should replace hand-rolled scroll in job detail** (`tui/job_detail.go`).
+   The job detail view calculates scroll offsets manually. `charmbracelet/bubbles/viewport` provides this with mouse-wheel support and correct boundary clamping for free.
+   → **Response:** [OPEN] — Noted in the Post-Execution Report as a known deviation. Will migrate in a future TUI polish plan.

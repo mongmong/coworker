@@ -49,10 +49,9 @@ type jobLogMsg struct {
 func subscribeSSE(baseURL, runID string) tea.Cmd {
 	return func() tea.Msg {
 		eventsURL := buildTUIEventsURL(baseURL, runID)
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, eventsURL, nil)
+		// Use a background context with no timeout — SSE streams are intentionally
+		// long-lived; the Bubble Tea lifecycle (tea.Quit) handles teardown.
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, eventsURL, nil)
 		if err != nil {
 			return errMsg{fmt.Errorf("build SSE request: %w", err)}
 		}
@@ -88,9 +87,9 @@ func subscribeSSE(baseURL, runID string) tea.Cmd {
 		if err := scanner.Err(); err != nil {
 			return errMsg{fmt.Errorf("SSE read: %w", err)}
 		}
-		// Stream closed; signal reconnect after brief pause.
-		time.Sleep(2 * time.Second)
-		return connectedMsg{}
+		// Stream closed cleanly by the server; let the existing backoff
+		// retry machinery handle reconnection (no sleep inside a Cmd goroutine).
+		return errMsg{fmt.Errorf("SSE stream closed by server")}
 	}
 }
 
