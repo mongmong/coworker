@@ -27,10 +27,14 @@ Copies the plugin files from the coworker installation into the project's CLI
 plugin directory and merges the MCP server configuration into .mcp.json.
 
 Supported CLIs:
-  claude   — installs into .claude/plugins/coworker/
+  claude    — installs into .claude/plugins/coworker/
+  codex     — installs into ~/.codex/coworker/
+  opencode  — installs into .opencode/coworker/
 
 Example:
-  coworker plugin install --cli claude`,
+  coworker plugin install --cli claude
+  coworker plugin install --cli codex
+  coworker plugin install --cli opencode`,
 	RunE: func(cmd *cobra.Command, _ []string) error {
 		return runPluginInstall(cmd)
 	},
@@ -46,8 +50,12 @@ func runPluginInstall(cmd *cobra.Command) error {
 	switch pluginCLI {
 	case "claude":
 		return installClaudePlugin(cmd)
+	case "codex":
+		return installCodexPlugin(cmd)
+	case "opencode":
+		return installOpenCodePlugin(cmd)
 	default:
-		return fmt.Errorf("unsupported CLI %q: only 'claude' is supported in this release", pluginCLI)
+		return fmt.Errorf("unsupported CLI %q: supported values are claude, codex, opencode", pluginCLI)
 	}
 }
 
@@ -87,6 +95,81 @@ func installClaudePlugin(cmd *cobra.Command) error {
 	fmt.Fprintf(cmd.OutOrStdout(), "  plugin dir:  %s\n", destDir)
 	fmt.Fprintf(cmd.OutOrStdout(), "  mcp config:  %s\n", mcpConfigPath)
 	fmt.Fprintf(cmd.OutOrStdout(), "\nStart Claude Code in this project to activate the coworker-orchy skill.\n")
+	return nil
+}
+
+// installCodexPlugin copies plugins/coworker-codex/ into ~/.codex/coworker/.
+// Codex uses config.toml for MCP registration; no .mcp.json merge is performed.
+// Users should run `codex mcp add coworker -- coworker daemon` separately, or
+// copy the settings.toml snippet from the plugin directory manually.
+func installCodexPlugin(cmd *cobra.Command) error {
+	srcDir, err := findPluginSource("coworker-codex")
+	if err != nil {
+		return fmt.Errorf("locate plugin source: %w", err)
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("resolve home directory: %w", err)
+	}
+	destDir := filepath.Join(home, ".codex", "coworker")
+
+	if err := os.MkdirAll(destDir, 0o755); err != nil {
+		return fmt.Errorf("create destination directory %q: %w", destDir, err)
+	}
+
+	if err := copyDir(srcDir, destDir); err != nil {
+		return fmt.Errorf("copy plugin files: %w", err)
+	}
+
+	tomlSnippet := filepath.Join(home, ".codex", "config.toml")
+
+	fmt.Fprintf(cmd.OutOrStdout(), "coworker-codex plugin installed\n")
+	fmt.Fprintf(cmd.OutOrStdout(), "  plugin dir:  %s\n", destDir)
+	fmt.Fprintf(cmd.OutOrStdout(), "\nNext step: register the MCP server with Codex:\n")
+	fmt.Fprintf(cmd.OutOrStdout(), "  codex mcp add coworker -- coworker daemon\n")
+	fmt.Fprintf(cmd.OutOrStdout(), "\nOr add the snippet from %s to %s manually.\n",
+		filepath.Join(destDir, "settings.toml"), tomlSnippet)
+	fmt.Fprintf(cmd.OutOrStdout(), "\nIMPORTANT: Codex requires --sandbox danger-full-access for MCP tool calls\n")
+	fmt.Fprintf(cmd.OutOrStdout(), "in codex exec mode. See %s for details.\n",
+		filepath.Join(destDir, "setup.md"))
+	return nil
+}
+
+// installOpenCodePlugin copies plugins/coworker-opencode/ into .opencode/coworker/
+// in the current working directory and merges the MCP server entry into .mcp.json.
+func installOpenCodePlugin(cmd *cobra.Command) error {
+	srcDir, err := findPluginSource("coworker-opencode")
+	if err != nil {
+		return fmt.Errorf("locate plugin source: %w", err)
+	}
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("get working directory: %w", err)
+	}
+	destDir := filepath.Join(cwd, ".opencode", "coworker")
+
+	if err := os.MkdirAll(destDir, 0o755); err != nil {
+		return fmt.Errorf("create destination directory %q: %w", destDir, err)
+	}
+
+	if err := copyDir(srcDir, destDir); err != nil {
+		return fmt.Errorf("copy plugin files: %w", err)
+	}
+
+	// Merge MCP server config into .mcp.json at the project root.
+	mcpConfigPath := filepath.Join(cwd, ".mcp.json")
+	if err := mergeMCPConfig(mcpConfigPath, srcDir); err != nil {
+		return fmt.Errorf("merge .mcp.json: %w", err)
+	}
+
+	fmt.Fprintf(cmd.OutOrStdout(), "coworker-opencode plugin installed\n")
+	fmt.Fprintf(cmd.OutOrStdout(), "  plugin dir:  %s\n", destDir)
+	fmt.Fprintf(cmd.OutOrStdout(), "  mcp config:  %s\n", mcpConfigPath)
+	fmt.Fprintf(cmd.OutOrStdout(), "\nStart OpenCode with `opencode serve` to activate HTTP dispatch.\n")
+	fmt.Fprintf(cmd.OutOrStdout(), "For interactive MCP mode, start `opencode` — the coworker-orchy skill\n")
+	fmt.Fprintf(cmd.OutOrStdout(), "will be available once the MCP server is loaded.\n")
 	return nil
 }
 

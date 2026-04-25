@@ -266,15 +266,18 @@ Level 1 and Level 2 customization ship in V1 (see spec §Workflow customization)
   5. End-to-end `build-from-prd` smoke test (manifest → schedule → phase → ship).
   6. Tests.
 
-#### 109 — Codex plugin (worker-only)
+#### 109 — Codex plugin (interactive + worker)
 - **Flavor:** Plugin
 - **Blocks on:** 104, 105
 - **Parallel-safe with:** 106, 107, 108, 110
-- **Purpose:** Codex as reviewer.arch, supervisor-quality backend, ephemeral exec target.
+- **Purpose:** Codex as first-class interactive driver or worker — same capabilities as Claude Code and OpenCode plugins. All three CLIs are equal citizens.
 - **Phases:**
-  1. Codex config (`~/.codex/coworker/`): worker prompts, sandbox defaults.
-  2. Orchy-skill equivalent for Codex's execution model.
-  3. Live smoke tests.
+  1. Plugin skeleton (`plugins/coworker-codex/`): MCP config, settings.
+  2. Orchy skill adapted to Codex (bare tool names, no namespace prefix, `--sandbox danger-full-access` documented).
+  3. Role-worker skills (developer, reviewer).
+  4. Slash commands (status, approve, invoke).
+  5. `coworker plugin install codex` command.
+  6. Live smoke tests.
 
 #### 110 — OpenCode plugin (interactive + worker)
 - **Flavor:** Plugin

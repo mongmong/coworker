@@ -1,0 +1,15 @@
+# coworker MCP server configuration for Codex.
+#
+# Add this snippet to ~/.codex/config.toml, or run:
+#
+#   codex mcp add coworker -- coworker daemon
+#
+# to have the CLI add it automatically.
+#
+# IMPORTANT: Codex uses BARE MCP tool names (e.g. orch_register, not
+# mcp__coworker__orch_register). All skill instructions use bare names.
+
+[mcp_servers.coworker]
+command = "coworker"
+args    = ["daemon"]
+type    = "stdio"

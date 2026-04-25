@@ -4,7 +4,10 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/spf13/cobra"
 )
 
 // ---------- mergeMCPConfig ----------
@@ -258,6 +261,142 @@ func TestFindPluginSource_NotFound(t *testing.T) {
 	_, err = findPluginSource("nonexistent-plugin")
 	if err == nil {
 		t.Fatal("expected error for missing plugin directory, got nil")
+	}
+}
+
+// ---------- runPluginInstall dispatch ----------
+
+// TestRunPluginInstall_UnsupportedCLI verifies that an unknown --cli value
+// returns a descriptive error without panicking.
+func TestRunPluginInstall_UnsupportedCLI(t *testing.T) {
+	t.Parallel()
+
+	origCLI := pluginCLI
+	t.Cleanup(func() { pluginCLI = origCLI })
+	pluginCLI = "unknown-cli"
+
+	err := runPluginInstall(pluginInstallCmd)
+	if err == nil {
+		t.Fatal("expected error for unsupported CLI, got nil")
+	}
+}
+
+// TestInstallCodexPlugin_CopiesFilesAndPrintsInstructions verifies that
+// installCodexPlugin copies plugin files to ~/.codex/coworker/ and prints
+// the MCP registration instructions. The test redirects HOME so it does not
+// touch the real ~/.codex directory.
+func TestInstallCodexPlugin_CopiesFilesAndPrintsInstructions(t *testing.T) {
+	fakeHome := t.TempDir()
+
+	// Build a minimal coworker-codex plugin source in a temp plugins dir.
+	tmpRoot := t.TempDir()
+	srcDir := filepath.Join(tmpRoot, "plugins", "coworker-codex")
+	if err := os.MkdirAll(filepath.Join(srcDir, "skills"), 0o755); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	writeFileMode(t, filepath.Join(srcDir, "setup.md"), "# setup", 0o644)
+	writeFileMode(t, filepath.Join(srcDir, "skills", "coworker-orchy.md"), "# orchy", 0o644)
+
+	orig, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	if err := os.Chdir(tmpRoot); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(orig) })
+
+	// Redirect HOME so UserHomeDir returns our temp directory.
+	t.Setenv("HOME", fakeHome)
+
+	var buf strings.Builder
+	cmd := &cobra.Command{}
+	cmd.SetOut(&buf)
+
+	if err := installCodexPlugin(cmd); err != nil {
+		t.Fatalf("installCodexPlugin: %v", err)
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, "coworker-codex plugin installed") {
+		t.Errorf("expected install confirmation in output; got: %q", out)
+	}
+	if !strings.Contains(out, "danger-full-access") {
+		t.Errorf("expected sandbox warning in output; got: %q", out)
+	}
+
+	destSetup := filepath.Join(fakeHome, ".codex", "coworker", "setup.md")
+	assertFileContent(t, destSetup, "# setup")
+
+	destSkill := filepath.Join(fakeHome, ".codex", "coworker", "skills", "coworker-orchy.md")
+	assertFileContent(t, destSkill, "# orchy")
+}
+
+// TestInstallOpenCodePlugin_CopiesFilesAndMergesMCP verifies that
+// installOpenCodePlugin copies plugin files to .opencode/coworker/ in the
+// project root and merges .mcp.json.
+func TestInstallOpenCodePlugin_CopiesFilesAndMergesMCP(t *testing.T) {
+	// Build a minimal coworker-opencode plugin source.
+	tmpRoot := t.TempDir()
+	srcDir := filepath.Join(tmpRoot, "plugins", "coworker-opencode")
+	if err := os.MkdirAll(filepath.Join(srcDir, "skills"), 0o755); err != nil {
+		t.Fatalf("setup srcDir: %v", err)
+	}
+	writeFileMode(t, filepath.Join(srcDir, "skills", "coworker-orchy.md"), "# orchy opencode", 0o644)
+
+	// Give the plugin a .mcp.json so the merge path is exercised.
+	pluginMCP := map[string]any{
+		"mcpServers": map[string]any{
+			"coworker": map[string]any{
+				"command": "coworker",
+				"args":    []string{"daemon"},
+				"type":    "stdio",
+			},
+		},
+	}
+	writeJSON(t, filepath.Join(srcDir, ".mcp.json"), pluginMCP)
+
+	orig, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	if err := os.Chdir(tmpRoot); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(orig) })
+
+	var buf strings.Builder
+	cmd := &cobra.Command{}
+	cmd.SetOut(&buf)
+
+	if err := installOpenCodePlugin(cmd); err != nil {
+		t.Fatalf("installOpenCodePlugin: %v", err)
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, "coworker-opencode plugin installed") {
+		t.Errorf("expected install confirmation in output; got: %q", out)
+	}
+
+	destSkill := filepath.Join(tmpRoot, ".opencode", "coworker", "skills", "coworker-orchy.md")
+	assertFileContent(t, destSkill, "# orchy opencode")
+
+	// Verify .mcp.json was created and contains the coworker server entry.
+	mcpPath := filepath.Join(tmpRoot, ".mcp.json")
+	data, err := os.ReadFile(mcpPath)
+	if err != nil {
+		t.Fatalf("read .mcp.json: %v", err)
+	}
+	var merged map[string]json.RawMessage
+	if err := json.Unmarshal(data, &merged); err != nil {
+		t.Fatalf("parse .mcp.json: %v", err)
+	}
+	var servers map[string]json.RawMessage
+	if err := json.Unmarshal(merged["mcpServers"], &servers); err != nil {
+		t.Fatalf("parse mcpServers: %v", err)
+	}
+	if _, ok := servers["coworker"]; !ok {
+		t.Errorf("expected coworker entry in merged .mcp.json; got keys: %v", mapKeys(servers))
 	}
 }
 

@@ -1,0 +1,10 @@
+{
+  "_comment": "coworker runs as an stdio MCP subprocess per OpenCode session. OpenCode supports MCP servers alongside its native HTTP dispatch path. The primary coworker dispatch path for OpenCode is HTTP (opencode serve), but the MCP server is registered here as a fallback and for interactive session use.",
+  "mcpServers": {
+    "coworker": {
+      "command": "coworker",
+      "args": ["daemon"],
+      "type": "stdio"
+    }
+  }
+}
