@@ -456,7 +456,7 @@ func TestWorkerStore_RequeueLeasedDispatches(t *testing.T) {
 	}
 
 	// Claim the dispatch (sets it to leased).
-	claimed, err := ds.ClaimNextDispatch(ctx, "coder.impl")
+	claimed, err := ds.ClaimNextDispatch(ctx, "coder.impl", "")
 	if err != nil {
 		t.Fatalf("ClaimNextDispatch: %v", err)
 	}

@@ -60,13 +60,14 @@ func (s *DispatchStore) EnqueueDispatch(ctx context.Context, d *core.Dispatch) e
 	return s.event.WriteEventThenRow(ctx, event, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx,
 			`INSERT INTO dispatches
-				(id, run_id, role, job_id, prompt, inputs, state, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+				(id, run_id, role, job_id, prompt, inputs, state, worker_handle, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			d.ID, d.RunID, d.Role,
 			nullableString(d.JobID),
 			nullableString(d.Prompt),
 			string(inputsJSON),
 			string(d.State),
+			nullableString(d.WorkerHandle),
 			d.CreatedAt.UTC().Format("2006-01-02T15:04:05Z"),
 		)
 		return err
@@ -78,15 +79,23 @@ func (s *DispatchStore) EnqueueDispatch(ctx context.Context, d *core.Dispatch) e
 // event, and returns the claimed dispatch. Returns nil if no pending dispatch
 // exists.
 //
+// If handle is non-empty (a registered persistent worker), only dispatches with
+// worker_handle = handle OR worker_handle IS NULL are eligible. This lets a
+// registered worker pick up both targeted dispatches and orphaned ephemeral ones.
+//
+// If handle is "" (an ephemeral caller), only dispatches with worker_handle IS
+// NULL are eligible, preventing ephemeral processes from stealing work intended
+// for a specific registered worker.
+//
 // The SELECT, event INSERT, and UPDATE all run inside a single explicit
-// transaction (BEGIN IMMEDIATE) so two concurrent callers cannot claim the same
-// row. This respects the event-log-before-state invariant: the event is written
-// before the dispatch row is updated.
-func (s *DispatchStore) ClaimNextDispatch(ctx context.Context, role string) (*core.Dispatch, error) {
+// transaction so two concurrent callers cannot claim the same row. This
+// respects the event-log-before-state invariant: the event is written before
+// the dispatch row is updated.
+func (s *DispatchStore) ClaimNextDispatch(ctx context.Context, role, handle string) (*core.Dispatch, error) {
 	now := time.Now()
 	nowStr := now.UTC().Format("2006-01-02T15:04:05Z")
 
-	// Use BEGIN IMMEDIATE to acquire a write lock immediately, preventing
+	// Use an explicit transaction to acquire a write lock immediately, preventing
 	// concurrent SELECTs from racing ahead of each other.
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{})
 	if err != nil {
@@ -95,27 +104,50 @@ func (s *DispatchStore) ClaimNextDispatch(ctx context.Context, role string) (*co
 	defer func() { _ = tx.Rollback() }()
 
 	// SELECT the oldest pending dispatch for this role, inside the write tx.
+	// Filter by worker_handle according to whether the caller is a registered
+	// worker (handle != "") or an ephemeral process (handle == "").
 	var d core.Dispatch
 	var inputsJSON, createdAtStr string
 	var jobID, prompt, workerHandle sql.NullString
 
-	err = tx.QueryRowContext(ctx,
-		`SELECT id, run_id, role, job_id, prompt, inputs, state, worker_handle, created_at
-		FROM dispatches
-		WHERE state = 'pending' AND role = ?
-		ORDER BY created_at ASC
-		LIMIT 1`,
-		role,
-	).Scan(
-		&d.ID, &d.RunID, &d.Role, &jobID, &prompt,
-		&inputsJSON, &d.State, &workerHandle,
-		&createdAtStr,
-	)
-	if err == sql.ErrNoRows {
+	var scanErr error
+	if handle != "" {
+		// Registered worker: eligible for dispatches targeted to it OR NULL-handle ones.
+		scanErr = tx.QueryRowContext(ctx,
+			`SELECT id, run_id, role, job_id, prompt, inputs, state, worker_handle, created_at
+			FROM dispatches
+			WHERE state = 'pending' AND role = ?
+			  AND (worker_handle = ? OR worker_handle IS NULL)
+			ORDER BY created_at ASC
+			LIMIT 1`,
+			role, handle,
+		).Scan(
+			&d.ID, &d.RunID, &d.Role, &jobID, &prompt,
+			&inputsJSON, &d.State, &workerHandle,
+			&createdAtStr,
+		)
+	} else {
+		// Ephemeral caller: only eligible for NULL-handle dispatches.
+		scanErr = tx.QueryRowContext(ctx,
+			`SELECT id, run_id, role, job_id, prompt, inputs, state, worker_handle, created_at
+			FROM dispatches
+			WHERE state = 'pending' AND role = ?
+			  AND worker_handle IS NULL
+			ORDER BY created_at ASC
+			LIMIT 1`,
+			role,
+		).Scan(
+			&d.ID, &d.RunID, &d.Role, &jobID, &prompt,
+			&inputsJSON, &d.State, &workerHandle,
+			&createdAtStr,
+		)
+	}
+
+	if scanErr == sql.ErrNoRows {
 		return nil, nil
 	}
-	if err != nil {
-		return nil, fmt.Errorf("find pending dispatch: %w", err)
+	if scanErr != nil {
+		return nil, fmt.Errorf("find pending dispatch: %w", scanErr)
 	}
 
 	if jobID.Valid {

@@ -364,7 +364,7 @@ func TestHandleNextDispatch_IdleWhenEmpty(t *testing.T) {
 	db := openTestDB(t)
 	ds := newDispatchStore(t, db)
 
-	out, err := mcpserver.CallNextDispatch(context.Background(), ds, "reviewer.arch")
+	out, err := mcpserver.CallNextDispatch(context.Background(), ds, "reviewer.arch", "")
 	if err != nil {
 		t.Fatalf("CallNextDispatch: %v", err)
 	}
@@ -390,7 +390,7 @@ func TestHandleNextDispatch_ReturnDispatchWhenEnqueued(t *testing.T) {
 		t.Fatalf("EnqueueDispatch: %v", err)
 	}
 
-	out, err := mcpserver.CallNextDispatch(context.Background(), ds, "reviewer.arch")
+	out, err := mcpserver.CallNextDispatch(context.Background(), ds, "reviewer.arch", "")
 	if err != nil {
 		t.Fatalf("CallNextDispatch: %v", err)
 	}
@@ -413,7 +413,7 @@ func TestHandleNextDispatch_ErrorOnEmptyRole(t *testing.T) {
 	db := openTestDB(t)
 	ds := newDispatchStore(t, db)
 
-	_, err := mcpserver.CallNextDispatch(context.Background(), ds, "")
+	_, err := mcpserver.CallNextDispatch(context.Background(), ds, "", "")
 	if err == nil {
 		t.Fatal("expected error for empty role, got nil")
 	}
@@ -435,7 +435,7 @@ func TestHandleNextDispatch_IdleAfterClaim(t *testing.T) {
 	}
 
 	// First claim — should get the dispatch.
-	out1, err := mcpserver.CallNextDispatch(context.Background(), ds, "coder.impl")
+	out1, err := mcpserver.CallNextDispatch(context.Background(), ds, "coder.impl", "")
 	if err != nil {
 		t.Fatalf("CallNextDispatch 1: %v", err)
 	}
@@ -444,7 +444,7 @@ func TestHandleNextDispatch_IdleAfterClaim(t *testing.T) {
 	}
 
 	// Second claim — queue now empty (dispatch is leased).
-	out2, err := mcpserver.CallNextDispatch(context.Background(), ds, "coder.impl")
+	out2, err := mcpserver.CallNextDispatch(context.Background(), ds, "coder.impl", "")
 	if err != nil {
 		t.Fatalf("CallNextDispatch 2: %v", err)
 	}
@@ -471,7 +471,7 @@ func TestHandleJobComplete_HappyPath(t *testing.T) {
 	}
 
 	// Claim it so it's in leased state.
-	claimed, err := ds.ClaimNextDispatch(context.Background(), "reviewer.arch")
+	claimed, err := ds.ClaimNextDispatch(context.Background(), "reviewer.arch", "")
 	if err != nil {
 		t.Fatalf("ClaimNextDispatch: %v", err)
 	}
@@ -554,7 +554,7 @@ func TestHandleDispatch_FullCycle(t *testing.T) {
 	}
 
 	// Step 2: claim via orch_next_dispatch.
-	ndOut, err := mcpserver.CallNextDispatch(context.Background(), ds, "coder.impl")
+	ndOut, err := mcpserver.CallNextDispatch(context.Background(), ds, "coder.impl", "")
 	if err != nil {
 		t.Fatalf("CallNextDispatch: %v", err)
 	}
@@ -567,7 +567,7 @@ func TestHandleDispatch_FullCycle(t *testing.T) {
 	}
 
 	// Step 3: after claiming, queue should be idle.
-	ndOut2, err := mcpserver.CallNextDispatch(context.Background(), ds, "coder.impl")
+	ndOut2, err := mcpserver.CallNextDispatch(context.Background(), ds, "coder.impl", "")
 	if err != nil {
 		t.Fatalf("CallNextDispatch (idle check): %v", err)
 	}

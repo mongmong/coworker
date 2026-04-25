@@ -66,7 +66,7 @@ func TestWatchdog_DefaultConfig(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // cancel immediately
+	cancel()    // cancel immediately
 	wd.Run(ctx) // must return promptly
 }
 

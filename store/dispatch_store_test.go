@@ -68,7 +68,7 @@ func TestClaimNextDispatch_HappyPath(t *testing.T) {
 		t.Fatalf("EnqueueDispatch: %v", err)
 	}
 
-	claimed, err := ds.ClaimNextDispatch(ctx, "reviewer.arch")
+	claimed, err := ds.ClaimNextDispatch(ctx, "reviewer.arch", "")
 	if err != nil {
 		t.Fatalf("ClaimNextDispatch: %v", err)
 	}
@@ -108,7 +108,7 @@ func TestClaimNextDispatch_IdleWhenEmpty(t *testing.T) {
 	ds := NewDispatchStore(db, es)
 	ctx := context.Background()
 
-	claimed, err := ds.ClaimNextDispatch(ctx, "reviewer.arch")
+	claimed, err := ds.ClaimNextDispatch(ctx, "reviewer.arch", "")
 	if err != nil {
 		t.Fatalf("ClaimNextDispatch on empty queue: %v", err)
 	}
@@ -131,7 +131,7 @@ func TestClaimNextDispatch_WrongRoleReturnsNil(t *testing.T) {
 		t.Fatalf("EnqueueDispatch: %v", err)
 	}
 
-	claimed, err := ds.ClaimNextDispatch(ctx, "coder.impl")
+	claimed, err := ds.ClaimNextDispatch(ctx, "coder.impl", "")
 	if err != nil {
 		t.Fatalf("ClaimNextDispatch: %v", err)
 	}
@@ -169,7 +169,7 @@ func TestClaimNextDispatch_OldestFirst(t *testing.T) {
 		t.Fatalf("EnqueueDispatch d2: %v", err)
 	}
 
-	claimed, err := ds.ClaimNextDispatch(ctx, "reviewer.arch")
+	claimed, err := ds.ClaimNextDispatch(ctx, "reviewer.arch", "")
 	if err != nil {
 		t.Fatalf("ClaimNextDispatch: %v", err)
 	}
@@ -195,7 +195,7 @@ func TestCompleteDispatch_HappyPath(t *testing.T) {
 		t.Fatalf("EnqueueDispatch: %v", err)
 	}
 
-	claimed, err := ds.ClaimNextDispatch(ctx, "reviewer.arch")
+	claimed, err := ds.ClaimNextDispatch(ctx, "reviewer.arch", "")
 	if err != nil {
 		t.Fatalf("ClaimNextDispatch: %v", err)
 	}
@@ -263,7 +263,7 @@ func TestExpireLeases(t *testing.T) {
 		t.Fatalf("EnqueueDispatch: %v", err)
 	}
 
-	claimed, err := ds.ClaimNextDispatch(ctx, "reviewer.arch")
+	claimed, err := ds.ClaimNextDispatch(ctx, "reviewer.arch", "")
 	if err != nil {
 		t.Fatalf("ClaimNextDispatch: %v", err)
 	}
@@ -313,7 +313,7 @@ func TestExpireLeases_SkipsNonExpired(t *testing.T) {
 		t.Fatalf("EnqueueDispatch: %v", err)
 	}
 
-	claimed, err := ds.ClaimNextDispatch(ctx, "reviewer.arch")
+	claimed, err := ds.ClaimNextDispatch(ctx, "reviewer.arch", "")
 	if err != nil {
 		t.Fatalf("ClaimNextDispatch: %v", err)
 	}
@@ -368,7 +368,7 @@ func TestFullLeaseCycle(t *testing.T) {
 	}
 
 	// Claim.
-	claimed, err := ds.ClaimNextDispatch(ctx, "coder.impl")
+	claimed, err := ds.ClaimNextDispatch(ctx, "coder.impl", "")
 	if err != nil {
 		t.Fatalf("ClaimNextDispatch: %v", err)
 	}
@@ -380,7 +380,7 @@ func TestFullLeaseCycle(t *testing.T) {
 	}
 
 	// Idle check — no more pending dispatches for this role.
-	idle, err := ds.ClaimNextDispatch(ctx, "coder.impl")
+	idle, err := ds.ClaimNextDispatch(ctx, "coder.impl", "")
 	if err != nil {
 		t.Fatalf("ClaimNextDispatch (idle): %v", err)
 	}

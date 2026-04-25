@@ -105,7 +105,8 @@ func CallRoleInvoke(ctx context.Context, d *coding.Dispatcher, role string, inpu
 
 // nextDispatchInput is the typed input for orch_next_dispatch.
 type nextDispatchInput struct {
-	Role string `json:"role"`
+	Role   string `json:"role"`
+	Handle string `json:"handle,omitempty"` // optional; empty for ephemeral callers
 }
 
 // nextDispatchOutput is the typed output for orch_next_dispatch when work is available.
@@ -134,7 +135,7 @@ func handleNextDispatch(
 			return nil, nextDispatchOutput{}, fmt.Errorf("role is required")
 		}
 
-		dispatch, err := ds.ClaimNextDispatch(ctx, in.Role)
+		dispatch, err := ds.ClaimNextDispatch(ctx, in.Role, in.Handle)
 		if err != nil {
 			return nil, nextDispatchOutput{}, fmt.Errorf("claim dispatch: %w", err)
 		}
@@ -157,9 +158,10 @@ func handleNextDispatch(
 
 // CallNextDispatch is an exported wrapper around the orch_next_dispatch handler
 // logic, used by tests to exercise the handler directly.
-func CallNextDispatch(ctx context.Context, ds *store.DispatchStore, role string) (map[string]interface{}, error) {
+// Pass handle="" for ephemeral callers; pass the worker handle for registered workers.
+func CallNextDispatch(ctx context.Context, ds *store.DispatchStore, role, handle string) (map[string]interface{}, error) {
 	h := handleNextDispatch(ds)
-	_, out, err := h(ctx, nil, nextDispatchInput{Role: role})
+	_, out, err := h(ctx, nil, nextDispatchInput{Role: role, Handle: handle})
 	if err != nil {
 		return nil, err
 	}
