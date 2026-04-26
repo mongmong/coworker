@@ -66,9 +66,10 @@ func (j *CLIJudge) Evaluate(ctx context.Context, rule *Rule, diff string, jobCon
 	}
 
 	var verdict Verdict
-	dec := json.NewDecoder(&stdout)
+	raw := stdout.Bytes()
+	dec := json.NewDecoder(bytes.NewReader(raw))
 	if err := dec.Decode(&verdict); err != nil {
-		return nil, fmt.Errorf("quality judge: parse verdict JSON for rule %q: %w (stdout: %s)", rule.Name, err, stdout.String())
+		return nil, fmt.Errorf("parse judge output for rule %q: %w; raw: %s", rule.Name, err, string(raw))
 	}
 
 	logger.Debug("quality judge verdict", "rule", rule.Name, "pass", verdict.Pass, "confidence", verdict.Confidence)

@@ -2,6 +2,7 @@ package quality
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"sort"
 
@@ -56,6 +57,17 @@ func validateRule(r *Rule) error {
 	}
 	if r.Severity != "block" && r.Severity != "advisory" {
 		return fmt.Errorf("severity must be %q or %q, got %q", "block", "advisory", r.Severity)
+	}
+	// Warn when severity contradicts the category's block-capable status.
+	// The category is the authoritative gate; severity is metadata only and
+	// does not affect routing. Mismatches are accepted but logged so rule
+	// authors can detect accidental misconfiguration early.
+	if r.Severity == "block" && !IsBlockCapable(r.Category) {
+		slog.Warn("quality rule has severity=block but category is not block-capable; severity will have no routing effect",
+			"rule", r.Name, "category", r.Category)
+	} else if r.Severity == "advisory" && IsBlockCapable(r.Category) {
+		slog.Warn("quality rule has severity=advisory but category is block-capable; the category will still block if the verdict fails",
+			"rule", r.Name, "category", r.Category)
 	}
 	return nil
 }

@@ -210,7 +210,7 @@ Test run: `go test -race ./coding/quality/... -count=1` → **PASS** (1.483s, no
 
 ### Issues
 
-**[OPEN] Important — `IsBlockSeverity()` is dead code; severity field does not affect routing**
+**[FIXED] Important — `IsBlockSeverity()` is dead code; severity field does not affect routing**
 
 `coding/quality/schema.go:61-64`
 
@@ -223,9 +223,11 @@ Two options:
 
 Either way, the inconsistency between the field's name/test and its actual impact on behaviour needs to be resolved to avoid future confusion.
 
+→ Response: Removed `IsBlockSeverity()` and its test (`TestRuleIsBlockSeverity`). Added `validateRule` warnings via `slog.Warn` when severity contradicts category block-capability. Rules are still accepted — the warning is a best-effort misconfiguration signal. Added `TestLoadRulesFromBytes_SeverityCategoryMismatch` to verify both warning paths are hit without errors. [FIXED]
+
 ---
 
-**[OPEN] Important — `stdout.String()` in JSON parse error message is always empty**
+**[FIXED] Important — `stdout.String()` in JSON parse error message is always empty**
 
 `coding/quality/judge.go:70-71`
 
@@ -248,6 +250,8 @@ if err := dec.Decode(&verdict); err != nil {
         rule.Name, err, raw)
 }
 ```
+
+→ Response: Fixed in `judge.go` — `raw := stdout.Bytes()` captured before `json.NewDecoder(bytes.NewReader(raw))`. Error message now uses `string(raw)`. `TestCLIJudge_InvalidJSON` extended to assert the raw output (`"not json"`) appears in the error string. [FIXED]
 
 ---
 

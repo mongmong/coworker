@@ -132,6 +132,44 @@ quality_rules:
 	}
 }
 
+// TestLoadRulesFromBytes_SeverityCategoryMismatch verifies that rules with
+// contradictory severity/category combinations are accepted (not rejected) and
+// that the loader does not return an error. The slog warning is a best-effort
+// signal; the rule is still usable.
+func TestLoadRulesFromBytes_SeverityCategoryMismatch(t *testing.T) {
+	// block-capable category with advisory severity — accepted with warning.
+	yaml1 := `
+quality_rules:
+  mismatch_advisory:
+    category: missing_required_tests
+    prompt: "check tests"
+    severity: advisory
+`
+	rules, err := LoadRulesFromBytes([]byte(yaml1))
+	if err != nil {
+		t.Fatalf("unexpected error for advisory severity on block-capable category: %v", err)
+	}
+	if len(rules) != 1 {
+		t.Fatalf("expected 1 rule, got %d", len(rules))
+	}
+
+	// non-block-capable category with block severity — accepted with warning.
+	yaml2 := `
+quality_rules:
+  mismatch_block:
+    category: spec_adherence
+    prompt: "check spec"
+    severity: block
+`
+	rules, err = LoadRulesFromBytes([]byte(yaml2))
+	if err != nil {
+		t.Fatalf("unexpected error for block severity on non-block-capable category: %v", err)
+	}
+	if len(rules) != 1 {
+		t.Fatalf("expected 1 rule, got %d", len(rules))
+	}
+}
+
 func TestBlockCapableCategories(t *testing.T) {
 	blockable := []Category{
 		CategoryMissingTests,
@@ -148,16 +186,5 @@ func TestBlockCapableCategories(t *testing.T) {
 	advisory := Category("spec_adherence")
 	if IsBlockCapable(advisory) {
 		t.Errorf("expected %q to be advisory (not block-capable)", advisory)
-	}
-}
-
-func TestRuleIsBlockSeverity(t *testing.T) {
-	r := &Rule{Severity: "block"}
-	if !r.IsBlockSeverity() {
-		t.Error("expected block severity to return true")
-	}
-	r.Severity = "advisory"
-	if r.IsBlockSeverity() {
-		t.Error("expected advisory severity to return false")
 	}
 }

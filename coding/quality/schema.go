@@ -58,11 +58,6 @@ type Rule struct {
 	Severity string `yaml:"severity"`
 }
 
-// IsBlockSeverity returns true if the rule's severity is "block".
-func (r *Rule) IsBlockSeverity() bool {
-	return r.Severity == "block"
-}
-
 // RuleSet is the top-level structure of a quality rules YAML file.
 type RuleSet struct {
 	Rules map[string]Rule `yaml:"quality_rules"`

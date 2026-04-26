@@ -157,6 +157,11 @@ func TestCLIJudge_InvalidJSON(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for invalid JSON, got nil")
 	}
+	// The raw stdout content must be preserved in the error message so that
+	// callers can diagnose what the judge actually emitted.
+	if !contains(err.Error(), "not json") {
+		t.Errorf("expected error to contain raw stdout output, got: %v", err)
+	}
 }
 
 func TestCLIJudge_NonZeroExit(t *testing.T) {
