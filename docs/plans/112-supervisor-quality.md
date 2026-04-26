@@ -191,4 +191,92 @@ quality_rules:
 
 ## Code Review
 
-*To be filled in during review phase.*
+Reviewer: claude-sonnet-4-6  
+Date: 2026-04-20  
+Range: 25c32c7..cc5384f (10 files, 1707 lines)  
+Test run: `go test -race ./coding/quality/... -count=1` → **PASS** (1.483s, no races)
+
+### What was done well
+
+- Routing authority correctly assigned to `IsBlockCapable(rule.Category)`, not `rule.Severity`. The category is the hard gate; severity is metadata only. This matches the spec invariant.
+- `effectiveMaxRetries()` fallback is clean; the `RetryCount >= effectiveMaxRetries()` boundary is correct (zero-indexed retries, fires on the 4th call when default=3).
+- `exec.CommandContext` propagates context cancellation to the subprocess — no hung child processes when the parent context is cancelled.
+- All four block-capable categories are hard-coded in `BlockCapableCategories`; the map is unexported-value-safe and policy cannot extend it.
+- `MockJudge.Calls` recorder enables deterministic call-order assertions in tests.
+- Nil-store safety in both `createAttentionItem` and `writeVerdictEvent` / `writeQualityGateEvent` allows nil-store unit testing without DB setup.
+- `rules.yaml` advisory categories (`spec_adherence`, `review_coverage_depth`) are non-block-capable and carry `severity: advisory`, consistent with the allowlist.
+
+---
+
+### Issues
+
+**[OPEN] Important — `IsBlockSeverity()` is dead code; severity field does not affect routing**
+
+`coding/quality/schema.go:61-64`
+
+`Rule.IsBlockSeverity()` is defined and tested but is never called in the evaluator. The evaluator routes entirely via `IsBlockCapable(rule.Category)`. This means a rule can declare `severity: block` on a non-block-capable category (or `severity: advisory` on a block-capable one) and the loader will accept it without warning. The severity field is currently misleading documentation rather than an enforced constraint.
+
+Two options:
+
+1. Remove `IsBlockSeverity()` and add a loader validation that warns (or errors) when `severity` and category membership are inconsistent. This would catch misconfigurations in `rules.yaml` early.
+2. If `severity` is intentionally reserved for future use, add a comment in `validateRule` explaining that it is not yet load-bearing in routing decisions.
+
+Either way, the inconsistency between the field's name/test and its actual impact on behaviour needs to be resolved to avoid future confusion.
+
+---
+
+**[OPEN] Important — `stdout.String()` in JSON parse error message is always empty**
+
+`coding/quality/judge.go:70-71`
+
+```go
+dec := json.NewDecoder(&stdout)
+if err := dec.Decode(&verdict); err != nil {
+    return nil, fmt.Errorf("... (stdout: %s)", rule.Name, err, stdout.String())
+}
+```
+
+`json.Decoder` reads from the `bytes.Buffer` as a stream. By the time `Decode` returns an error, it has already drained the buffer's contents into its own internal read buffer. `stdout.String()` on the remaining buffer will be empty (or show only the unconsumed suffix if the JSON was partially valid). The error message will lose the actual output that caused the parse failure, making debugging hard.
+
+Fix: capture the raw bytes before handing them to the decoder.
+
+```go
+raw := stdout.Bytes()
+dec := json.NewDecoder(bytes.NewReader(raw))
+if err := dec.Decode(&verdict); err != nil {
+    return nil, fmt.Errorf("quality judge: parse verdict JSON for rule %q: %w (stdout: %s)",
+        rule.Name, err, raw)
+}
+```
+
+---
+
+**[OPEN] Suggestion — Judge errors silently drop the rule with no verdict event; evaluator test has no coverage for this path**
+
+`coding/quality/evaluator.go:88-94`
+
+When `e.Judge.Evaluate` returns an error, the rule is silently skipped (`continue`) and no `quality.verdict` event is written. This means a systematic judge failure (e.g. `codex` binary missing) produces a clean `result.Pass = true` with no audit trail in the event log. The comment says "treat as advisory pass", but advisory findings still write events; judge errors do not.
+
+Recommendation: write a `quality.verdict` event with `pass: true, confidence: 0.0` and a `findings: ["judge error: <err>"]` field so failures are observable in the event log. Also add an evaluator test with a `MockJudge` that returns errors to verify the pass-through behaviour.
+
+---
+
+**[OPEN] Suggestion — No test verifies that `quality.verdict` events are actually written to the event store**
+
+`coding/quality/evaluator_test.go`
+
+All evaluator tests assert on the `Result` struct (findings counts, attention item IDs, escalation flag) but none query the event store to confirm that `writeVerdictEvent` or `writeQualityGateEvent` persisted rows. Given that both functions silently swallow store errors (log only), a broken `EventStore` would cause all tests to pass while emitting nothing. Adding one assertion along the lines of `evtStore.ListEvents(runID)` and checking the count would close this gap.
+
+---
+
+**[OPEN] Suggestion — `CLIJudge` has no `WaitDelay` set; subprocess may linger after context cancellation**
+
+`coding/quality/judge.go:55`
+
+`exec.CommandContext` sends `SIGKILL` when the context is cancelled, but the Go runtime's `cmd.Wait()` may still block waiting for the process's I/O pipes to drain. Setting `cmd.WaitDelay` (available since Go 1.20, confirmed present in Go 1.25) gives the subprocess a grace period before the pipe is force-closed:
+
+```go
+cmd.WaitDelay = 5 * time.Second
+```
+
+Without this, a subprocess that ignores SIGKILL or holds the pipe open will cause `cmd.Run()` to block indefinitely even after the context deadline fires. This is low severity for a batch quality judge but worth addressing before production use.
