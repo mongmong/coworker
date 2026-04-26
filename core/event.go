@@ -37,6 +37,11 @@ const (
 	// Cost events — emitted by the scheduler when token usage is recorded.
 	EventCostDelta EventKind = "cost.delta"
 
+	// EventJobSkipped is emitted when a job's applies_when predicate evaluates
+	// to false, causing the rule to be skipped without running its check.
+	// Callers that drive the rule engine are responsible for writing this event.
+	EventJobSkipped EventKind = "job.skipped"
+
 	// Phase lifecycle events — emitted by the phase loop executor.
 	EventPhaseStarted   EventKind = "phase.started"
 	EventPhaseCompleted EventKind = "phase.completed"

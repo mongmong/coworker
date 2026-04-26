@@ -12,13 +12,24 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// AppliesWhenClause is the structured form of the applies_when YAML block.
+// In V1 the only supported key is changes_touch (a list of file globs).
+// When the clause is nil or empty, the rule applies unconditionally.
+type AppliesWhenClause struct {
+	// ChangesTouch is a list of glob patterns (using path.Match semantics).
+	// The rule fires only if the current git diff touches at least one file
+	// that matches any of the listed patterns.
+	ChangesTouch []string `yaml:"changes_touch"`
+}
+
 // Rule is a single contract rule parsed from YAML.
 type Rule struct {
-	Name      string           `yaml:"-"` // populated from the map key
-	AppliesTo []string         `yaml:"applies_to"`
-	Check     string           `yaml:"check"`
-	Message   string           `yaml:"message"`
-	compiled  []*regexp.Regexp `yaml:"-"`
+	Name        string             `yaml:"-"` // populated from the map key
+	AppliesTo   []string           `yaml:"applies_to"`
+	AppliesWhen *AppliesWhenClause `yaml:"applies_when,omitempty"`
+	Check       string             `yaml:"check"`
+	Message     string             `yaml:"message"`
+	compiled    []*regexp.Regexp   `yaml:"-"`
 }
 
 // RuleSet is the top-level structure of a rules YAML file.

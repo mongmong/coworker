@@ -1,6 +1,27 @@
 # Seed rule catalog — built-in contract rules for the supervisor.
 # Per-repo overrides go in .coworker/rules/supervisor-contract.yaml.
 rules:
+  # --- developer rules ---
+
+  dev_commits_on_feature_branch:
+    applies_to: [developer]
+    check: git_current_branch_matches("^feature/plan-\\d+-")
+    message: "Developer committed to non-feature branch"
+
+  dev_phase_tag_in_commit:
+    applies_to: [developer]
+    check: last_commit_msg_contains("Phase \\d+:")
+    message: "Commit message must include Phase N: tag"
+
+  # --- planner rules ---
+
+  planner_plan_file_written:
+    applies_to: [planner]
+    check: exit_code_is(0)
+    message: "Planner must complete successfully"
+
+  # --- reviewer rules (wildcard covers reviewer.arch and reviewer.frontend) ---
+
   reviewer_findings_line_anchored:
     applies_to: [reviewer.*]
     check: all_findings_have(["path", "line"])
@@ -15,3 +36,17 @@ rules:
     applies_to: [reviewer.*]
     check: all_findings_have(["body"])
     message: "All reviewer findings must include a body description"
+
+  # --- tester rules ---
+
+  tester_exit_zero:
+    applies_to: [tester]
+    check: exit_code_is(0)
+    message: "Tester must exit with code 0 (all tests pass)"
+
+  # --- shipper rules ---
+
+  shipper_exit_zero:
+    applies_to: [shipper]
+    check: exit_code_is(0)
+    message: "Shipper must complete successfully"

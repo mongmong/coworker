@@ -1,0 +1,40 @@
+name: tester
+concurrency: single
+cli: claude-code
+prompt_template: prompts/tester.md
+inputs:
+  required:
+    - plan_path
+    - phase_index
+  optional:
+    - run_context_ref
+outputs:
+  contract:
+    test_files_written: true
+    tests_pass: true
+  emits:
+    test_files: []
+    test_results: string
+    notes: string
+sandbox: workspace-write
+permissions:
+  allowed_tools:
+    - read
+    - write
+    - edit
+    - grep
+    - glob
+    - "bash:go"
+    - "bash:git"
+  never:
+    - "bash:sudo"
+    - "bash:rm -rf"
+  requires_human:
+    - network
+budget:
+  max_tokens_per_job: 150000
+  max_wallclock_minutes: 20
+  max_cost_usd: 3.00
+retry_policy:
+  on_contract_fail: retry_with_feedback
+  on_job_error: retry_once

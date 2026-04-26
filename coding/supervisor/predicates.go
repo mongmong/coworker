@@ -3,6 +3,7 @@ package supervisor
 import (
 	"fmt"
 	"os/exec"
+	"path"
 	"regexp"
 	"strconv"
 	"strings"
@@ -34,6 +35,7 @@ var predicateRegistry = map[string]PredicateFn{
 	"exit_code_is":               exitCodeIs,
 	"git_current_branch_matches": gitCurrentBranchMatches,
 	"last_commit_msg_contains":   lastCommitMsgContains,
+	"changes_touch":              changesTouch,
 }
 
 // LookupPredicate returns the predicate function for the given name,
@@ -233,6 +235,66 @@ func lastCommitMsgContains(ctx *EvalContext, args []string) (bool, error) {
 	return re.MatchString(msg), nil
 }
 
+// EvalAppliesWhen evaluates the applies_when clause on a rule.
+// Returns (true, nil) if the rule should be evaluated (clause is absent or
+// its condition is met). Returns (false, nil) if the clause condition is not
+// met and the rule should be skipped. Returns (false, err) on evaluation error.
+func EvalAppliesWhen(ctx *EvalContext, clause *AppliesWhenClause) (bool, error) {
+	if clause == nil {
+		return true, nil
+	}
+
+	if len(clause.ChangesTouch) > 0 {
+		return evalChangesTouch(ctx, clause.ChangesTouch)
+	}
+
+	// Clause present but no known keys: treat as unconditional (forward-compat).
+	return true, nil
+}
+
+// evalChangesTouch checks whether the current git diff touches any file
+// matching the given glob patterns.
+func evalChangesTouch(ctx *EvalContext, globs []string) (bool, error) {
+	files, err := gitDiffChangedFiles(ctx.WorkDir)
+	if err != nil {
+		return false, fmt.Errorf("changes_touch: %w", err)
+	}
+
+	for _, f := range files {
+		for _, g := range globs {
+			matched, err := path.Match(g, f)
+			if err != nil {
+				return false, fmt.Errorf("changes_touch: invalid glob %q: %w", g, err)
+			}
+			if matched {
+				return true, nil
+			}
+			// Also match the basename against patterns that don't contain a slash.
+			if !strings.Contains(g, "/") {
+				base := path.Base(f)
+				matched, err = path.Match(g, base)
+				if err != nil {
+					return false, fmt.Errorf("changes_touch: invalid glob %q: %w", g, err)
+				}
+				if matched {
+					return true, nil
+				}
+			}
+		}
+	}
+
+	return false, nil
+}
+
+// changesTouch is the PredicateFn form of changes_touch, for use in check
+// expressions (not applies_when). Usage: changes_touch(["web/**", "*.tsx"])
+func changesTouch(ctx *EvalContext, args []string) (bool, error) {
+	if len(args) == 0 {
+		return false, fmt.Errorf("changes_touch requires at least one glob pattern")
+	}
+	return evalChangesTouch(ctx, args)
+}
+
 // --- Git helpers ---
 
 // gitCurrentBranch returns the current git branch name.
@@ -259,4 +321,35 @@ func gitLastCommitMsg(workDir string) (string, error) {
 		return "", fmt.Errorf("git log -1 --format=%%s: %w", err)
 	}
 	return strings.TrimSpace(string(out)), nil
+}
+
+// gitDiffChangedFiles returns the list of files changed between HEAD~1 and
+// HEAD. If there is only one commit (no parent), it returns the files
+// introduced by that commit using the empty-tree comparison.
+func gitDiffChangedFiles(workDir string) ([]string, error) {
+	// Try HEAD~1..HEAD first.
+	cmd := exec.Command("git", "diff", "--name-only", "HEAD~1..HEAD")
+	if workDir != "" {
+		cmd.Dir = workDir
+	}
+	out, err := cmd.Output()
+	if err != nil {
+		// If HEAD has no parent (initial commit), fall back to HEAD vs empty tree.
+		emptyTree := "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+		cmd2 := exec.Command("git", "diff", "--name-only", emptyTree, "HEAD")
+		if workDir != "" {
+			cmd2.Dir = workDir
+		}
+		out2, err2 := cmd2.Output()
+		if err2 != nil {
+			return nil, fmt.Errorf("git diff HEAD~1..HEAD: %w; git diff empty-tree HEAD: %v", err, err2)
+		}
+		out = out2
+	}
+
+	raw := strings.TrimSpace(string(out))
+	if raw == "" {
+		return nil, nil
+	}
+	return strings.Split(raw, "\n"), nil
 }

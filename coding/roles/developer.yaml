@@ -1,0 +1,42 @@
+name: developer
+concurrency: single
+cli: claude-code
+prompt_template: prompts/developer.md
+inputs:
+  required:
+    - plan_path
+    - phase_index
+    - run_context_ref
+outputs:
+  contract:
+    new_commits_on_feature_branch: true
+    phase_tag_in_commit_msg: true
+    tests_added_or_justified: true
+    no_commits_to_main: true
+  emits:
+    commits: []
+    touched_files: []
+    notes: string
+sandbox: workspace-write
+permissions:
+  allowed_tools:
+    - read
+    - write
+    - edit
+    - grep
+    - glob
+    - "bash:git"
+    - "bash:go"
+  never:
+    - "bash:sudo"
+    - "bash:rm -rf"
+  requires_human:
+    - "bash:curl"
+    - network
+budget:
+  max_tokens_per_job: 200000
+  max_wallclock_minutes: 30
+  max_cost_usd: 5.00
+retry_policy:
+  on_contract_fail: retry_with_feedback
+  on_job_error: retry_once

@@ -54,6 +54,32 @@ func (e *RuleEngine) Evaluate(ctx *EvalContext) (*core.SupervisorVerdict, error)
 	verdict := &core.SupervisorVerdict{Pass: true}
 
 	for _, rule := range applicable {
+		// Phase 6: evaluate applies_when before running the check.
+		// If the clause is present and its condition is false, skip the rule.
+		if rule.AppliesWhen != nil {
+			applies, err := EvalAppliesWhen(ctx, rule.AppliesWhen)
+			if err != nil {
+				// Evaluation error: treat as a failure so callers know
+				// something went wrong with the predicate itself.
+				verdict.Pass = false
+				verdict.Results = append(verdict.Results, core.RuleResult{
+					RuleName: rule.Name,
+					Passed:   false,
+					Message:  fmt.Sprintf("applies_when eval error: %v", err),
+				})
+				continue
+			}
+			if !applies {
+				verdict.Results = append(verdict.Results, core.RuleResult{
+					RuleName: rule.Name,
+					Passed:   true,
+					Skipped:  true,
+					Message:  rule.Message,
+				})
+				continue
+			}
+		}
+
 		funcName, args, err := ParseCheck(rule.Check)
 		if err != nil {
 			verdict.Pass = false

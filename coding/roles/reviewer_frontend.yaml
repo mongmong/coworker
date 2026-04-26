@@ -1,0 +1,41 @@
+name: reviewer.frontend
+concurrency: many
+cli: opencode
+prompt_template: prompts/reviewer_frontend.md
+inputs:
+  required:
+    - diff_path
+    - design_system_path
+  optional:
+    - spec_path
+outputs:
+  contract:
+    findings_line_anchored: true
+  emits:
+    findings: []
+applies_when:
+  changes_touch:
+    - "web/**"
+    - "*.tsx"
+    - "*.ts"
+    - "*.css"
+    - "*.scss"
+    - "*.html"
+sandbox: read-only
+permissions:
+  allowed_tools:
+    - read
+    - grep
+    - glob
+  never:
+    - write
+    - edit
+    - "bash:rm"
+  requires_human: []
+budget:
+  max_tokens_per_job: 200000
+  max_wallclock_minutes: 30
+  max_cost_usd: 5.00
+retry_policy:
+  on_contract_fail: retry_with_feedback
+  on_job_error: retry_once
