@@ -108,7 +108,11 @@ EventPlanShipped EventKind = "plan.shipped"
 
 ## Code Review
 
-### External review — 2026-04-20
+### Review 1
+
+- **Date**: 2026-04-24
+- **Reviewer**: Claude (post-implementation review)
+- **Verdict**: Approved with fixes applied
 
 **[FIXED] Critical: StageRegistry is wired as a field but never consulted**
 
