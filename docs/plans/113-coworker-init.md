@@ -212,10 +212,89 @@ All existing and new tests must pass.
 
 ## Code Review
 
-_To be filled in during review._
+### Finding 1 — `copyInitFileSrc` returned `nil` for both skip and copy [FIXED]
+**Priority:** Must Fix
+**Location:** `cli/init.go` (original `copyInitFileSrc`)
+
+The function originally returned `error` only, so the caller incremented
+`stats.written` on any nil return — including the "skip, already exists" path.
+Changed return signature to `(bool, error)` where `true` means "was copied".
+
+→ Response: Fixed. `copyInitFileSrc` now returns `(copied bool, err error)` and
+callers differentiate skip vs write in the stats counters. [FIXED]
+
+### Finding 2 — Dead `written`/`skipped` tracking in `runInit` [FIXED]
+**Priority:** Should Fix
+**Location:** `cli/init.go` runInit
+
+The original had `written, skipped := 0, 0` accumulating counts from several
+branches, then discarded them with `_ = written; _ = skipped`. Cleaned up by
+removing the tracking in `runInit` (asset copying stats remain on `copyStats`
+for future use, but the top-level caller no longer collects them).
+
+→ Response: Fixed. Removed the dead variable accumulation from `runInit`. [FIXED]
+
+### Finding 3 — `--global` flag has no effect on claude/opencode [WONTFIX]
+**Priority:** Nice to Have
+**Location:** `cli/init.go` initOptions.Global
+
+`--global` is accepted and stored but only affects the codex plugin (always
+global by design). Claude and opencode plugins install project-locally regardless.
+This is documented in the plan's trade-offs section.
+
+→ Response: Documented as a known V1 limitation in the trade-offs section of this
+plan. Forward-compatibility flag exists so we don't need to add it later. The help
+text already includes the flag; adding "(currently affects codex only)" would be
+confusing since the flag *will* affect all plugins in a future plan. [WONTFIX]
 
 ---
 
 ## Post-Execution Report
 
-_To be filled in after implementation._
+### What was implemented
+
+**Phase 1–5 all implemented in a single `cli/init.go`** (no `init_assets.go` needed
+— the asset-finding logic is simple enough to inline in `init.go`).
+
+Files created:
+- `cli/init.go` — 420 lines: cobra command, `runInit`, `writeInitFile`,
+  `copyInitAssets`, `findInitAssets`, `copyGlob`, `copyInitFileSrc`,
+  `augmentGitignore`
+- `cli/init_test.go` — 500 lines: 12 test functions covering all five phases
+
+### Key design decisions and deviations
+
+1. **No `init_assets.go`** — the plan proposed separating asset helpers into a
+   separate file. They're small enough to live in `init.go` without reducing
+   readability.
+
+2. **`--with-plugins` is non-fatal** — plugin install errors are logged and
+   summarized but do not abort `coworker init`. This matches the stated design in
+   the plan's trade-offs section.
+
+3. **Tests avoid `t.Parallel()` for Chdir tests** — `os.Chdir` is process-wide;
+   parallel tests that Chdir would race. All init command tests (which Chdir to
+   tmpDir) are sequential. Unit tests for `augmentGitignore` and `writeInitFile`
+   remain parallel.
+
+4. **`copyInitFileSrc` returns `(bool, error)`** — distinguishes "copied" from
+   "skipped (already exists)" so stats accounting is correct.
+
+5. **File permissions use 0o600** — gosec flags 0o644 for WriteFile. Config and
+   policy files are written with 0o600; directories remain 0o755.
+
+### Test coverage
+
+All 12 tests pass. Full suite (24 packages) passes with `-race` flag.
+Linter (`golangci-lint`) reports 0 issues.
+
+### Known limitations
+
+- Asset discovery at runtime (`findInitAssets`) requires `coding/` to be adjacent
+  to the binary or the cwd. Production distributions must ship `coding/` alongside
+  the binary. This is documented in the plan's trade-offs section.
+- `--global` currently has no effect beyond `--with-plugins --global` routing
+  codex plugin to `~/.codex/` (which is always the case anyway). Claude and
+  opencode plugins install project-locally in V1.
+- The `runs/` directory is created by `coworker init` even though it's gitignored;
+  this is intentional (the directory must exist for the daemon to write into it).
