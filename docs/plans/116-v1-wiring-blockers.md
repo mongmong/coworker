@@ -683,6 +683,23 @@ Before opening the PR, verify each item:
 
 11. `[WONTFIX]` `buildDispatcher` already handles missing role-dir/prompt-dir via existing role loader. No change needed.
 
+### Pre-Implementation Re-Review (Codex, 2026-04-26)
+
+Confirmation pass after revision. All 4 Must Fix and 4 Should Fix findings verified:
+
+| # | Finding | Status |
+|---|---|---|
+| 1 | B-1 PRD entry, architect-first | ✅ FIXED — Phase 2 registers `Use: "run <prd.md>"`, dispatches architect with `prd_path` input. `--manifest` is documented warning-bypass for testing. |
+| 2 | B-5 default-deny | ✅ FIXED — `on_undeclared: "deny"` default; `PermDecisionUndeclared` hard-fails. |
+| 3 | Resume approve/reject distinction | ✅ FIXED — Phase 2 Step k aborts on reject, exits non-zero. Phase 6 writes correct constant per command. |
+| 4 | errgroup lifecycle | ✅ FIXED — `signal.NotifyContext` + `defer cancel()` in both goroutines. |
+| 5 | Resume context reconstruction | ✅ FIXED — Phase 2 documents event-log replay + idempotent `worktree.Open`. |
+| 6 | Dirty-phase checkpoint filter | ✅ FIXED — `GetUnansweredCheckpointForRun(runID, source)` filters by `kind='checkpoint' AND source=?`. |
+| 7 | Phase ordering | ✅ FIXED — Phase 0 shared types first; clean dependency order after. |
+| 8 | `orch_checkpoint_list` symmetry | ✅ FIXED — `run_id` required, returns validation error if absent. |
+
+**Verdict: READY TO IMPLEMENT.**
+
 ---
 
 ## Post-Execution Report
