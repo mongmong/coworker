@@ -125,7 +125,6 @@ func (s *Shipper) Ship(
 
 	// Step 3: record PR URL as artifact.
 	// Emit plan.shipped event first (event-log-before-state invariant).
-	artifactID := core.NewID()
 	jobID := fmt.Sprintf("ship-plan-%d", planEntry.ID)
 
 	if err := s.emitShippedEvent(ctx, runID, planEntry, branch, prURL, jobID); err != nil {
@@ -135,6 +134,10 @@ func (s *Shipper) Ship(
 		)
 		// Non-fatal for the PR itself, but log prominently.
 	}
+
+	// artifactID is only set after a successful artifact insert so callers can
+	// use ArtifactID != "" as a reliable signal that the row exists in the DB.
+	artifactID := ""
 
 	if s.ArtifactStore != nil {
 		// Ensure the ship job row exists so the artifacts FK constraint is satisfied.
@@ -156,8 +159,9 @@ func (s *Shipper) Ship(
 				)
 				// Non-fatal: skip artifact insertion if job creation failed.
 			} else {
+				intendedID := core.NewID()
 				artifact := &core.Artifact{
-					ID:    artifactID,
+					ID:    intendedID,
 					JobID: jobID,
 					Kind:  "pr-url",
 					Path:  prURL,
@@ -165,10 +169,13 @@ func (s *Shipper) Ship(
 				if err := s.ArtifactStore.InsertArtifact(ctx, artifact, runID); err != nil {
 					log.Error("shipper: failed to record pr-url artifact",
 						"plan_id", planEntry.ID,
-						"artifact_id", artifactID,
+						"artifact_id", intendedID,
 						"error", err,
 					)
 					// Non-fatal: the PR was created successfully.
+				} else {
+					// Only expose the artifact ID once the row is persisted.
+					artifactID = intendedID
 				}
 			}
 		} else {

@@ -4,12 +4,14 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/chris/coworker/coding"
 	"github.com/chris/coworker/coding/manifest"
 	"github.com/chris/coworker/coding/phaseloop"
 	"github.com/chris/coworker/coding/shipper"
+	"github.com/chris/coworker/coding/stages"
 	"github.com/chris/coworker/coding/workflow"
 	"github.com/chris/coworker/core"
 	"github.com/chris/coworker/store"
@@ -260,5 +262,88 @@ func TestBuildFromPRDWorkflow_RunPhasesForPlan_BranchFallback(t *testing.T) {
 	}
 	if result.ShipResult == nil {
 		t.Fatal("expected ShipResult even with branch fallback")
+	}
+}
+
+// recordingOrchestrator captures the role name of every Orchestrate call.
+type recordingOrchestrator struct {
+	mu    sync.Mutex
+	roles []string
+}
+
+func (r *recordingOrchestrator) Orchestrate(_ context.Context, input *coding.DispatchInput) (*coding.DispatchResult, error) {
+	r.mu.Lock()
+	r.roles = append(r.roles, input.RoleName)
+	r.mu.Unlock()
+	return &coding.DispatchResult{ExitCode: 0}, nil
+}
+
+func (r *recordingOrchestrator) dispatched() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]string, len(r.roles))
+	copy(out, r.roles)
+	return out
+}
+
+func TestBuildFromPRDWorkflow_StageRegistry_OverrideUsed(t *testing.T) {
+	// When a StageRegistry overrides "phase-review", the overridden roles must
+	// be dispatched by PhaseExecutor instead of the hardcoded defaults.
+	path := writeManifest(t, testManifestYAML)
+
+	// Build a policy that overrides phase-review to a single custom role.
+	policy := &core.Policy{
+		WorkflowOverrides: map[string]map[string][]string{
+			"build-from-prd": {
+				"phase-review": {"security-auditor"},
+			},
+		},
+	}
+
+	registry := stages.NewStageRegistry(
+		stages.WorkflowBuildFromPRD,
+		stages.DefaultStages,
+		policy,
+	)
+
+	rec := &recordingOrchestrator{}
+	db := openTestDB(t)
+	exec := &phaseloop.PhaseExecutor{
+		Dispatcher: rec,
+		EventStore: store.NewEventStore(db),
+	}
+
+	w := workflow.NewBuildFromPRDWorkflow(path, nil)
+	w.PhaseExecutor = exec
+	w.StageRegistry = registry
+
+	plan := manifest.PlanEntry{ID: 200, Title: "Registry override test", Phases: []string{"build"}}
+	_, err := w.RunPhasesForPlan(context.Background(), "run-registry", plan, map[string]string{
+		"diff_path": "/tmp/test.diff",
+		"spec_path": "/tmp/spec.md",
+	})
+	if err != nil {
+		t.Fatalf("RunPhasesForPlan: %v", err)
+	}
+
+	dispatched := rec.dispatched()
+
+	// "security-auditor" must appear (the overridden role).
+	found := false
+	for _, r := range dispatched {
+		if r == "security-auditor" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected security-auditor to be dispatched; got roles: %v", dispatched)
+	}
+
+	// Default reviewer roles must NOT appear (they were replaced, not appended).
+	for _, r := range dispatched {
+		if r == "reviewer.arch" || r == "reviewer.frontend" {
+			t.Errorf("default reviewer role %q dispatched despite registry override; got roles: %v", r, dispatched)
+		}
 	}
 }

@@ -21,9 +21,10 @@ type Orchestrator interface {
 	Orchestrate(ctx context.Context, input *coding.DispatchInput) (*coding.DispatchResult, error)
 }
 
-// reviewerRoles are the roles dispatched in parallel after each developer
-// job. tester is included so test failures block the phase.
-var reviewerRoles = []string{"reviewer.arch", "reviewer.frontend", "tester"}
+// defaultReviewerRoles are the roles dispatched in parallel after each developer
+// job when no override is provided. tester is included so test failures block
+// the phase.
+var defaultReviewerRoles = []string{"reviewer.arch", "reviewer.frontend", "tester"}
 
 // PhaseExecutor runs one phase of a plan through the full cycle:
 // developer → fan-out reviewers/tester → dedupe → fix-loop → checkpoint.
@@ -47,6 +48,12 @@ type PhaseExecutor struct {
 	// Policy controls fix-cycle limits and checkpoint behavior.
 	// May be nil; defaults are used when nil.
 	Policy *core.Policy
+
+	// ReviewerRoles is the list of roles dispatched in parallel after each
+	// developer job. When nil or empty, defaultReviewerRoles is used.
+	// Set by BuildFromPRDWorkflow from StageRegistry.RolesForStage("phase-review")
+	// so policy.yaml workflow_overrides take effect.
+	ReviewerRoles []string
 
 	// Logger is the structured logger. Uses slog.Default() if nil.
 	Logger *slog.Logger
@@ -246,6 +253,15 @@ func (e *PhaseExecutor) runLoop(
 	}
 }
 
+// reviewerRoles returns the effective reviewer role list: e.ReviewerRoles when
+// non-empty, otherwise the package-level default.
+func (e *PhaseExecutor) reviewerRoles() []string {
+	if len(e.ReviewerRoles) > 0 {
+		return e.ReviewerRoles
+	}
+	return defaultReviewerRoles
+}
+
 // fanOut dispatches all reviewer roles and tester in parallel and collects
 // results. An error from any goroutine cancels the rest via errgroup.
 func (e *PhaseExecutor) fanOut(
@@ -253,13 +269,15 @@ func (e *PhaseExecutor) fanOut(
 	inputs map[string]string,
 	log *slog.Logger,
 ) ([]*coding.DispatchResult, error) {
+	roles := e.reviewerRoles()
+
 	// Preallocate results slice — each goroutine writes to its own index,
 	// so no mutex is needed.
-	results := make([]*coding.DispatchResult, len(reviewerRoles))
+	results := make([]*coding.DispatchResult, len(roles))
 
 	g, gCtx := errgroup.WithContext(ctx)
 
-	for i, roleName := range reviewerRoles {
+	for i, roleName := range roles {
 		i, roleName := i, roleName // capture loop vars
 		g.Go(func() error {
 			log.Info("dispatching reviewer/tester", "role", roleName)

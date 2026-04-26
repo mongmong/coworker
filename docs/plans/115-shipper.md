@@ -108,6 +108,54 @@ EventPlanShipped EventKind = "plan.shipped"
 
 ## Code Review
 
+### External review — 2026-04-20
+
+**[FIXED] Critical: StageRegistry is wired as a field but never consulted**
+
+`BuildFromPRDWorkflow.StageRegistry` is declared and documented but `RunPhasesForPlan` never calls `RolesForStage`. The reviewer/tester role list is hardcoded in `coding/phaseloop/executor.go:26` as `var reviewerRoles = []string{"reviewer.arch", "reviewer.frontend", "tester"}`. The plan (Phase 5) states: "The `PhaseExecutor.fanOut` reviewer roles are sourced from `StageRegistry.RolesForStage("phase-review")` when a registry is set." That wiring does not exist. `StageRegistry` is a dead field today — adding it to the struct and importing the package is the only observable effect. The workflow test (`TestBuildFromPRDWorkflow_RunPhasesForPlan_WithShipper_DryRun`) also never asserts that the registry-supplied roles were used instead of the hardcoded defaults.
+
+File references: `coding/workflow/build_from_prd.go:49-51`, `coding/phaseloop/executor.go:24-26`.
+
+Required fix: either (a) pass `StageRegistry.RolesForStage("phase-review")` into `PhaseExecutor` before calling `Execute` (requires adding a `ReviewerRoles []string` field to `PhaseExecutor` or passing it per-call) and add a test that verifies a policy override actually changes which roles are dispatched, or (b) explicitly defer this wiring to Plan 116 and remove the `StageRegistry` field from the struct (and the corresponding plan phase claim) to avoid a documented-but-inoperative API surface.
+
+→ Response: Fixed. Added `ReviewerRoles []string` field to `PhaseExecutor`. `fanOut` now calls `e.reviewerRoles()` which falls back to `defaultReviewerRoles` when nil/empty. `BuildFromPRDWorkflow.RunPhasesForPlan` populates `ReviewerRoles` from `StageRegistry.RolesForStage("phase-review")` when a registry is set. `TestBuildFromPRDWorkflow_StageRegistry_OverrideUsed` verifies the override is dispatched and defaults are suppressed.
+
+**[FIXED] Important: `ArtifactID` is always non-empty in `ShipResult` even when no artifact was stored**
+
+`shipper.go:128` generates `artifactID = core.NewID()` unconditionally. The field is returned in `ShipResult.ArtifactID` (line 189) regardless of whether the artifact insert succeeded or was skipped (nil `ArtifactStore`, nil `JobStore`, or failed `CreateJob`). Callers inspecting `ShipResult.ArtifactID != ""` as a signal that an artifact row exists in the DB will get a false positive. Either (a) only set `ArtifactID` in the return value after the insert succeeds, setting it to `""` on skip/failure, or (b) document clearly that the field holds the *intended* ID and may not correspond to a persisted row.
+
+File reference: `coding/shipper/shipper.go:128,187-191`.
+
+→ Response: Fixed. `artifactID` is now initialised to `""` before the artifact block and only set to the generated ID after `InsertArtifact` succeeds. Skip/failure paths leave it empty. `ShipResult.ArtifactID` is now a reliable signal that a DB row exists.
+
+**[FIXED] Suggestion: dead-code branch in `registry.go` should be deleted**
+
+Lines 49–77 enter an `if stages, ok := wfOverride["stages"]; ok { ... }` block, immediately blank-assign `stages` (`_ = stages`), and exit. The entire `if` body is a no-op; the actual iteration happens in the sibling loop at line 80 that skips the `"stages"` key. The block adds ~30 lines of confusing comments that contradict the actual YAML contract (which the self-review `[OK]` note already clarifies). Delete the dead `if` block; the comment explaining why `"stages"` is skipped belongs on the `continue` at line 84.
+
+File reference: `coding/stages/registry.go:49-77`.
+
+→ Response: Fixed. Deleted the no-op `if stages, ok := wfOverride["stages"]; ok { ... }` block (lines 49–77). The explanatory comment explaining why the `"stages"` key is skipped now lives on the `continue` branch of the iteration loop.
+
+**[OK] gh.go command injection — no issue**
+
+`ghCreatePR` passes `branch`, `title`, and `body` as discrete `exec.Command` argument strings, not via a shell interpreter. There is no shell interpolation: `exec.CommandContext(ctx, "gh", "pr", "create", "--title", title, ...)` hands each string directly to the OS as a separate `argv` element. Newlines or shell metacharacters in a title cannot escape into a second command. The `//nolint:gosec` suppression is accurate — `gosec` flags any `exec.Command` whose first argument is not a literal; the suppression is appropriate here and the justification comment is correct.
+
+**[OK] Shipper.Ship flow — checkpoint then proceed**
+
+The spec (Phase 2) explicitly states "In V1, true blocking is deferred; we emit and proceed." `Ship` records the attention item, logs non-fatally on insert failure, and continues. This matches the documented V1 contract. Plan 103 is the correct vehicle for blocking semantics.
+
+**[OK] Race safety**
+
+`StageRegistry` is immutable after `NewStageRegistry` returns (all writes happen in the constructor; `RolesForStage` and `AllStages` only read from `r.merged`). `Shipper` has no shared mutable state between calls. The race detector confirmed 0 races across 3 packages.
+
+**[OK] Defensive copy in `RolesForStage`**
+
+Both construction-time copies (lines 41-43 and 89-92) and the return-time copy (lines 110-113) are correct. The mutation isolation test (`TestStageRegistry_Mutation_IsolatedFromCaller`) verifies this end-to-end.
+
+**[OK] Empty-list vs nil distinction for disabled stages**
+
+`NewStageRegistry` stores `[]string{}` (not nil) for an empty policy override. `RolesForStage` returns a copy via `make([]string, 0)` for that case, preserving the nil/empty distinction. The test `TestStageRegistry_PolicyOverride_EmptyListDisablesStage` asserts exactly this.
+
 ### Self-review findings
 
 **[FIXED]** `Shipper.ArtifactStore` insertion violated `artifacts.job_id` FK because the

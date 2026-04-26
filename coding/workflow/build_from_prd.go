@@ -202,6 +202,15 @@ func (w *BuildFromPRDWorkflow) RunPhasesForPlan(
 		return nil, fmt.Errorf("build-from-prd: PhaseExecutor is required for RunPhasesForPlan")
 	}
 
+	// Populate ReviewerRoles from the StageRegistry so policy.yaml overrides
+	// take effect. Fall back to PhaseExecutor defaults when no registry is set
+	// or when the registry returns nil (stage not registered).
+	if w.StageRegistry != nil {
+		if roles := w.StageRegistry.RolesForStage("phase-review"); roles != nil {
+			w.PhaseExecutor.ReviewerRoles = roles
+		}
+	}
+
 	log := w.logger()
 	log.Info("running phases for plan",
 		"plan_id", plan.ID,

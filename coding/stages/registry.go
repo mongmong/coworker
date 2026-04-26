@@ -46,38 +46,10 @@ func NewStageRegistry(workflow string, defaults map[string][]string, policy *cor
 	// Apply policy overrides if present.
 	if policy != nil {
 		if wfOverride, ok := policy.WorkflowOverrides[workflow]; ok {
-			if stages, ok := wfOverride["stages"]; ok {
-				// stages is map[string][]string encoded as the YAML value.
-				// core.Policy.WorkflowOverrides is map[string]map[string][]string,
-				// but the inner map key is stage name and value is role list.
-				//
-				// policy.WorkflowOverrides["build-from-prd"]["stages"] is not quite
-				// right — the YAML structure is:
-				//   workflow_overrides:
-				//     build-from-prd:
-				//       stages:
-				//         phase-review: [...]
-				//
-				// WorkflowOverrides[workflow] is map[string][]string where each key
-				// under "stages" is a stage name. However the YAML parses the
-				// nested "stages:" key as its own entry in the inner map, so the
-				// inner map key is "stages" and value is nil ([]string). The stage
-				// names are nested one level deeper.
-				//
-				// We handle this by checking whether WorkflowOverrides[workflow] has
-				// a "stages" key. If it does, the actual stage keys live in a separate
-				// nested map that requires a different decoding. Since core.Policy uses
-				// map[string]map[string][]string, the nesting cannot represent the
-				// three-level YAML structure directly.
-				//
-				// Resolution: treat WorkflowOverrides[workflow] as the stages map
-				// directly (skipping the intermediate "stages:" key). This matches
-				// how callers that build Policy in tests will set it up.
-				_ = stages // suppress unused warning; handled below
-			}
-
 			// Treat every key in wfOverride as a stage name → role list override.
-			// This matches the direct-stages encoding described above.
+			// The intermediate "stages:" YAML key cannot be represented in
+			// core.Policy's map[string]map[string][]string type, so callers
+			// (and tests) set stage names directly as keys in the inner map.
 			for stage, roleList := range wfOverride {
 				if stage == "stages" {
 					// Reserved YAML key used as a namespace in config; skip.
