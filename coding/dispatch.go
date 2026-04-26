@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -39,6 +40,16 @@ type Dispatcher struct {
 	// WorkDir is the working directory for git-based predicates.
 	// If empty, git predicates use the current working directory.
 	WorkDir string
+
+	// Policy is the effective merged policy. When non-nil it is consulted for
+	// permission enforcement (e.g. on_undeclared). When nil, all undeclared
+	// actions default to hard-fail (most restrictive).
+	Policy *core.Policy
+
+	// AttentionStore is used to create attention.permission items when an
+	// action matches the requires_human permission list. Optional; no item is
+	// created when nil.
+	AttentionStore *store.AttentionStore
 }
 
 // DispatchInput contains the inputs for a dispatch operation.
@@ -208,6 +219,68 @@ func (d *Dispatcher) Orchestrate(ctx context.Context, input *DispatchInput) (*Di
 	}, nil
 }
 
+// checkPermission evaluates whether the dispatcher is allowed to launch the
+// given CLI binary for the given role. binaryName must be a binary basename
+// (e.g. "codex"), not a full path. It:
+//   - Returns nil if the action is explicitly allowed.
+//   - Returns an error (hard-fail) if the action is in the never list.
+//   - Creates an attention.permission item and returns an error if the action
+//     requires human approval.
+//   - Returns an error (hard-fail) on undeclared actions when policy is
+//     "deny" (default). Returns nil with a warning log when policy is "warn".
+func (d *Dispatcher) checkPermission(ctx context.Context, logger *slog.Logger, runID string, role *core.Role, binaryName string) error {
+	// Ensure we have just the basename in case a full path is supplied.
+	binaryName = filepath.Base(binaryName)
+	action := core.Permission{
+		Kind:    core.PermKindBash,
+		Subject: binaryName,
+		Raw:     "bash:" + binaryName,
+	}
+
+	decision := core.EvaluateAction(role.Permissions, action)
+	switch decision {
+	case core.PermDecisionAllow:
+		return nil
+
+	case core.PermDecisionHardDeny:
+		return fmt.Errorf("role %q is not permitted to execute %s (matched 'never')", role.Name, action.Raw)
+
+	case core.PermDecisionRequiresHuman:
+		// Create an attention.permission item so a human can approve.
+		if d.AttentionStore != nil && d.DB != nil {
+			item := &core.AttentionItem{
+				ID:       core.NewID(),
+				RunID:    runID,
+				Kind:     core.AttentionPermission,
+				Source:   "dispatch",
+				Question: fmt.Sprintf("Role %q requests permission to execute %s", role.Name, action.Raw),
+			}
+			if insertErr := d.AttentionStore.InsertAttention(ctx, item); insertErr != nil {
+				logger.Error("failed to insert attention.permission item", "error", insertErr, "role", role.Name, "action", action.Raw)
+				// Proceed to hard-fail even if insert fails.
+				return fmt.Errorf("role %q requires human approval to execute %s (attention insert failed: %w)", role.Name, action.Raw, insertErr)
+			}
+			return fmt.Errorf("role %q requires human approval to execute %s (attention ID: %s)", role.Name, action.Raw, item.ID)
+		}
+		return fmt.Errorf("role %q requires human approval to execute %s", role.Name, action.Raw)
+
+	default: // PermDecisionUndeclared
+		onUndeclared := "deny"
+		if d.Policy != nil {
+			onUndeclared = d.Policy.PermissionPolicy.OnUndeclared
+		}
+		if onUndeclared == "warn" {
+			logger.Warn("undeclared permission: proceeding (on_undeclared=warn)",
+				"role", role.Name,
+				"action", action.Raw,
+			)
+			return nil
+		}
+		// Default: hard-fail.
+		return fmt.Errorf("role %q is not permitted to execute %s (undeclared action; set policy.permissions.on_undeclared=warn to allow in development)", role.Name, action.Raw)
+	}
+}
+
 func (d *Dispatcher) executeAttempt(
 	ctx context.Context,
 	logger *slog.Logger,
@@ -242,6 +315,19 @@ func (d *Dispatcher) executeAttempt(
 
 	if err := jobStore.UpdateJobState(ctx, jobID, core.JobStateDispatched); err != nil {
 		return nil, fmt.Errorf("update job to dispatched: %w", err)
+	}
+
+	// Permission check: verify that the role is allowed to invoke the agent binary.
+	// We use a BinaryBasename() interface assertion so the check is cleanly
+	// opt-in for non-CLI agent implementations (e.g., test stubs).
+	if binaryAgent, ok := d.Agent.(interface{ BinaryBasename() string }); ok {
+		binaryName := binaryAgent.BinaryBasename()
+		if binaryName != "" {
+			if permErr := d.checkPermission(ctx, logger, runID, role, binaryName); permErr != nil {
+				jobStore.UpdateJobState(ctx, jobID, core.JobStateFailed) //nolint:errcheck
+				return nil, permErr
+			}
+		}
 	}
 
 	handle, err := d.Agent.Dispatch(ctx, job, prompt)

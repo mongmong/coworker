@@ -27,6 +27,20 @@ func NewCliAgent(binaryPath string, args ...string) *CliAgent {
 	}
 }
 
+// BinaryBasename returns the base name of the CLI binary for permission checks.
+// For example, "/usr/bin/codex" returns "codex".
+func (a *CliAgent) BinaryBasename() string {
+	if a.BinaryPath == "" {
+		return ""
+	}
+	// Use strings.LastIndexByte to avoid importing path/filepath here.
+	idx := len(a.BinaryPath) - 1
+	for idx >= 0 && a.BinaryPath[idx] != '/' && a.BinaryPath[idx] != '\\' {
+		idx--
+	}
+	return a.BinaryPath[idx+1:]
+}
+
 // Dispatch starts a job by executing the CLI binary with the prompt
 // on stdin. Returns a JobHandle to wait for the result.
 func (a *CliAgent) Dispatch(ctx context.Context, job *core.Job, prompt string) (core.JobHandle, error) {

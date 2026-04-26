@@ -27,6 +27,7 @@ permissions:
     - read
     - grep
     - glob
+    - "bash:opencode"
   never:
     - write
     - edit

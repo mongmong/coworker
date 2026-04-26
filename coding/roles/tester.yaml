@@ -26,6 +26,7 @@ permissions:
     - glob
     - "bash:go"
     - "bash:git"
+    - "bash:claude"
   never:
     - "bash:sudo"
     - "bash:rm -rf"

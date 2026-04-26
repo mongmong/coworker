@@ -38,8 +38,9 @@ func TestLoadRole_ReviewerArch(t *testing.T) {
 	if role.Budget.MaxCostUSD != 5.00 {
 		t.Errorf("budget.max_cost_usd = %f, want 5.00", role.Budget.MaxCostUSD)
 	}
-	if len(role.Permissions.AllowedTools) != 3 {
-		t.Errorf("permissions.allowed_tools length = %d, want 3", len(role.Permissions.AllowedTools))
+	// 4 allowed tools: read, grep, glob, bash:codex (the CLI binary entry).
+	if len(role.Permissions.AllowedTools) != 4 {
+		t.Errorf("permissions.allowed_tools length = %d, want 4", len(role.Permissions.AllowedTools))
 	}
 }
 

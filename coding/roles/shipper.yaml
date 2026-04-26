@@ -18,9 +18,9 @@ sandbox: workspace-write
 permissions:
   allowed_tools:
     - read
-    - bash
-    - git
-    - gh
+    - "bash:git"
+    - "bash:gh"
+    - "bash:claude"
   never:
     - "bash:rm -rf"
   requires_human: []

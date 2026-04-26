@@ -24,7 +24,7 @@ func DefaultPolicy() *core.Policy {
 			MaxParallelReviewers: 3,
 		},
 		PermissionPolicy: core.PermissionPolicy{
-			OnUndeclared: "block",
+			OnUndeclared: "deny",
 		},
 		WorkflowOverrides: make(map[string]map[string][]string),
 		Source:            map[string]string{},

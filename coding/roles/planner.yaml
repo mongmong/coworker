@@ -21,6 +21,7 @@ permissions:
     - grep
     - glob
     - write
+    - "bash:claude"
   never:
     - "bash:rm"
     - "bash:sudo"

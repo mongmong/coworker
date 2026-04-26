@@ -55,7 +55,7 @@ concurrency:
   max_parallel_reviewers: 3
 
 permissions:
-  on_undeclared: block
+  on_undeclared: deny
 `
 
 // gitignoreEntries lists the lines appended to .gitignore by coworker init.

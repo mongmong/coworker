@@ -17,6 +17,7 @@ permissions:
     - read
     - grep
     - glob
+    - "bash:codex"
   never:
     - write
     - edit

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/chris/coworker/agent"
@@ -13,6 +14,16 @@ import (
 	"github.com/chris/coworker/core"
 	"github.com/chris/coworker/store"
 )
+
+// warnPolicy returns a minimal Policy with on_undeclared=warn.
+// Use this in tests that exercise supervisor/retry logic but don't test
+// permission enforcement — it prevents permission hard-fails when the mock
+// binary basename doesn't match the role's allowed_tools.
+func warnPolicy() *core.Policy {
+	return &core.Policy{
+		PermissionPolicy: core.PermissionPolicy{OnUndeclared: "warn"},
+	}
+}
 
 type stubJobHandle struct {
 	wait func(ctx context.Context) (*core.JobResult, error)
@@ -265,6 +276,7 @@ rules:
 		DB:         db,
 		Supervisor: engine,
 		MaxRetries: 3,
+		Policy:     warnPolicy(), // mock binary basename differs from allowed_tools; test supervisor logic only
 	}
 
 	ctx := context.Background()
@@ -356,6 +368,7 @@ rules:
 		Agent:      agent.NewCliAgent(mockBin),
 		DB:         db,
 		Supervisor: engine,
+		Policy:     warnPolicy(), // mock binary basename differs from allowed_tools; test supervisor logic only
 	}
 
 	ctx := context.Background()
@@ -662,6 +675,257 @@ rules:
 	}
 	if agent.dispatches != 1 {
 		t.Fatalf("dispatches = %d, want 1", agent.dispatches)
+	}
+}
+
+// ---- Permission enforcement tests -------------------------------------------
+
+// makeMockDispatcher returns a Dispatcher wired to a namedCountingAgent whose
+// BinaryBasename returns binaryBasename. The default RoleDir points to
+// coding/roles so tests that override it must set d.RoleDir after construction.
+func makeMockDispatcher(t *testing.T, binaryBasename string, db *store.DB, policy *core.Policy, attnStore *store.AttentionStore) (*Dispatcher, *countingAgent) {
+	t.Helper()
+	repoRoot := findRepoRoot(t)
+
+	ca := &countingAgent{
+		wait: func(_ context.Context, _ *core.Job, _ string) (*core.JobResult, error) {
+			return &core.JobResult{ExitCode: 0}, nil
+		},
+	}
+	wrapped := &namedCountingAgent{countingAgent: ca, name: binaryBasename}
+
+	d := &Dispatcher{
+		RoleDir:        filepath.Join(repoRoot, "coding", "roles"),
+		PromptDir:      filepath.Join(repoRoot, "coding"),
+		Agent:          wrapped,
+		DB:             db,
+		Policy:         policy,
+		AttentionStore: attnStore,
+	}
+	return d, ca
+}
+
+// namedCountingAgent wraps countingAgent with a BinaryBasename method.
+type namedCountingAgent struct {
+	*countingAgent
+	name string
+}
+
+func (a *namedCountingAgent) BinaryBasename() string { return a.name }
+
+func TestOrchestrate_PermissionAllow(t *testing.T) {
+	// Role reviewer.arch has "bash:codex" in allowed_tools. Agent binary is "codex".
+	// Expect: dispatch succeeds.
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script mock requires unix")
+	}
+
+	repoRoot := findRepoRoot(t)
+	db, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	d, ca := makeMockDispatcher(t, "codex", db, &core.Policy{
+		PermissionPolicy: core.PermissionPolicy{OnUndeclared: "deny"},
+	}, nil)
+	d.RoleDir = filepath.Join(repoRoot, "coding", "roles")
+
+	_, err = d.Orchestrate(context.Background(), &DispatchInput{
+		RoleName: "reviewer.arch",
+		Inputs: map[string]string{
+			"diff_path": "/tmp/test.diff",
+			"spec_path": "/tmp/spec.md",
+		},
+	})
+	if err != nil {
+		t.Fatalf("expected success, got error: %v", err)
+	}
+	if ca.dispatches != 1 {
+		t.Errorf("dispatches = %d, want 1", ca.dispatches)
+	}
+}
+
+func TestOrchestrate_PermissionHardDeny(t *testing.T) {
+	// reviewer.arch has "bash:rm" in never. If agent binary is "rm" it should hard-fail.
+	db, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	repoRoot := findRepoRoot(t)
+	d, ca := makeMockDispatcher(t, "rm", db, &core.Policy{
+		PermissionPolicy: core.PermissionPolicy{OnUndeclared: "deny"},
+	}, nil)
+	d.RoleDir = filepath.Join(repoRoot, "coding", "roles")
+
+	_, err = d.Orchestrate(context.Background(), &DispatchInput{
+		RoleName: "reviewer.arch",
+		Inputs: map[string]string{
+			"diff_path": "/tmp/test.diff",
+			"spec_path": "/tmp/spec.md",
+		},
+	})
+	if err == nil {
+		t.Fatal("expected permission error, got nil")
+	}
+	if !strings.Contains(err.Error(), "never") {
+		t.Errorf("error should mention 'never', got: %v", err)
+	}
+	// No subprocess should have been started.
+	if ca.dispatches != 0 {
+		t.Errorf("dispatches = %d, want 0 (no subprocess should start)", ca.dispatches)
+	}
+}
+
+func TestOrchestrate_PermissionUndeclaredDeny(t *testing.T) {
+	// Agent binary is "something-not-listed". Policy on_undeclared=deny (default).
+	db, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	repoRoot := findRepoRoot(t)
+	d, ca := makeMockDispatcher(t, "something-not-listed", db, &core.Policy{
+		PermissionPolicy: core.PermissionPolicy{OnUndeclared: "deny"},
+	}, nil)
+	d.RoleDir = filepath.Join(repoRoot, "coding", "roles")
+
+	_, err = d.Orchestrate(context.Background(), &DispatchInput{
+		RoleName: "reviewer.arch",
+		Inputs: map[string]string{
+			"diff_path": "/tmp/test.diff",
+			"spec_path": "/tmp/spec.md",
+		},
+	})
+	if err == nil {
+		t.Fatal("expected permission error, got nil")
+	}
+	if !strings.Contains(err.Error(), "undeclared") {
+		t.Errorf("error should mention 'undeclared', got: %v", err)
+	}
+	if ca.dispatches != 0 {
+		t.Errorf("dispatches = %d, want 0", ca.dispatches)
+	}
+}
+
+func TestOrchestrate_PermissionUndeclaredWarn(t *testing.T) {
+	// Agent binary is "something-not-listed". Policy on_undeclared=warn → proceeds.
+	db, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	repoRoot := findRepoRoot(t)
+	d, ca := makeMockDispatcher(t, "something-not-listed", db, &core.Policy{
+		PermissionPolicy: core.PermissionPolicy{OnUndeclared: "warn"},
+	}, nil)
+	d.RoleDir = filepath.Join(repoRoot, "coding", "roles")
+
+	_, err = d.Orchestrate(context.Background(), &DispatchInput{
+		RoleName: "reviewer.arch",
+		Inputs: map[string]string{
+			"diff_path": "/tmp/test.diff",
+			"spec_path": "/tmp/spec.md",
+		},
+	})
+	if err != nil {
+		t.Fatalf("expected success with warn policy, got: %v", err)
+	}
+	if ca.dispatches != 1 {
+		t.Errorf("dispatches = %d, want 1", ca.dispatches)
+	}
+}
+
+func TestOrchestrate_PermissionRequiresHuman_WithAttentionStore(t *testing.T) {
+	// Build a custom role (in a temp dir) with "bash:special" in requires_human.
+	// Expect: attention.permission item created AND hard-fail returned.
+	db, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	// Write a custom role YAML to a temp directory.
+	tmpRoleDir := t.TempDir()
+	tmpPromptDir := t.TempDir()
+	roleYAML := `
+name: testrole
+concurrency: single
+cli: special
+prompt_template: prompt.md
+inputs:
+  required:
+    - some_input
+permissions:
+  allowed_tools:
+    - read
+  never: []
+  requires_human:
+    - "bash:special"
+`
+	if writeErr := os.WriteFile(filepath.Join(tmpRoleDir, "testrole.yaml"), []byte(roleYAML), 0o600); writeErr != nil {
+		t.Fatalf("write role: %v", writeErr)
+	}
+	// Write a minimal prompt template.
+	if writeErr := os.WriteFile(filepath.Join(tmpPromptDir, "prompt.md"), []byte("hello {{.SomeInput}}"), 0o600); writeErr != nil {
+		t.Fatalf("write prompt: %v", writeErr)
+	}
+
+	attnStore := store.NewAttentionStore(db)
+
+	// We also need a run row so the attention FK doesn't fail. The Dispatcher
+	// creates the run before the permission check, so FK constraint is satisfied.
+	ca := &countingAgent{
+		wait: func(ctx context.Context, _ *core.Job, _ string) (*core.JobResult, error) {
+			return &core.JobResult{ExitCode: 0}, nil
+		},
+	}
+	wrapped := &namedCountingAgent{countingAgent: ca, name: "special"}
+
+	d := &Dispatcher{
+		RoleDir:        tmpRoleDir,
+		PromptDir:      tmpPromptDir,
+		Agent:          wrapped,
+		DB:             db,
+		Policy:         &core.Policy{PermissionPolicy: core.PermissionPolicy{OnUndeclared: "deny"}},
+		AttentionStore: attnStore,
+	}
+
+	_, err = d.Orchestrate(context.Background(), &DispatchInput{
+		RoleName: "testrole",
+		Inputs:   map[string]string{"some_input": "value"},
+	})
+	if err == nil {
+		t.Fatal("expected requires_human hard-fail, got nil")
+	}
+	if !strings.Contains(err.Error(), "requires human approval") {
+		t.Errorf("error should mention 'requires human approval', got: %v", err)
+	}
+
+	// Verify the attention.permission item was created by querying all pending items.
+	ctx := context.Background()
+	pending, listErr := attnStore.ListAllPending(ctx)
+	if listErr != nil {
+		t.Fatalf("ListAllPending: %v", listErr)
+	}
+	var permItems []*core.AttentionItem
+	for _, item := range pending {
+		if item.Kind == core.AttentionPermission {
+			permItems = append(permItems, item)
+		}
+	}
+	if len(permItems) == 0 {
+		t.Error("expected at least one attention.permission item to be created")
+	}
+
+	// No subprocess should have been started.
+	if ca.dispatches != 0 {
+		t.Errorf("dispatches = %d, want 0", ca.dispatches)
 	}
 }
 
