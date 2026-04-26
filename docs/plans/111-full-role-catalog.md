@@ -151,6 +151,81 @@ Tests:
 
 ## Code Review
 
+### External code review — 2026-04-20
+
+**[OPEN] Critical: `path.Match("web/**", ...)` silently fails for nested paths**
+`predicates.go:263-280`. `path.Match` does not treat `**` as a multi-segment
+wildcard — it only matches a literal `*` within a single path segment. As a
+result, `path.Match("web/**", "web/components/Button.tsx")` returns `false`
+while `path.Match("web/**", "web/app.tsx")` returns `true` (only one level
+deep). The `reviewer_frontend.yaml` and tests both advertise `web/**` support,
+but the advertised semantics are silently broken for real-world frontend trees
+where components live in subdirectories. The basename fallback (`!strings.Contains(g, "/")`)
+does not help here because `web/**` contains a slash.
+Fix: replace `path.Match` with `doublestar.Match` from `bmatcuk/doublestar`
+(zero-dependency, MIT) or implement a recursive split: try `path.Match` against
+the full path, and if the glob ends in `/**` also try `strings.HasPrefix(file, prefix+"/")`.
+File: `coding/supervisor/predicates.go:263`.
+
+**[OPEN] Important: `web/**` glob is neither tested at the nested-path level nor
+guarded by a validator warning**
+`integration_test.go:199` — `TestAppliesWhen_FiresWhenFileMatches` uses
+`Button.tsx` at root (matched by `*.tsx`) as the trigger file when the
+`applies_when` block also contains `"web/**"`. No test exercises
+`web/components/Button.tsx` against `"web/**"` and verifies it matches.
+Given the `path.Match` limitation above, a test would also fail. Add a
+`TestChangesTouch_NestedWebPath` case that commits `web/components/Button.tsx`
+and asserts `changes_touch(["web/**"])` returns true.
+
+**[OPEN] Important: `SkippedMessages()` returns `RuleName`, not `Message` —
+asymmetric with `FailedMessages()`**
+`core/supervisor.go:40`. `FailedMessages()` returns `r.Message` (the
+human-readable rule failure string). `SkippedMessages()` returns `r.RuleName`
+(the machine identifier). The naming and docstring say "messages", but the
+contents are names. This asymmetry will confuse callers that log or display
+both lists. Either (a) rename to `SkippedRuleNames()` and update all call
+sites and tests, or (b) store a skip message in `RuleResult.Message` for
+skipped rules (currently it copies `rule.Message`, the original contract
+message, which is also misleading). The plan spec says "mirror of
+`FailedMessages()` for tracing" (`docs/plans/111-full-role-catalog.md:122`)
+which implies it should return message strings, not names.
+
+**[OPEN] Important: `applies_when` evaluation error is not tested**
+`engine.go:63-71`. When `EvalAppliesWhen` returns an error (e.g., invalid glob,
+git not available), the engine sets `verdict.Pass = false` and appends a
+`RuleResult` with `Passed: false` and `Skipped: false`. This path is
+load-bearing — it prevents silent pass on evaluation failures — but has no
+test coverage. Add a test that injects a rule with an invalid glob pattern in
+`applies_when.changes_touch` (e.g., `"[invalid"`) and asserts `verdict.Pass`
+is false and the result message contains "applies_when eval error".
+
+**[OPEN] Suggestion: `reviewer_frontend.yaml` has `applies_when` that core.Role
+cannot deserialize — silent field drop**
+`coding/roles/reviewer_frontend.yaml:16-24`. The `core.Role` struct has no
+`AppliesWhen` field, so the `applies_when` block in the role YAML is silently
+dropped by the YAML parser when loaded via `coding/roles` package. The self-
+review notes this is intentional (Plan 114 will wire it), but there is no
+warning at load time and no compile-time guard. This risks a future reader
+assuming the field is already wired. Consider adding a `AppliesWhen *struct{...}`
+placeholder with a `// not yet evaluated; owned by Plan 114` comment in
+`core/role.go`, or add a YAML strict-decoder check in the roles loader that
+at minimum logs a warning for unknown keys.
+
+**[OPEN] Suggestion: `gitDiffChangedFiles` falls back to empty-tree on ANY
+error, not just "no parent" errors**
+`predicates.go:336-345`. The fallback from `HEAD~1..HEAD` to
+`emptyTree..HEAD` is triggered on any `cmd.Output()` error, not specifically
+`exit status 128` (unknown revision). A transient git error (disk full,
+permissions issue, corrupted repo) would silently produce an empty-tree diff
+instead of propagating the error. Tighten the fallback: check
+`strings.Contains(err.Error(), "unknown revision")` or parse the exit code
+before falling back.
+
+**[FIXED — self-review] `core/event.go` gofmt alignment**
+**[WONTFIX — self-review] `EvalAppliesWhen` exported**
+**[WONTFIX — self-review] empty-tree fallback on error**
+**[WONTFIX — self-review] role YAML `applies_when` not yet evaluated**
+
 ### Self-review findings
 
 **[FIXED] `core/event.go` gofmt alignment** — Inserting the `EventJobSkipped`
