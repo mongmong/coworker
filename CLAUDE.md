@@ -142,14 +142,29 @@ Follow `docs/development-workflow.md` exactly for every plan (Steps 1–6: Desig
 - **Review before ship** — code review findings in plan file, all `[OPEN]` items resolved.
 - **Ship cleanly** — post-execution report, update `decisions.md` + `TODO.md`, then PR.
 
-## Code Review
+## Reviews
 
 Follow `docs/code-review.md`. Key points:
 
 - Reviews go in the plan file's `## Code Review` section.
 - Reviewers: append findings with `[OPEN]` status and file:line references.
 - Authors: respond inline with `→ Response:` and `[FIXED]` / `[WONTFIX]`.
-- **Use Codex (GPT-5.5) for code reviews.** Dispatch via `codex:codex-rescue` subagent type with the review prompt, diff range (BASE_SHA..HEAD_SHA), and review focus areas. Codex's sandboxed execution lets it run `go test -race`, `go vet`, and read all files independently — producing a fresh-context review without Claude's session bias. Write Codex's findings into the plan file's Code Review section, then fix findings inline.
+
+**Claude must use Codex (GPT-5.5) for ALL reviews.** This includes — without exception:
+
+- **Pre-implementation plan review** — before writing code, dispatch the plan to Codex to catch design issues, missing requirements, and spec misalignment.
+- **Post-implementation code review** — after committing, dispatch the diff range (BASE_SHA..HEAD_SHA) to Codex.
+- **Spec/manifest review** — when amending `docs/specs/` or `docs/specs/001-plan-manifest.md`, dispatch to Codex.
+- **PR review** — when reviewing pull requests, dispatch to Codex.
+
+Dispatch via the `codex:codex-rescue` subagent type with the artifact (plan file path, diff range, or spec section) and explicit review focus areas. Codex's sandboxed execution lets it run `go test -race`, `go vet`, and read files independently — producing a fresh-context review without Claude's session bias.
+
+Claude does NOT perform reviews directly via the `superpowers:code-reviewer` subagent or any other Claude-backed reviewer. Claude's role in reviews is limited to:
+1. Crafting the review prompt and dispatching to Codex.
+2. Recording Codex's findings in the plan file's `## Code Review` section.
+3. Fixing the findings (or deferring with explicit `[WONTFIX]` justification).
+
+If Codex is unavailable (model access error, runtime offline), STOP and tell the user — do not silently fall back to Claude review. The user can choose to wait, fix Codex access, or explicitly authorize a Claude-backed review for the specific case.
 
 ## Codex Delegation (GPT-5.5)
 
