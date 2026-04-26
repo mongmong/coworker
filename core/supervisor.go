@@ -5,6 +5,15 @@ const (
 	EventSupervisorVerdict EventKind = "supervisor.verdict"
 	EventSupervisorRetry   EventKind = "supervisor.retry"
 	EventComplianceBreach  EventKind = "compliance-breach"
+
+	// Quality sub-behavior event kinds (Plan 112).
+	// EventQualityVerdict is emitted for every quality rule verdict
+	// (advisory or blocking) at checkpoint time.
+	EventQualityVerdict EventKind = "quality.verdict"
+	// EventQualityGate is emitted when blocking quality findings remain
+	// after max retries, escalating to an always-blocking gate.
+	// Policy cannot weaken this checkpoint.
+	EventQualityGate EventKind = "quality-gate"
 )
 
 type SupervisorVerdict struct {

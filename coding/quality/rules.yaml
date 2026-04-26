@@ -1,0 +1,75 @@
+# Default quality rules for the supervisor quality sub-behavior.
+# Rules with severity: block and a block-capable category may create attention
+# items and halt progress after max retries. All other rules are advisory
+# (logged to the adherence report but do not block).
+#
+# Block-capable categories (hard-coded per spec):
+#   - missing_required_tests
+#   - spec_contradiction
+#   - security_sensitive_unreviewed_change
+#   - shipper_report_missing
+quality_rules:
+  missing_required_tests:
+    category: missing_required_tests
+    prompt: |
+      Review the diff. Are there new exported functions or methods without
+      corresponding test coverage? Consider any *_test.go files in the diff.
+      Answer with a single JSON object:
+      {"pass": <bool>, "category": "missing_required_tests", "findings": ["<issue>", ...], "confidence": <0.0-1.0>}
+      If the criterion is satisfied, set "pass" to true and "findings" to [].
+    severity: block
+
+  spec_contradiction:
+    category: spec_contradiction
+    prompt: |
+      Does the implementation in the diff contradict the spec requirements
+      provided in the context? Look for semantic mismatches, missing required
+      behaviors, or behaviors that the spec explicitly forbids.
+      Answer with a single JSON object:
+      {"pass": <bool>, "category": "spec_contradiction", "findings": ["<issue>", ...], "confidence": <0.0-1.0>}
+      If the criterion is satisfied, set "pass" to true and "findings" to [].
+    severity: block
+
+  security_sensitive_unreviewed_change:
+    category: security_sensitive_unreviewed_change
+    prompt: |
+      Does the diff contain security-sensitive changes — authentication, crypto,
+      secret handling, SQL queries, network calls, permission checks — that have
+      not been reviewed by a reviewer.arch or reviewer.security job in this run?
+      Answer with a single JSON object:
+      {"pass": <bool>, "category": "security_sensitive_unreviewed_change", "findings": ["<issue>", ...], "confidence": <0.0-1.0>}
+      If the criterion is satisfied, set "pass" to true and "findings" to [].
+    severity: block
+
+  shipper_report_missing:
+    category: shipper_report_missing
+    prompt: |
+      For shipper jobs: does the plan file referenced in context contain a
+      non-empty "## Post-Execution Report" section? The section must have at
+      least a few lines of substantive content describing what was done.
+      Answer with a single JSON object:
+      {"pass": <bool>, "category": "shipper_report_missing", "findings": ["<issue>", ...], "confidence": <0.0-1.0>}
+      If the criterion is satisfied, set "pass" to true and "findings" to [].
+    severity: block
+
+  spec_adherence:
+    category: spec_adherence
+    prompt: |
+      Does the implementation broadly match the spec requirements in spirit
+      and structure? This is an advisory check — small deviations are acceptable
+      but notable drift should be flagged.
+      Answer with a single JSON object:
+      {"pass": <bool>, "category": "spec_adherence", "findings": ["<issue>", ...], "confidence": <0.0-1.0>}
+      If the criterion is satisfied, set "pass" to true and "findings" to [].
+    severity: advisory
+
+  review_coverage_depth:
+    category: review_coverage_depth
+    prompt: |
+      Are the reviewer findings in the context substantive and line-anchored,
+      covering the key risk areas in the diff? Flag if findings are vague,
+      missing line references, or appear to ignore obvious concerns.
+      Answer with a single JSON object:
+      {"pass": <bool>, "category": "review_coverage_depth", "findings": ["<issue>", ...], "confidence": <0.0-1.0>}
+      If the criterion is satisfied, set "pass" to true and "findings" to [].
+    severity: advisory
