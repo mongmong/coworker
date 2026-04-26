@@ -205,3 +205,145 @@ func TestAttentionStore_AnswerAttention_AnsweredOnPopulated(t *testing.T) {
 		t.Errorf("AnsweredOn = %v, want [\"tui\"]", retrieved.AnsweredOn)
 	}
 }
+
+// TestAttentionStore_GetUnansweredCheckpointForRun tests the filter logic for
+// GetUnansweredCheckpointForRun across all expected cases.
+func TestAttentionStore_GetUnansweredCheckpointForRun(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	db := setupTestDB(t)
+	runID := "run_checkpoint_filter_test"
+	otherRunID := "run_other_checkpoint"
+	mustCreateRunForAttention(t, db, ctx, runID)
+	mustCreateRunForAttention(t, db, ctx, otherRunID)
+
+	as := NewAttentionStore(db)
+
+	t.Run("no items returns nil", func(t *testing.T) {
+		got, err := as.GetUnansweredCheckpointForRun(ctx, runID, "phase-loop")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != nil {
+			t.Errorf("expected nil when no items exist, got %+v", got)
+		}
+	})
+
+	t.Run("answered checkpoint returns nil", func(t *testing.T) {
+		item := &core.AttentionItem{
+			RunID:  runID,
+			Kind:   core.AttentionCheckpoint,
+			Source: "phase-loop",
+		}
+		if err := as.InsertAttention(ctx, item); err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+		// Answer it.
+		if err := as.AnswerAttention(ctx, item.ID, core.AttentionAnswerApprove, "tui"); err != nil {
+			t.Fatalf("answer: %v", err)
+		}
+
+		got, err := as.GetUnansweredCheckpointForRun(ctx, runID, "phase-loop")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != nil {
+			t.Errorf("expected nil for answered checkpoint, got %+v", got)
+		}
+	})
+
+	t.Run("wrong kind returns nil", func(t *testing.T) {
+		item := &core.AttentionItem{
+			RunID:  runID,
+			Kind:   core.AttentionQuestion, // not "checkpoint"
+			Source: "phase-loop",
+		}
+		if err := as.InsertAttention(ctx, item); err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+
+		got, err := as.GetUnansweredCheckpointForRun(ctx, runID, "phase-loop")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != nil {
+			t.Errorf("expected nil for wrong kind, got %+v", got)
+		}
+	})
+
+	t.Run("wrong source returns nil", func(t *testing.T) {
+		item := &core.AttentionItem{
+			RunID:  runID,
+			Kind:   core.AttentionCheckpoint,
+			Source: "run-command", // not "phase-loop"
+		}
+		if err := as.InsertAttention(ctx, item); err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+
+		got, err := as.GetUnansweredCheckpointForRun(ctx, runID, "phase-loop")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != nil {
+			t.Errorf("expected nil for wrong source, got %+v", got)
+		}
+	})
+
+	t.Run("matching item returned", func(t *testing.T) {
+		item := &core.AttentionItem{
+			RunID:    runID,
+			Kind:     core.AttentionCheckpoint,
+			Source:   "phase-loop",
+			Question: "Phase did not converge",
+		}
+		if err := as.InsertAttention(ctx, item); err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+
+		got, err := as.GetUnansweredCheckpointForRun(ctx, runID, "phase-loop")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got == nil {
+			t.Fatal("expected item, got nil")
+		}
+		if got.ID != item.ID {
+			t.Errorf("got ID %q, want %q", got.ID, item.ID)
+		}
+		if got.Kind != core.AttentionCheckpoint {
+			t.Errorf("got kind %q, want checkpoint", got.Kind)
+		}
+		if got.Source != "phase-loop" {
+			t.Errorf("got source %q, want phase-loop", got.Source)
+		}
+	})
+
+	t.Run("permission kind not returned", func(t *testing.T) {
+		permItem := &core.AttentionItem{
+			RunID:  runID,
+			Kind:   core.AttentionPermission,
+			Source: "phase-loop",
+		}
+		if err := as.InsertAttention(ctx, permItem); err != nil {
+			t.Fatalf("insert permission item: %v", err)
+		}
+		// The previously inserted matching checkpoint (from "matching item returned")
+		// means we can verify the filter isolates kind=checkpoint.
+		got, err := as.GetUnansweredCheckpointForRun(ctx, runID, "phase-loop")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		// Should still return the checkpoint item (not the permission item).
+		if got == nil {
+			t.Fatal("expected checkpoint item, got nil")
+		}
+		if got.Kind != core.AttentionCheckpoint {
+			t.Errorf("got kind %q, want checkpoint", got.Kind)
+		}
+		if got.ID == permItem.ID {
+			t.Error("returned the permission item instead of the checkpoint item")
+		}
+	})
+}

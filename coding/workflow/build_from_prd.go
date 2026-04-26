@@ -240,6 +240,30 @@ func (w *BuildFromPRDWorkflow) RunPhasesForPlan(
 			"fix_cycles", result.FixCycles,
 			"findings", len(result.Findings),
 		)
+
+		// B-4: if the phase did not converge, stop the workflow and surface the
+		// attention item created by the fix-loop exhaustion path.
+		if !result.Clean {
+			out := &RunPhasesResult{
+				PhaseResults:        phaseResults,
+				StoppedAtPhaseClean: true,
+				DirtyPhaseIndex:     i,
+				DirtyPhaseName:      phaseName,
+			}
+			if w.PhaseExecutor.AttentionStore != nil {
+				item, getErr := w.PhaseExecutor.AttentionStore.GetUnansweredCheckpointForRun(ctx, runID, "phase-loop")
+				if getErr == nil && item != nil {
+					out.AttentionItemID = item.ID
+				}
+			}
+			log.Warn("phase-clean block: stopping workflow",
+				"plan_id", plan.ID,
+				"phase_index", i,
+				"phase_name", phaseName,
+				"attention_id", out.AttentionItemID,
+			)
+			return out, nil
+		}
 	}
 
 	out := &RunPhasesResult{PhaseResults: phaseResults}
@@ -272,6 +296,24 @@ type RunPhasesResult struct {
 	// ShipResult is the output of the ship step.
 	// Nil when no Shipper is configured or shipping was not attempted.
 	ShipResult *shipper.ShipResult
+
+	// StoppedAtPhaseClean is true when workflow was halted because a phase
+	// returned Clean==false (fix-loop exhausted). When true, the Shipper was
+	// NOT called.
+	StoppedAtPhaseClean bool
+
+	// DirtyPhaseIndex is the zero-based index of the phase that returned
+	// Clean==false. Meaningful only when StoppedAtPhaseClean is true.
+	DirtyPhaseIndex int
+
+	// DirtyPhaseName is the human-readable name of the dirty phase.
+	// Meaningful only when StoppedAtPhaseClean is true.
+	DirtyPhaseName string
+
+	// AttentionItemID is the ID of the phase-clean attention item created by
+	// PhaseExecutor for the dirty phase. Empty when no item was found or
+	// AttentionStore is nil.
+	AttentionItemID string
 }
 
 // BuildFromPRDResult holds the output of one scheduling iteration.

@@ -12,6 +12,17 @@ const (
 	AttentionCheckpoint AttentionKind = "checkpoint"
 )
 
+// Standard answer values for checkpoint attention items.
+const (
+	// AttentionAnswerApprove is written by orch_checkpoint_advance and signals
+	// that the checkpoint is approved and the workflow may continue.
+	AttentionAnswerApprove = "approve"
+
+	// AttentionAnswerReject is written by orch_checkpoint_rollback and signals
+	// that the checkpoint was rejected; the run should be aborted.
+	AttentionAnswerReject = "reject"
+)
+
 // AttentionItem is a unified human-input request blocking a run or job.
 type AttentionItem struct {
 	ID          string        `json:"id"`

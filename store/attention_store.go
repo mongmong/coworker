@@ -208,6 +208,27 @@ func (s *AttentionStore) ListUnansweredByRun(ctx context.Context, runID string) 
 	return items, nil
 }
 
+// GetUnansweredCheckpointForRun returns the most-recently-created unanswered
+// attention item with kind="checkpoint" and the given source for the run.
+// Returns nil (not an error) when no matching item exists.
+func (s *AttentionStore) GetUnansweredCheckpointForRun(ctx context.Context, runID, source string) (*core.AttentionItem, error) {
+	query := `SELECT id, run_id, kind, source, job_id, question, options,
+	presented_on, answered_on, answered_by, answer, created_at, resolved_at
+	FROM attention
+	WHERE run_id = ? AND kind = 'checkpoint' AND source = ? AND answer IS NULL
+	ORDER BY created_at DESC LIMIT 1`
+
+	row := s.db.QueryRowContext(ctx, query, runID, source)
+	item, err := scanAttentionItem(row.Scan)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get unanswered checkpoint: %w", err)
+	}
+	return item, nil
+}
+
 // ListAllPending returns all unanswered attention items across all runs.
 func (s *AttentionStore) ListAllPending(ctx context.Context) ([]*core.AttentionItem, error) {
 	query := `SELECT id, run_id, kind, source, job_id, question, options,

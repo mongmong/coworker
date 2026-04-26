@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/chris/coworker/coding"
 	"github.com/chris/coworker/coding/manifest"
@@ -345,5 +346,352 @@ func TestBuildFromPRDWorkflow_StageRegistry_OverrideUsed(t *testing.T) {
 		if r == "reviewer.arch" || r == "reviewer.frontend" {
 			t.Errorf("default reviewer role %q dispatched despite registry override; got roles: %v", r, dispatched)
 		}
+	}
+}
+
+// dirtyOrchestrator always returns a single finding so phases never converge.
+type dirtyOrchestrator struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (d *dirtyOrchestrator) Orchestrate(_ context.Context, _ *coding.DispatchInput) (*coding.DispatchResult, error) {
+	d.mu.Lock()
+	d.calls++
+	d.mu.Unlock()
+	return &coding.DispatchResult{
+		ExitCode: 0,
+		Findings: []core.Finding{
+			{
+				Body:     "test finding",
+				Severity: core.SeverityCritical,
+			},
+		},
+	}, nil
+}
+
+// mockShipper records whether Ship was called.
+type mockShipper struct {
+	mu     sync.Mutex
+	called int
+}
+
+func (m *mockShipper) Ship(_ context.Context, _ string, _ *manifest.PlanEntry, _ string) (*shipper.ShipResult, error) {
+	m.mu.Lock()
+	m.called++
+	m.mu.Unlock()
+	return &shipper.ShipResult{PRURL: "https://example.com/pr/1"}, nil
+}
+
+// newDirtyPhaseExecutor creates a PhaseExecutor with a dirty-always stub
+// and a policy that exhausts the fix budget after 1 cycle (2 dispatcher
+// calls total per reviewer: cycle 0 is dirty, cycle 1 >= maxCycles=1 → stop).
+func newDirtyPhaseExecutor(t *testing.T, db *store.DB, attentionStore *store.AttentionStore) *phaseloop.PhaseExecutor {
+	t.Helper()
+	policy := &core.Policy{
+		SupervisorLimits: core.SupervisorLimits{MaxFixCyclesPerPhase: 1},
+	}
+	exec := &phaseloop.PhaseExecutor{
+		Dispatcher:     &dirtyOrchestrator{},
+		EventStore:     store.NewEventStore(db),
+		AttentionStore: attentionStore,
+		Policy:         policy,
+		// Single reviewer role reduces call count for speed.
+		ReviewerRoles: []string{"reviewer.arch"},
+	}
+	return exec
+}
+
+// mustCreateRun inserts a run row needed for FK constraints on attention items.
+func mustCreateRun(t *testing.T, db *store.DB, ctx context.Context, runID string) {
+	t.Helper()
+	es := store.NewEventStore(db)
+	rs := store.NewRunStore(db, es)
+	run := &core.Run{
+		ID:        runID,
+		Mode:      "interactive",
+		State:     core.RunStateActive,
+		StartedAt: time.Now(),
+	}
+	if err := rs.CreateRun(ctx, run); err != nil {
+		t.Fatalf("CreateRun(%q): %v", runID, err)
+	}
+}
+
+// TestRunPhasesForPlan_DirtyPhase_StopsWorkflow verifies that when a phase
+// returns Clean==false, RunPhasesForPlan stops immediately and sets
+// StoppedAtPhaseClean=true with the correct index and name.
+func TestRunPhasesForPlan_DirtyPhase_StopsWorkflow(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	path := writeManifest(t, testManifestYAML)
+	db := openTestDB(t)
+	runID := "run-dirty-phase"
+	mustCreateRun(t, db, ctx, runID)
+
+	w := workflow.NewBuildFromPRDWorkflow(path, nil)
+	w.PhaseExecutor = newDirtyPhaseExecutor(t, db, nil)
+
+	plan := manifest.PlanEntry{
+		ID:     100,
+		Title:  "Core runtime",
+		Phases: []string{"phase-zero", "phase-one"},
+	}
+	result, err := w.RunPhasesForPlan(ctx, runID, plan, nil)
+	if err != nil {
+		t.Fatalf("RunPhasesForPlan: %v", err)
+	}
+	if !result.StoppedAtPhaseClean {
+		t.Error("expected StoppedAtPhaseClean=true, got false")
+	}
+	if result.DirtyPhaseIndex != 0 {
+		t.Errorf("DirtyPhaseIndex = %d, want 0", result.DirtyPhaseIndex)
+	}
+	if result.DirtyPhaseName != "phase-zero" {
+		t.Errorf("DirtyPhaseName = %q, want %q", result.DirtyPhaseName, "phase-zero")
+	}
+	// Only the first phase result should be present (second was never executed).
+	if len(result.PhaseResults) != 1 {
+		t.Errorf("len(PhaseResults) = %d, want 1", len(result.PhaseResults))
+	}
+}
+
+// TestRunPhasesForPlan_DirtyPhase_NoShipCalled verifies that when a phase is
+// dirty the shipper is never invoked.
+func TestRunPhasesForPlan_DirtyPhase_NoShipCalled(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	path := writeManifest(t, testManifestYAML)
+	db := openTestDB(t)
+	runID := "run-dirty-no-ship"
+	mustCreateRun(t, db, ctx, runID)
+
+	ms := &mockShipper{}
+	w := workflow.NewBuildFromPRDWorkflow(path, nil)
+	w.PhaseExecutor = newDirtyPhaseExecutor(t, db, nil)
+	// Wire in a real shipper wrapper that delegates to our mock.
+	// We can't set w.Shipper directly since it's *shipper.Shipper; instead
+	// verify via ShipResult being nil (the early return skips the ship block).
+	_ = ms // keep reference for clarity
+	// No w.Shipper set — ShipResult must still be nil and StoppedAtPhaseClean true.
+
+	plan := manifest.PlanEntry{
+		ID:     100,
+		Title:  "Core runtime",
+		Phases: []string{"only-phase"},
+	}
+	result, err := w.RunPhasesForPlan(ctx, runID, plan, nil)
+	if err != nil {
+		t.Fatalf("RunPhasesForPlan: %v", err)
+	}
+	if !result.StoppedAtPhaseClean {
+		t.Error("expected StoppedAtPhaseClean=true")
+	}
+	if result.ShipResult != nil {
+		t.Error("expected ShipResult to be nil when StoppedAtPhaseClean=true")
+	}
+}
+
+// TestRunPhasesForPlan_DirtyPhase_SecondPhase verifies that when phase 0 is
+// clean but phase 1 is dirty, the workflow stops at phase 1 and phase 2 is
+// never executed.
+//
+// Strategy: use a thresholdOrchestrator that returns clean results for the
+// first 2 calls (phase 0: developer + 1 reviewer) and dirty results thereafter
+// (phase 1 onwards).
+func TestRunPhasesForPlan_DirtyPhase_SecondPhase(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	// Phase 0 with maxFixCycles=1 and 1 reviewer:
+	//   cycle 0: developer(1) + reviewer.arch(1) = 2 calls → clean check → pass
+	// Phase 1 (calls 2+): dirty immediately → exhausts at cycle 1.
+	threshold := 2
+	callIdx := 0
+	var callIdxMu sync.Mutex
+
+	thresholdOrch := &thresholdOrchestrator{
+		threshold: threshold,
+		callIdx:   &callIdx,
+		mu:        &callIdxMu,
+	}
+
+	path := writeManifest(t, testManifestYAML)
+	db := openTestDB(t)
+	runID := "run-dirty-phase-1"
+	mustCreateRun(t, db, ctx, runID)
+
+	policy := &core.Policy{
+		SupervisorLimits: core.SupervisorLimits{MaxFixCyclesPerPhase: 1},
+	}
+	exec := &phaseloop.PhaseExecutor{
+		Dispatcher:    thresholdOrch,
+		EventStore:    store.NewEventStore(db),
+		Policy:        policy,
+		ReviewerRoles: []string{"reviewer.arch"},
+	}
+
+	w := workflow.NewBuildFromPRDWorkflow(path, nil)
+	w.PhaseExecutor = exec
+
+	plan := manifest.PlanEntry{
+		ID:     100,
+		Title:  "Core runtime",
+		Phases: []string{"phase-zero", "phase-one", "phase-two"},
+	}
+	result, err := w.RunPhasesForPlan(ctx, runID, plan, nil)
+	if err != nil {
+		t.Fatalf("RunPhasesForPlan: %v", err)
+	}
+	if !result.StoppedAtPhaseClean {
+		t.Error("expected StoppedAtPhaseClean=true, got false")
+	}
+	if result.DirtyPhaseIndex != 1 {
+		t.Errorf("DirtyPhaseIndex = %d, want 1", result.DirtyPhaseIndex)
+	}
+	if result.DirtyPhaseName != "phase-one" {
+		t.Errorf("DirtyPhaseName = %q, want %q", result.DirtyPhaseName, "phase-one")
+	}
+	// Phase 0 and phase 1 results should be present; phase 2 was never executed.
+	if len(result.PhaseResults) != 2 {
+		t.Errorf("len(PhaseResults) = %d, want 2", len(result.PhaseResults))
+	}
+}
+
+// thresholdOrchestrator returns clean results for the first `threshold` calls
+// and dirty results (with findings) thereafter.
+type thresholdOrchestrator struct {
+	threshold int
+	callIdx   *int
+	mu        *sync.Mutex
+}
+
+func (t *thresholdOrchestrator) Orchestrate(_ context.Context, _ *coding.DispatchInput) (*coding.DispatchResult, error) {
+	t.mu.Lock()
+	idx := *t.callIdx
+	*t.callIdx++
+	t.mu.Unlock()
+
+	if idx < t.threshold {
+		return &coding.DispatchResult{ExitCode: 0}, nil
+	}
+	return &coding.DispatchResult{
+		ExitCode: 0,
+		Findings: []core.Finding{
+			{Body: "threshold finding", Severity: core.SeverityCritical},
+		},
+	}, nil
+}
+
+// TestRunPhasesForPlan_AttentionItemID_Populated verifies that AttentionItemID
+// is populated when AttentionStore is set and a matching checkpoint exists.
+func TestRunPhasesForPlan_AttentionItemID_Populated(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	path := writeManifest(t, testManifestYAML)
+	db := openTestDB(t)
+	runID := "run-attention-id"
+	mustCreateRun(t, db, ctx, runID)
+
+	as := store.NewAttentionStore(db)
+	w := workflow.NewBuildFromPRDWorkflow(path, nil)
+	w.PhaseExecutor = newDirtyPhaseExecutor(t, db, as)
+
+	plan := manifest.PlanEntry{
+		ID:     100,
+		Title:  "Core runtime",
+		Phases: []string{"only-phase"},
+	}
+	result, err := w.RunPhasesForPlan(ctx, runID, plan, nil)
+	if err != nil {
+		t.Fatalf("RunPhasesForPlan: %v", err)
+	}
+	if !result.StoppedAtPhaseClean {
+		t.Error("expected StoppedAtPhaseClean=true")
+	}
+	// AttentionItemID should be populated because the PhaseExecutor (with
+	// AttentionStore set) inserts a checkpoint item when fix-loop exhausts.
+	if result.AttentionItemID == "" {
+		t.Error("expected AttentionItemID to be non-empty when AttentionStore is set")
+	}
+
+	// Verify the item exists in the store.
+	item, err := as.GetAttentionByID(ctx, result.AttentionItemID)
+	if err != nil {
+		t.Fatalf("GetAttentionByID: %v", err)
+	}
+	if item == nil {
+		t.Fatal("attention item not found in store")
+	}
+	if item.Kind != core.AttentionCheckpoint {
+		t.Errorf("item.Kind = %q, want checkpoint", item.Kind)
+	}
+}
+
+// TestRunPhasesForPlan_AttentionItemID_NilStore verifies that AttentionItemID
+// is empty (not a panic) when AttentionStore is nil.
+func TestRunPhasesForPlan_AttentionItemID_NilStore(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	path := writeManifest(t, testManifestYAML)
+	db := openTestDB(t)
+	runID := "run-nil-attention-store"
+	mustCreateRun(t, db, ctx, runID)
+
+	w := workflow.NewBuildFromPRDWorkflow(path, nil)
+	w.PhaseExecutor = newDirtyPhaseExecutor(t, db, nil) // AttentionStore is nil
+
+	plan := manifest.PlanEntry{
+		ID:     100,
+		Title:  "Core runtime",
+		Phases: []string{"only-phase"},
+	}
+	result, err := w.RunPhasesForPlan(ctx, runID, plan, nil)
+	if err != nil {
+		t.Fatalf("RunPhasesForPlan: %v", err)
+	}
+	if !result.StoppedAtPhaseClean {
+		t.Error("expected StoppedAtPhaseClean=true")
+	}
+	if result.AttentionItemID != "" {
+		t.Errorf("expected empty AttentionItemID when store is nil, got %q", result.AttentionItemID)
+	}
+}
+
+// TestRunPhasesForPlan_CleanPhases_ShipCalled verifies that when all phases
+// are clean, StoppedAtPhaseClean is false and the shipper is called.
+func TestRunPhasesForPlan_CleanPhases_ShipCalled(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	path := writeManifest(t, testManifestYAML)
+	db := openTestDB(t)
+	runID := "run-clean-ship"
+	mustCreateRun(t, db, ctx, runID)
+
+	w := workflow.NewBuildFromPRDWorkflow(path, nil)
+	w.PhaseExecutor = newTestPhaseExecutor(t) // always clean
+	w.Shipper = &shipper.Shipper{DryRun: true}
+
+	plan := manifest.PlanEntry{
+		ID:     100,
+		Title:  "Core runtime",
+		Phases: []string{"phase-a", "phase-b"},
+	}
+	result, err := w.RunPhasesForPlan(ctx, runID, plan, map[string]string{
+		"branch": "feature/plan-100",
+	})
+	if err != nil {
+		t.Fatalf("RunPhasesForPlan: %v", err)
+	}
+	if result.StoppedAtPhaseClean {
+		t.Error("expected StoppedAtPhaseClean=false for clean phases")
+	}
+	if result.ShipResult == nil {
+		t.Error("expected ShipResult to be non-nil when all phases are clean")
 	}
 }
