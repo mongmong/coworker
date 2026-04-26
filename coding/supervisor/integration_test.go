@@ -6,12 +6,13 @@ package supervisor
 // 2. The applies_when.changes_touch predicate correctly skips rules when no
 //    files match and fires rules when they do.
 // 3. Skipped rules do not affect verdict.Pass.
-// 4. SkippedMessages returns the right rule names.
+// 4. SkippedRuleNames returns the right rule names.
 
 import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/chris/coworker/core"
@@ -176,9 +177,9 @@ rules:
 		t.Error("expected result.Skipped=true")
 	}
 
-	skipped := verdict.SkippedMessages()
+	skipped := verdict.SkippedRuleNames()
 	if len(skipped) != 1 || skipped[0] != "frontend_rule" {
-		t.Errorf("SkippedMessages() = %v, want [frontend_rule]", skipped)
+		t.Errorf("SkippedRuleNames() = %v, want [frontend_rule]", skipped)
 	}
 }
 
@@ -228,8 +229,8 @@ rules:
 		t.Error("expected result.Passed=true")
 	}
 
-	if len(verdict.SkippedMessages()) != 0 {
-		t.Errorf("SkippedMessages() = %v, want empty", verdict.SkippedMessages())
+	if len(verdict.SkippedRuleNames()) != 0 {
+		t.Errorf("SkippedRuleNames() = %v, want empty", verdict.SkippedRuleNames())
 	}
 }
 
@@ -283,9 +284,9 @@ rules:
 		t.Fatalf("results count = %d, want 2", len(verdict.Results))
 	}
 
-	skipped := verdict.SkippedMessages()
+	skipped := verdict.SkippedRuleNames()
 	if len(skipped) != 1 {
-		t.Errorf("SkippedMessages() = %v, want exactly 1", skipped)
+		t.Errorf("SkippedRuleNames() = %v, want exactly 1", skipped)
 	}
 
 	failed := verdict.FailedMessages()
@@ -359,6 +360,98 @@ func TestChangesTouch_GlobMatching(t *testing.T) {
 	}
 }
 
+// TestChangesTouch_NestedWebPath verifies that "web/**" matches a deeply
+// nested file such as web/components/Button.tsx (I1).
+func TestChangesTouch_NestedWebPath(t *testing.T) {
+	tmpDir := setupGitRepo(t)
+
+	// Create the nested directory and file.
+	componentsDir := filepath.Join(tmpDir, "web", "components")
+	if err := os.MkdirAll(componentsDir, 0755); err != nil {
+		t.Fatalf("mkdir web/components: %v", err)
+	}
+	writeFile(t, filepath.Join(componentsDir, "Button.tsx"), "export const Button = () => null")
+	runGit(t, tmpDir, "add", ".")
+	runGit(t, tmpDir, "commit", "-m", "Phase 1: add web/components/Button.tsx")
+
+	ctx := &EvalContext{
+		WorkDir: tmpDir,
+		Result:  &core.JobResult{},
+	}
+
+	// "web/**" must match web/components/Button.tsx.
+	passed, err := changesTouch(ctx, []string{"web/**"})
+	if err != nil {
+		t.Fatalf("changesTouch: %v", err)
+	}
+	if !passed {
+		t.Error("expected web/** to match web/components/Button.tsx")
+	}
+
+	// "api/**" must NOT match web/components/Button.tsx.
+	passed, err = changesTouch(ctx, []string{"api/**"})
+	if err != nil {
+		t.Fatalf("changesTouch: %v", err)
+	}
+	if passed {
+		t.Error("expected api/** NOT to match web/components/Button.tsx")
+	}
+}
+
+// TestAppliesWhen_InvalidGlobReturnsError verifies that an unparseable glob
+// in applies_when.changes_touch causes rule evaluation to fail (I3).
+// This exercises the error propagation path in the engine when
+// EvalAppliesWhen returns an error.
+func TestAppliesWhen_InvalidGlobReturnsError(t *testing.T) {
+	tmpDir := setupGitRepo(t)
+	writeFile(t, filepath.Join(tmpDir, "main.go"), "package main")
+	runGit(t, tmpDir, "add", ".")
+	runGit(t, tmpDir, "commit", "-m", "Phase 1: add main.go")
+
+	engine := makeEngine(t, `
+rules:
+  bad_glob_rule:
+    applies_to: [developer]
+    applies_when:
+      changes_touch: ["[invalid"]
+    check: exit_code_is(0)
+    message: "Bad glob rule"
+`)
+
+	ctx := &EvalContext{
+		Role:    &core.Role{Name: "developer"},
+		Result:  &core.JobResult{ExitCode: 0},
+		Job:     &core.Job{ID: "j1", RunID: "r1", Role: "developer"},
+		RunID:   "r1",
+		WorkDir: tmpDir,
+	}
+
+	verdict, err := engine.Evaluate(ctx)
+	if err != nil {
+		t.Fatalf("Evaluate returned unexpected error: %v", err)
+	}
+
+	// The verdict must fail because the applies_when evaluation errored.
+	if verdict.Pass {
+		t.Error("expected verdict.Pass=false when applies_when eval errors")
+	}
+
+	// There must be exactly one result, not skipped (it errored, not skipped).
+	if len(verdict.Results) != 1 {
+		t.Fatalf("results count = %d, want 1", len(verdict.Results))
+	}
+	r := verdict.Results[0]
+	if r.Skipped {
+		t.Error("expected result.Skipped=false for eval error (error ≠ skip)")
+	}
+	if r.Passed {
+		t.Error("expected result.Passed=false for eval error")
+	}
+	if !strings.Contains(r.Message, "applies_when eval error") {
+		t.Errorf("result.Message = %q, want it to contain \"applies_when eval error\"", r.Message)
+	}
+}
+
 // TestChangesTouch_NoArgs verifies that calling changesTouch with no args
 // returns an error.
 func TestChangesTouch_NoArgs(t *testing.T) {
@@ -381,17 +474,17 @@ func TestLookupPredicate_ChangesTouchRegistered(t *testing.T) {
 	}
 }
 
-// TestSkippedMessages_Empty verifies SkippedMessages on an all-pass verdict.
-func TestSkippedMessages_Empty(t *testing.T) {
+// TestSkippedRuleNames_Empty verifies SkippedRuleNames on an all-pass verdict.
+func TestSkippedRuleNames_Empty(t *testing.T) {
 	verdict := &core.SupervisorVerdict{
 		Pass: true,
 		Results: []core.RuleResult{
 			{RuleName: "r1", Passed: true, Message: "ok"},
 		},
 	}
-	msgs := verdict.SkippedMessages()
+	msgs := verdict.SkippedRuleNames()
 	if len(msgs) != 0 {
-		t.Errorf("SkippedMessages() = %v, want empty", msgs)
+		t.Errorf("SkippedRuleNames() = %v, want empty", msgs)
 	}
 }
 

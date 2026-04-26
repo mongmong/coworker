@@ -153,7 +153,7 @@ Tests:
 
 ### External code review — 2026-04-20
 
-**[OPEN] Critical: `path.Match("web/**", ...)` silently fails for nested paths**
+**[FIXED] Critical: `path.Match("web/**", ...)` silently fails for nested paths**
 `predicates.go:263-280`. `path.Match` does not treat `**` as a multi-segment
 wildcard — it only matches a literal `*` within a single path segment. As a
 result, `path.Match("web/**", "web/components/Button.tsx")` returns `false`
@@ -166,8 +166,12 @@ Fix: replace `path.Match` with `doublestar.Match` from `bmatcuk/doublestar`
 (zero-dependency, MIT) or implement a recursive split: try `path.Match` against
 the full path, and if the glob ends in `/**` also try `strings.HasPrefix(file, prefix+"/")`.
 File: `coding/supervisor/predicates.go:263`.
+→ Response: Replaced `path.Match` with `filepath.Match` and introduced a `globMatch`
+helper that handles `**` patterns: `"prefix/**"` checks `strings.HasPrefix`, `"**/<rest>"`
+matches the base name, all others delegate to `filepath.Match`. The `path` import removed.
+[FIXED]
 
-**[OPEN] Important: `web/**` glob is neither tested at the nested-path level nor
+**[FIXED] Important: `web/**` glob is neither tested at the nested-path level nor
 guarded by a validator warning**
 `integration_test.go:199` — `TestAppliesWhen_FiresWhenFileMatches` uses
 `Button.tsx` at root (matched by `*.tsx`) as the trigger file when the
@@ -176,8 +180,11 @@ guarded by a validator warning**
 Given the `path.Match` limitation above, a test would also fail. Add a
 `TestChangesTouch_NestedWebPath` case that commits `web/components/Button.tsx`
 and asserts `changes_touch(["web/**"])` returns true.
+→ Response: Added `TestChangesTouch_NestedWebPath` to `integration_test.go`.
+Commits `web/components/Button.tsx`, asserts `"web/**"` matches and `"api/**"` does not.
+Passes with the `globMatch` fix in C1. [FIXED]
 
-**[OPEN] Important: `SkippedMessages()` returns `RuleName`, not `Message` —
+**[FIXED] Important: `SkippedMessages()` returns `RuleName`, not `Message` —
 asymmetric with `FailedMessages()`**
 `core/supervisor.go:40`. `FailedMessages()` returns `r.Message` (the
 human-readable rule failure string). `SkippedMessages()` returns `r.RuleName`
@@ -189,8 +196,11 @@ skipped rules (currently it copies `rule.Message`, the original contract
 message, which is also misleading). The plan spec says "mirror of
 `FailedMessages()` for tracing" (`docs/plans/111-full-role-catalog.md:122`)
 which implies it should return message strings, not names.
+→ Response: Renamed `SkippedMessages()` to `SkippedRuleNames()` in `core/supervisor.go`
+and updated all call sites and test references in `coding/supervisor/integration_test.go`.
+Docstring updated to make the asymmetry explicit. [FIXED]
 
-**[OPEN] Important: `applies_when` evaluation error is not tested**
+**[FIXED] Important: `applies_when` evaluation error is not tested**
 `engine.go:63-71`. When `EvalAppliesWhen` returns an error (e.g., invalid glob,
 git not available), the engine sets `verdict.Pass = false` and appends a
 `RuleResult` with `Passed: false` and `Skipped: false`. This path is
@@ -198,6 +208,10 @@ load-bearing — it prevents silent pass on evaluation failures — but has no
 test coverage. Add a test that injects a rule with an invalid glob pattern in
 `applies_when.changes_touch` (e.g., `"[invalid"`) and asserts `verdict.Pass`
 is false and the result message contains "applies_when eval error".
+→ Response: Added `TestAppliesWhen_InvalidGlobReturnsError` to `integration_test.go`.
+Commits a real file so git diff works, then evaluates a rule whose `applies_when.changes_touch`
+contains `"[invalid"`. Asserts `verdict.Pass=false`, `Skipped=false`, and message contains
+`"applies_when eval error"`. [FIXED]
 
 **[OPEN] Suggestion: `reviewer_frontend.yaml` has `applies_when` that core.Role
 cannot deserialize — silent field drop**

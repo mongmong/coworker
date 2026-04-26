@@ -3,7 +3,7 @@ package supervisor
 import (
 	"fmt"
 	"os/exec"
-	"path"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -252,6 +252,34 @@ func EvalAppliesWhen(ctx *EvalContext, clause *AppliesWhenClause) (bool, error) 
 	return true, nil
 }
 
+// globMatch matches a file path against a glob pattern that may contain **.
+//
+// filepath.Match does not support **, which is a common convention meaning
+// "any depth of subdirectories". This function handles two ** forms:
+//
+//   - "web/**"  → true if file starts with "web/" (any depth under web/)
+//   - "**/*.tsx" → true if the file's base name matches "*.tsx" at any depth
+//
+// All other patterns are delegated to filepath.Match.
+func globMatch(pattern, file string) (bool, error) {
+	if strings.Contains(pattern, "**") {
+		// "prefix/**" — match any file under the prefix directory.
+		if strings.HasSuffix(pattern, "/**") {
+			prefix := strings.TrimSuffix(pattern, "/**")
+			return strings.HasPrefix(file, prefix+"/"), nil
+		}
+		// "**/<rest>" — match the base name (or sub-path) at any depth.
+		if strings.HasPrefix(pattern, "**/") {
+			suffix := strings.TrimPrefix(pattern, "**/")
+			return filepath.Match(suffix, filepath.Base(file))
+		}
+		// Other ** patterns (e.g. "a/**/b") — not supported; return no-match
+		// without error so callers are not broken by unknown patterns.
+		return false, nil
+	}
+	return filepath.Match(pattern, file)
+}
+
 // evalChangesTouch checks whether the current git diff touches any file
 // matching the given glob patterns.
 func evalChangesTouch(ctx *EvalContext, globs []string) (bool, error) {
@@ -262,7 +290,7 @@ func evalChangesTouch(ctx *EvalContext, globs []string) (bool, error) {
 
 	for _, f := range files {
 		for _, g := range globs {
-			matched, err := path.Match(g, f)
+			matched, err := globMatch(g, f)
 			if err != nil {
 				return false, fmt.Errorf("changes_touch: invalid glob %q: %w", g, err)
 			}
@@ -271,8 +299,8 @@ func evalChangesTouch(ctx *EvalContext, globs []string) (bool, error) {
 			}
 			// Also match the basename against patterns that don't contain a slash.
 			if !strings.Contains(g, "/") {
-				base := path.Base(f)
-				matched, err = path.Match(g, base)
+				base := filepath.Base(f)
+				matched, err = globMatch(g, base)
 				if err != nil {
 					return false, fmt.Errorf("changes_touch: invalid glob %q: %w", g, err)
 				}

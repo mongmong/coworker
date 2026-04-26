@@ -31,14 +31,17 @@ func (v *SupervisorVerdict) FailedMessages() []string {
 	return msgs
 }
 
-// SkippedMessages returns the messages from rules that were skipped because
+// SkippedRuleNames returns the names of rules that were skipped because
 // their applies_when predicate evaluated to false.
-func (v *SupervisorVerdict) SkippedMessages() []string {
-	var msgs []string
+// Named "RuleNames" (not "Messages") to make the asymmetry with
+// FailedMessages explicit — FailedMessages returns human-readable strings
+// while this returns machine identifiers.
+func (v *SupervisorVerdict) SkippedRuleNames() []string {
+	var names []string
 	for _, r := range v.Results {
 		if r.Skipped {
-			msgs = append(msgs, r.RuleName)
+			names = append(names, r.RuleName)
 		}
 	}
-	return msgs
+	return names
 }
