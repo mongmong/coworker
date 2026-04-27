@@ -351,6 +351,7 @@ func (d *Dispatcher) checkPermission(ctx context.Context, logger *slog.Logger, r
 	}
 }
 
+//nolint:gocyclo // Linear retry/persistence flow; complexity grew from per-error logging additions.
 func (d *Dispatcher) executeAttempt(
 	ctx context.Context,
 	logger *slog.Logger,
@@ -395,7 +396,10 @@ func (d *Dispatcher) executeAttempt(
 		binaryName := binaryAgent.BinaryBasename()
 		if binaryName != "" {
 			if permErr := d.checkPermission(ctx, logger, runID, role, binaryName); permErr != nil {
-				jobStore.UpdateJobState(ctx, jobID, core.JobStateFailed) //nolint:errcheck
+				if updErr := jobStore.UpdateJobState(ctx, jobID, core.JobStateFailed); updErr != nil {
+					logger.Error("failed to update job state after permission denial",
+						"job_id", jobID, "error", updErr)
+				}
 				return nil, permErr
 			}
 		}
@@ -407,14 +411,20 @@ func (d *Dispatcher) executeAttempt(
 
 	handle, err := roleAgent.Dispatch(subCtx, job, prompt)
 	if err != nil {
-		jobStore.UpdateJobState(ctx, jobID, core.JobStateFailed) //nolint:errcheck
+		if updErr := jobStore.UpdateJobState(ctx, jobID, core.JobStateFailed); updErr != nil {
+			logger.Error("failed to update job state after dispatch error",
+				"job_id", jobID, "error", updErr)
+		}
 		return nil, fmt.Errorf("dispatch agent: %w", err)
 	}
 	logger.Info("dispatched to agent", "cli", role.CLI, "attempt", attempt)
 
 	result, err := handle.Wait(ctx)
 	if err != nil {
-		jobStore.UpdateJobState(ctx, jobID, core.JobStateFailed) //nolint:errcheck
+		if updErr := jobStore.UpdateJobState(ctx, jobID, core.JobStateFailed); updErr != nil {
+			logger.Error("failed to update job state after wait error",
+				"job_id", jobID, "error", updErr)
+		}
 		return nil, fmt.Errorf("wait for agent: %w", err)
 	}
 	logger.Info("agent completed", "findings", len(result.Findings), "exit_code", result.ExitCode, "attempt", attempt)
@@ -451,7 +461,10 @@ func (d *Dispatcher) executeAttempt(
 		// Evaluation error means something is wrong with the rule engine or
 		// its inputs. Silently passing would hide the bug. Return the error
 		// so the caller marks the job and run as failed.
-		jobStore.UpdateJobState(ctx, jobID, core.JobStateFailed) //nolint:errcheck
+		if updErr := jobStore.UpdateJobState(ctx, jobID, core.JobStateFailed); updErr != nil {
+			logger.Error("failed to update job state after supervisor eval error",
+				"job_id", jobID, "error", updErr)
+		}
 		return nil, fmt.Errorf("supervisor.Evaluate: %w", evalErr)
 	}
 	attemptResult.verdict = verdict
@@ -463,7 +476,10 @@ func (d *Dispatcher) executeAttempt(
 	}
 
 	if attempt < maxRetries {
-		jobStore.UpdateJobState(ctx, jobID, core.JobStateFailed) //nolint:errcheck
+		if updErr := jobStore.UpdateJobState(ctx, jobID, core.JobStateFailed); updErr != nil {
+			logger.Error("failed to update job state before retry",
+				"job_id", jobID, "attempt", attempt, "error", updErr)
+		}
 
 		feedback := d.buildRetryFeedback(verdict)
 		retryPayload, _ := json.Marshal(map[string]interface{}{

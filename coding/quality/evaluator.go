@@ -215,7 +215,7 @@ func (e *Evaluator) createAttentionItem(
 		if err := e.CheckpointWriter.CreateCheckpoint(ctx, core.CheckpointRecord{
 			ID:    item.ID,
 			RunID: cpCtx.RunID,
-			Kind:  string(core.AttentionCheckpoint),
+			Kind:  core.CheckpointKindQualityGate,
 		}); err != nil {
 			return "", fmt.Errorf("insert checkpoint row: %w", err)
 		}

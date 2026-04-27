@@ -62,6 +62,11 @@ func (a *CliAgent) Dispatch(ctx context.Context, job *core.Job, prompt string) (
 	}
 
 	if err := cmd.Start(); err != nil {
+		// Close the pipes that were opened above; otherwise the underlying
+		// pipe FDs leak when Start fails before the process inherits them.
+		// Plan 126 (I8).
+		_ = stdout.Close()
+		_ = stderr.Close()
 		return nil, fmt.Errorf("start %q: %w", a.BinaryPath, err)
 	}
 
