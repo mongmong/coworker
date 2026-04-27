@@ -1,1 +1,2 @@
 {"type":"done","exit_code":0}
+{"type":"result","total_cost_usd":0.0123,"usage":{"input_tokens":100,"output_tokens":50},"modelUsage":{"claude-opus-4-7":{"inputTokens":100,"outputTokens":50,"costUSD":0.0123}}}
