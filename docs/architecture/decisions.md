@@ -127,3 +127,24 @@ The helper is then invoked at the post-spec-approved code path in `runPlanLoopWi
 **Enforcement:** Three wiring tests in `cli/run_test.go`. The tests use `saveAndRestoreRunFlags` to prevent cross-test pollution.
 
 **Status:** Introduced in Plan 122.
+
+
+## Decision 10: CLI Checkpoint Commands Reuse MCP Wrappers (Plan 123)
+
+**Context:** The `advance` and `rollback` CLI commands shipped as stubs since their introduction. The MCP server already exposed `orch_checkpoint_advance` and `orch_checkpoint_rollback` with exported wrappers (`mcp.CallCheckpointAdvance`, `mcp.CallCheckpointRollback`).
+
+**Decision:** The CLI commands directly invoke the MCP wrappers rather than re-implementing the AnswerAttention + ResolveAttention + ResolveCheckpoint flow. This keeps one source of truth for checkpoint resolution semantics: any future invariant change (e.g., a new event type for advance) propagates to both surfaces automatically.
+
+**Decision:** `cli/advance` (no args) finds the most recent unanswered checkpoint for the active session's run via the new `AttentionStore.GetAnyUnansweredCheckpointForRun` (necessary because the existing `GetUnansweredCheckpointForRun` filters source by exact match). `cli/rollback <id>` is explicit. Both expose `--answered-by <user>` (default "cli") so audit trails distinguish CLI advances from HTTP / MCP advances.
+
+**Status:** Introduced in Plan 123.
+
+## Decision 11: OpenCode Cancel Best-Effort with 5s Goroutine Drain (Plan 123)
+
+**Context:** Plan 118 launched the `sendMessage` POST in a fire-and-forget goroutine so `Dispatch` could return immediately. The 2026-04-27 audit (BLOCKER B5) flagged that under hung-network conditions the goroutine could leak indefinitely.
+
+**Decision:** `openCodeJobHandle.Cancel()` waits on a `sync.WaitGroup` for the message goroutine with a 5-second timeout. On timeout we log a warning and return nil — a hung message POST cannot block Cancel forever. The 5s window is generous enough that healthy networks always drain in time, narrow enough that operators see leaks promptly.
+
+**Decision:** This is best-effort cancellation. Operators with persistent leaks should investigate network configuration (DNS resolution, OpenCode server health) rather than tune the timeout.
+
+**Status:** Introduced in Plan 123.
