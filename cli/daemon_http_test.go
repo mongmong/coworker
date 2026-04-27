@@ -250,6 +250,11 @@ func TestHandleAnswerAttention(t *testing.T) {
 	if err := s.attention.InsertAttention(context.Background(), item); err != nil {
 		t.Fatalf("InsertAttention: %v", err)
 	}
+	if err := s.checkpoint.CreateCheckpoint(context.Background(), core.CheckpointRecord{
+		ID: item.ID, RunID: item.RunID, Kind: string(item.Kind),
+	}); err != nil {
+		t.Fatalf("CreateCheckpoint: %v", err)
+	}
 
 	bus := eventbus.NewInMemoryBus()
 	ts := httptest.NewServer(buildHTTPMux(bus, s))

@@ -153,7 +153,11 @@ func handleAnswerAttention(as *store.AttentionStore, cw core.CheckpointWriter) h
 		//nolint:errcheck // best-effort resolve
 		_ = as.ResolveAttention(r.Context(), id)
 		if item.Kind == core.AttentionCheckpoint && cw != nil {
-			if err := cw.ResolveCheckpoint(r.Context(), id, req.Answer, req.AnsweredBy, ""); err != nil {
+			// Best-effort: the answer is persisted on the attention row above.
+			// A missing checkpoint row is tolerated (legacy item, test fixture,
+			// or item created before Plan 119 wired the paired write).
+			if err := cw.ResolveCheckpoint(r.Context(), id, req.Answer, req.AnsweredBy, ""); err != nil &&
+				!errors.Is(err, store.ErrCheckpointNotFound) {
 				http.Error(w, "internal error", http.StatusInternalServerError)
 				return
 			}
