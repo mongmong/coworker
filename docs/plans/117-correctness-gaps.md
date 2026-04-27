@@ -1272,3 +1272,39 @@ The revised plan now explicitly covers every prior Must Fix and Should Fix item 
 ## Post-Execution Report
 
 _Empty — to be filled in after implementation._
+
+### Post-Implementation Review Findings — Resolution
+
+**Blockers (3) — all FIXED in commit after review:**
+1. ✅ RoleDir wired: BuildFromPRDWorkflow.RoleDir → PhaseExecutor.RoleDir, populated from --role-dir flag in cli/run.go
+2. ✅ CoworkerDir wired: derived from --db flag parent in cli/run.go, cli/daemon.go, cli/invoke.go; CliAgent now writes JSONL logs
+3. ✅ Subprocess timeouts: confirmed all 5 sites (dispatcher, judge, worktree, recorder, shipper) have proper context.WithTimeout + WaitDelay (Codex finding was a false alarm)
+
+**Important (3) — all FIXED:**
+1. ✅ job.skipped events now include run_id correlation
+2. ✅ applies_when.changes_touch empty list rejected at role load time
+3. ✅ Integration test added for phase-test stage registry override
+
+**Verdict: All findings resolved. Ready to merge.**
+
+---
+
+## Post-Execution Report
+
+### Summary
+
+All 8 Important findings (I-1 through I-5, I-7, I-9, I-10) from the V1 comprehensive review are fixed:
+- **I-1**: SQLite trigger prevents direct UPDATE on immutable finding columns
+- **I-2**: PhaseExecutor.TesterRoles separates tester from reviewer fan-out; nil-vs-empty semantics for stage override
+- **I-3**: core.Role.AppliesWhen with shared internal/predicates package; PhaseExecutor.WorkDir+RoleDir wired through workflow
+- **I-4**: SupervisorEvaluator interface; supervisor errors fail job and run
+- **I-5**: Quality judge errors emit verdict events with status=error; block-capable creates attention items
+- **I-7**: BudgetTimeout helper applied to all 5 subprocess sites with WaitDelay
+- **I-9**: OpenJobLog persists per-job JSONL streams via io.TeeReader
+- **I-10**: time.RFC3339 used consistently for both write and read
+
+### Verification
+
+- 27 packages pass go test -race
+- 0 lint issues
+- All findings from both Codex pre-impl and post-impl reviews addressed
