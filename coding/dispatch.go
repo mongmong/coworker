@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -224,12 +225,31 @@ func (d *Dispatcher) Orchestrate(ctx context.Context, input *DispatchInput) (*Di
 	}
 
 	// 11. Persist findings from the final attempt.
+	// Populate plan/phase/reviewer attribution from the dispatch context
+	// so audit queries can filter findings by plan or phase. Plan 125 (B3).
+	planID := input.Inputs["plan_id"]
+	var phaseIdxPtr *int
+	if v, ok := input.Inputs["phase_index"]; ok {
+		if n, err := strconv.Atoi(v); err == nil {
+			phaseIdxPtr = &n
+		}
+	}
 	for i := range lastResult.Findings {
 		f := &lastResult.Findings[i]
 		f.RunID = runID
 		f.JobID = lastJobID
 		if f.ID == "" {
 			f.ID = core.NewID()
+		}
+		if f.PlanID == "" {
+			f.PlanID = planID
+		}
+		if f.PhaseIndex == nil && phaseIdxPtr != nil {
+			pi := *phaseIdxPtr
+			f.PhaseIndex = &pi
+		}
+		if f.ReviewerHandle == "" && strings.HasPrefix(role.Name, "reviewer.") {
+			f.ReviewerHandle = role.Name
 		}
 		if err := findingStore.InsertFinding(ctx, f); err != nil {
 			logger.Error("failed to persist finding", "error", err, "path", f.Path, "line", f.Line)

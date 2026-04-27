@@ -1305,6 +1305,67 @@ func TestOrchestrate_NilCostWriterIsNoOp(t *testing.T) {
 	}
 }
 
+// TestOrchestrate_PopulatesPlanFieldsOnFindings verifies plan_id/
+// phase_index/reviewer_handle are written onto findings when present
+// in DispatchInput.Inputs. Plan 125 (B3).
+func TestOrchestrate_PopulatesPlanFieldsOnFindings(t *testing.T) {
+	repoRoot := findRepoRoot(t)
+	db, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("Open(:memory:): %v", err)
+	}
+	defer db.Close()
+
+	d := &Dispatcher{
+		RoleDir:   filepath.Join(repoRoot, "coding", "roles"),
+		PromptDir: filepath.Join(repoRoot, "coding"),
+		Agent: &countingAgent{wait: func(context.Context, *core.Job, string) (*core.JobResult, error) {
+			return &core.JobResult{
+				ExitCode: 0,
+				Findings: []core.Finding{
+					{Path: "main.go", Line: 1, Severity: core.SeverityImportant, Body: "x"},
+				},
+			}, nil
+		}},
+		DB:     db,
+		Policy: warnPolicy(),
+	}
+
+	res, err := d.Orchestrate(context.Background(), &DispatchInput{
+		RoleName: "reviewer.arch",
+		Inputs: map[string]string{
+			"diff_path":   "/tmp/diff",
+			"spec_path":   "/tmp/spec",
+			"plan_id":     "100",
+			"phase_index": "2",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Orchestrate: %v", err)
+	}
+
+	// Read the persisted finding back.
+	es := store.NewEventStore(db)
+	fs := store.NewFindingStore(db, es)
+	persisted, err := fs.ListFindings(context.Background(), res.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(persisted) != 1 {
+		t.Fatalf("got %d persisted findings, want 1", len(persisted))
+	}
+	got := persisted[0]
+	if got.PlanID != "100" {
+		t.Errorf("PlanID = %q, want 100", got.PlanID)
+	}
+	if got.PhaseIndex == nil || *got.PhaseIndex != 2 {
+		t.Errorf("PhaseIndex = %v, want 2", got.PhaseIndex)
+	}
+	if got.ReviewerHandle != "reviewer.arch" {
+		t.Errorf("ReviewerHandle = %q, want reviewer.arch", got.ReviewerHandle)
+	}
+}
+
 func TestSnakeToPascal(t *testing.T) {
 	tests := []struct {
 		input string

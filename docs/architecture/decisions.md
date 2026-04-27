@@ -161,3 +161,20 @@ The helper is then invoked at the post-spec-approved code path in `runPlanLoopWi
 **Decision:** Wiring `Dispatcher.Orchestrate(role: "supervisor", ...)` for production use is **deferred**. The in-process implementation is faster (no LLM round-trip for contract rules) and authoritative for the V1 release.
 
 **Status:** Introduced in Plan 124.
+
+
+## Decision 13: Schema Drift Reconciliation (Plan 125)
+
+**Context:** The 2026-04-27 V1 audit (BLOCKERs B3 + B4) flagged that `findings` was missing spec-required columns (`plan_id`, `phase_index`, `reviewer_handle`) and `dispatches` was missing the spec's `mode` column.
+
+**Decision:** Plan 125 adds an additive migration (008) for all four columns with sensible defaults (empty string / 0 / "persistent"). Existing rows continue to satisfy the schema; new code populates the fields where context is available.
+
+**Decision:** `Finding.PhaseIndex` is `*int` in Go (nil = unknown) so phase 0 is unambiguous. The DB column stays `INTEGER NOT NULL DEFAULT 0` for back-compat; on read, when `plan_id` is empty AND `phase_index` is 0 we leave the pointer nil, otherwise dereference.
+
+**Decision:** Reviewer attribution: roles whose name starts with `reviewer.` (e.g., `reviewer.arch`, `reviewer.frontend`) populate `findings.reviewer_handle = role.Name`. Findings synthesized in-process (e.g., supervisor contract violations) leave the field empty. This matches the spec's intent: the column attributes external review findings, not internal contract checks.
+
+**Decision:** `dispatches.mode` is populated **at the router**, not at the store. `coding/router.go::enqueueEphemeral` writes `Mode = "ephemeral"`; `coding/router.go::enqueue` (worker-targeted) writes `Mode = "persistent"`. The store layer fills in `"persistent"` only when the field is empty (defensive default). Direct `Dispatcher.Orchestrate` calls (synchronous in-process spawns) do not go through the `dispatches` table at all — that's by design and acceptable for V1.
+
+**Decision:** `phaseloop.PhaseExecutor.Execute` injects `plan_id` and `phase_index` into the `inputs` map before dispatching. The dispatcher reads them out of `DispatchInput.Inputs` to populate finding fields. This keeps the wiring narrow (one-line injection at the executor entry; one-line read at the dispatcher's persistence loop) without growing every Dispatch* struct.
+
+**Status:** Introduced in Plan 125.

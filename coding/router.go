@@ -113,6 +113,7 @@ func (r *DispatchRouter) enqueueEphemeral(ctx context.Context, template *core.Di
 		JobID:  template.JobID,
 		Prompt: template.Prompt,
 		Inputs: template.Inputs,
+		Mode:   core.DispatchModeEphemeral,
 		// WorkerHandle: "" → stored as NULL
 	}
 	if err := r.dispatch.EnqueueDispatch(ctx, ephemeral); err != nil {
@@ -137,6 +138,7 @@ func (r *DispatchRouter) enqueue(ctx context.Context, template *core.Dispatch, w
 			Prompt:       template.Prompt,
 			Inputs:       template.Inputs,
 			WorkerHandle: w.Handle,
+			Mode:         core.DispatchModePersistent,
 		}
 		if err := r.dispatch.EnqueueDispatch(ctx, d); err != nil {
 			return nil, fmt.Errorf("enqueue dispatch for worker %q: %w", w.Handle, err)

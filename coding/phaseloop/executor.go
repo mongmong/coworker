@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -142,6 +143,14 @@ func (e *PhaseExecutor) Execute(
 		"phase_index", phaseIndex,
 		"phase_name", phaseName,
 	)
+
+	// Inject plan/phase context into inputs so finding rows can be
+	// attributed to the (plan, phase) that produced them. Plan 125 (B3).
+	if inputs == nil {
+		inputs = map[string]string{}
+	}
+	inputs["plan_id"] = strconv.Itoa(planID)
+	inputs["phase_index"] = strconv.Itoa(phaseIndex)
 
 	e.emitPhaseEvent(ctx, runID, planID, phaseIndex, phaseName, core.EventPhaseStarted, nil)
 
