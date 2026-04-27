@@ -105,3 +105,25 @@ Updated whenever a plan introduces or revises a cross-cutting decision.
 **Enforcement:** Unit tests in `agent/cost_helpers_test.go` (8 cases), `agent/replay_agent_test.go` (2 new cases), `coding/dispatch_test.go` (4 new cases for cost-writer wiring), and the replay scenario at `tests/replay/developer_then_reviewer/replay_test.go` (cost row + sum assertion).
 
 **Status:** Introduced in Plan 121.
+
+
+## Decision 9: Production Workflow Wiring (Plan 122)
+
+**Context:** `coding/workflow/build_from_prd.go::BuildFromPRDWorkflow` requires several optional collaborators (PhaseExecutor, Shipper, StageRegistry) to actually run plan phases end-to-end. Without them, `RunPhasesForPlan` returns the "PhaseExecutor is required" error, leaving autopilot non-functional. Tests construct these collaborators ad-hoc; production previously did not. Plan 122 (BLOCKER B1 from the 2026-04-27 audit) closed this gap.
+
+**Decision:** A single helper `cli/run.go::buildPhaseRunner(manifestPath, db, policy, attentionStore, checkpointWriter, eventStore, logger)` constructs and wires the full production runner. It builds:
+
+- one Dispatcher (shared between planner and phase pipelines — both resolve the same role dir);
+- a PhaseExecutor with EventStore + AttentionStore + CheckpointWriter + Policy + WorkDir + RoleDir;
+- a Shipper with all five stores it needs, **gated by `--no-ship`** (Shipper is nil when set), inheriting `--dry-run`;
+- a StageRegistry constructed via `stages.NewStageRegistry(stages.WorkflowBuildFromPRD, stages.DefaultStages, policy)` so `policy.workflow_overrides` are honored at construction.
+
+The helper is then invoked at the post-spec-approved code path in `runPlanLoopWithDeps`.
+
+**Decision:** `WorktreeManager` is intentionally left nil. Parallel plan execution (`max_parallel_plans > 1`) is not yet supported on the resume path; a follow-up plan adds it when actually needed.
+
+**Decision:** Tests continue to construct `*phaseloop.PhaseExecutor` and `*shipper.Shipper` directly via existing test helpers (`newTestPhaseExecutor`, `newDirtyPhaseExecutor`). The production helper is exercised end-to-end by `TestBuildPhaseRunner_*` tests in `cli/run_test.go`, which assert default wiring, `--no-ship` behavior, and `--dry-run` propagation.
+
+**Enforcement:** Three wiring tests in `cli/run_test.go`. The tests use `saveAndRestoreRunFlags` to prevent cross-test pollution.
+
+**Status:** Introduced in Plan 122.
