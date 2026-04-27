@@ -150,4 +150,52 @@ _To be filled by post-implementation review._
 
 ## Post-Execution Report
 
-_To be filled after implementation._
+### Date
+2026-04-20
+
+### Implementation summary
+
+All four phases completed in one session:
+
+**Phase 1 — `agent/opencode_http_agent.go`**
+- `OpenCodeHTTPAgent` struct with `ServerURL` and `HTTPClient` fields.
+- `Dispatch()`: creates session, spawns SSE goroutine, posts message synchronously in a goroutine so context cancellation can interrupt it, returns `openCodeJobHandle`.
+- `openCodeJobHandle.Wait()` / `Cancel()`: Wait selects on resultCh/ctx.Done; Cancel calls sseCancel then POSTs /session/{id}/abort.
+- `sseLoop()`: reconnect loop with exponential backoff (250ms → 5s); exits on `session.idle` or ctx cancelled.
+- `sseStream()`: single SSE connection; filters events by sessionID; handles `session.idle` (done), `message.part.updated` (text accumulation), `session.error` (surfaced in result.Stderr).
+- `parseAssistantText()`: tries JSONL decoder; falls back to result.Stdout for free-form text.
+- Session cleanup via DELETE uses `context.Background` (intentional, annotated with `//nolint:gosec`).
+
+**Phase 2 — Dispatcher integration**
+- Added `--opencode-server` flag to both `daemon` and `run` commands.
+- `buildDaemonDispatcher` and `buildRunDispatcher` both accept the server URL and put `&agent.OpenCodeHTTPAgent{...}` in the "opencode" CLIAgents slot when non-empty; fall back to CliAgent when empty.
+- Signature of `buildDaemonDispatcher` updated to accept `openCodeServer string`.
+
+**Phase 3 — Tests (`agent/opencode_http_agent_test.go`)**
+- 14 test cases using `httptest.NewServer` covering:
+  - Happy path with JSONL findings
+  - Cancel / abort
+  - SSE reconnect after connection drop
+  - Context timeout before session.idle
+  - session.error propagation to result.Stderr
+  - Free-form (non-JSONL) prose output
+  - Message send failure (500 from server)
+  - Unit tests for `parseAssistantText`, `processSSEEvent`, `serverURL`
+
+**Phase 4 — `agent/doc.go`**
+- Updated package comment to document both implementations and the HTTP Agent pattern for future additions.
+
+### Verification
+
+```
+go build ./...                     → clean
+go test -race ./... -count=1 -timeout 120s → 24 ok, 0 failed, 0 races
+golangci-lint run ./...            → 0 issues
+```
+
+### Notes / deviations from plan
+
+- The spike showed `POST /session/{id}/message` is synchronous and blocks until OpenCode responds. To allow context cancellation during the send, the POST is run in its own goroutine with a select. This is slightly different from the plan description but more robust.
+- `openCodeMessageUpdatedProps` and `sseResult` types were removed (unused) to satisfy `unused` linter.
+- SSE loop refactored to `for ctx.Err() == nil` to satisfy staticcheck QF1006.
+- No new test infrastructure was required; `httptest.NewServer` with Go 1.25 method-pattern routing (`POST /path/{var}`) was sufficient.

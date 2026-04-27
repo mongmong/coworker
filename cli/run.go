@@ -34,6 +34,7 @@ var (
 	runClaudeBinary         string
 	runCodexBinary          string
 	runOpenCodeBinary       string
+	runOpenCodeServer       string
 )
 
 var runCmd = &cobra.Command{
@@ -79,6 +80,7 @@ func init() {
 	runCmd.Flags().StringVar(&runClaudeBinary, "claude-binary", "", "Path to the claude-code binary (default: resolved from PATH)")
 	runCmd.Flags().StringVar(&runCodexBinary, "codex-binary", "", "Path to the codex binary (default: resolved from PATH)")
 	runCmd.Flags().StringVar(&runOpenCodeBinary, "opencode-binary", "", "Path to the opencode binary (default: resolved from PATH)")
+	runCmd.Flags().StringVar(&runOpenCodeServer, "opencode-server", "", "OpenCode HTTP server URL for HTTP-primary dispatch (e.g. http://127.0.0.1:7777). When set, uses OpenCodeHTTPAgent instead of CliAgent for opencode roles.")
 	rootCmd.AddCommand(runCmd)
 }
 
@@ -743,10 +745,19 @@ func buildRunDispatcher(db *store.DB, policy *core.Policy, logger *slog.Logger) 
 		return a
 	}
 
+	// Build the opencode agent: use HTTP-primary when --opencode-server is set,
+	// fall back to CliAgent otherwise.
+	var openCodeAgent core.Agent
+	if runOpenCodeServer != "" {
+		openCodeAgent = &agent.OpenCodeHTTPAgent{ServerURL: runOpenCodeServer}
+	} else {
+		openCodeAgent = newAgentWithDir(openCodeBin)
+	}
+
 	cliAgents := map[string]core.Agent{
 		"claude-code": newAgentWithDir(claudeBin),
 		"codex":       newAgentWithDir(codexBin),
-		"opencode":    newAgentWithDir(openCodeBin),
+		"opencode":    openCodeAgent,
 	}
 
 	d := &coding.Dispatcher{

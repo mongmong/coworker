@@ -32,6 +32,7 @@ var (
 	daemonClaudeBinary   string
 	daemonCodexBinary    string
 	daemonOpenCodeBinary string
+	daemonOpenCodeServer string
 )
 
 var daemonCmd = &cobra.Command{
@@ -71,6 +72,7 @@ func init() {
 	daemonCmd.Flags().StringVar(&daemonClaudeBinary, "claude-binary", "", "Path to the claude-code binary (default: resolved from PATH)")
 	daemonCmd.Flags().StringVar(&daemonCodexBinary, "codex-binary", "", "Path to the codex binary (default: resolved from PATH)")
 	daemonCmd.Flags().StringVar(&daemonOpenCodeBinary, "opencode-binary", "", "Path to the opencode binary (default: resolved from PATH)")
+	daemonCmd.Flags().StringVar(&daemonOpenCodeServer, "opencode-server", "", "OpenCode HTTP server URL for HTTP-primary dispatch (e.g. http://127.0.0.1:7777). When set, uses OpenCodeHTTPAgent instead of CliAgent for opencode roles.")
 	rootCmd.AddCommand(daemonCmd)
 }
 
@@ -111,7 +113,7 @@ func runDaemon(cmd *cobra.Command) error {
 	bus := eventbus.NewInMemoryBus()
 
 	// Build the Dispatcher so MCP role invocations drive real jobs.
-	dispatcher, err := buildDaemonDispatcher(db, daemonRoleDir, daemonPromptDir, daemonCliBinary, daemonClaudeBinary, daemonCodexBinary, daemonOpenCodeBinary, logger)
+	dispatcher, err := buildDaemonDispatcher(db, daemonRoleDir, daemonPromptDir, daemonCliBinary, daemonClaudeBinary, daemonCodexBinary, daemonOpenCodeBinary, daemonOpenCodeServer, logger)
 	if err != nil {
 		return fmt.Errorf("build dispatcher: %w", err)
 	}
@@ -181,7 +183,9 @@ func runDaemon(cmd *cobra.Command) error {
 // Per-CLI binary flags (claudeBinary, codexBinary, openCodeBinary) populate the
 // CLIAgents map so each role is dispatched to the correct tool. The cliBinary
 // fallback is used as the default Agent when a role's CLI is not in the map.
-func buildDaemonDispatcher(db *store.DB, roleDir, promptDir, cliBinary, claudeBinary, codexBinary, openCodeBinary string, logger *slog.Logger) (*coding.Dispatcher, error) {
+// When openCodeServer is non-empty, the "opencode" slot uses OpenCodeHTTPAgent
+// instead of CliAgent.
+func buildDaemonDispatcher(db *store.DB, roleDir, promptDir, cliBinary, claudeBinary, codexBinary, openCodeBinary, openCodeServer string, logger *slog.Logger) (*coding.Dispatcher, error) {
 	if roleDir == "" {
 		roleDir = filepath.Join(".coworker", "roles")
 		if _, err := os.Stat(roleDir); os.IsNotExist(err) {
@@ -227,10 +231,19 @@ func buildDaemonDispatcher(db *store.DB, roleDir, promptDir, cliBinary, claudeBi
 		return a
 	}
 
+	// Build the opencode agent: use HTTP-primary when --opencode-server is set,
+	// fall back to CliAgent otherwise.
+	var openCodeAgent core.Agent
+	if openCodeServer != "" {
+		openCodeAgent = &agent.OpenCodeHTTPAgent{ServerURL: openCodeServer}
+	} else {
+		openCodeAgent = newAgentWithDir(openCodeBinary)
+	}
+
 	cliAgents := map[string]core.Agent{
 		"claude-code": newAgentWithDir(claudeBinary),
 		"codex":       newAgentWithDir(codexBinary),
-		"opencode":    newAgentWithDir(openCodeBinary),
+		"opencode":    openCodeAgent,
 	}
 
 	d := &coding.Dispatcher{
