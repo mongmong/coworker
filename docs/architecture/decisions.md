@@ -85,3 +85,23 @@ Updated whenever a plan introduces or revises a cross-cutting decision.
 **Enforcement:** `var _ core.Agent = (*ReplayAgent)(nil)` compile-time assertion. Three smoke tests (claude, codex, opencode) exercise each CLI binary independently. `docs/architecture/testing.md` documents the four layers, when to use each, and how to add fixtures.
 
 **Status:** Introduced in Plan 120.
+
+
+## Decision 8: Cost Capture (Plan 121)
+
+**Context:** V1 needs visibility into per-job cost so live tests can enforce a budget and operators can see cumulative spend.
+
+**Decision:** Cost data is captured per-CLI from stream-json events:
+- **Claude Code** emits `{"type":"result","total_cost_usd":...,"usage":{...},"modelUsage":{<model>:{...}}}` once at end-of-run. The parser populates `core.JobResult.Cost` directly with USD, tokens, and the lexicographically-first `modelUsage` key (deterministic across runs because Go map iteration is randomized).
+- **Codex** emits `{"type":"turn.completed","usage":{...}}` cumulatively per session — latest event wins. Tokens are captured; USD is left at 0 pending a future per-model price table.
+- **OpenCode** does not currently expose token or cost data via the SSE stream we consume; capture is deferred entirely.
+
+**Decision:** Cost is persisted **per attempt**, not just on the final attempt. `executeAttempt` writes a `cost_events` row after each `agent.Wait()` succeeds. This way retries' real API spend is tracked accurately (each retry has a distinct `jobID` but shares a `runID`, so `runs.cost_usd` accumulates correctly via `CostEventStore.RecordCost`'s in-transaction UPDATE).
+
+**Decision:** `Dispatcher.CostWriter` is optional. When nil, cost persistence is skipped. When non-nil, write failures are logged but do not fail dispatch — same posture as `SupervisorWriter`.
+
+**Decision:** Live tests use `verifyCostUnderBudget(t, db, runID, requireRows)` to fail when (a) row count is below the required minimum (catches a silently-broken parser), or (b) `SUM(cost_events.usd) > COWORKER_LIVE_BUDGET_USD` (default 0.50). Codex and OpenCode smoke tests carry `FUTURE` comments explaining why this is not yet active for them.
+
+**Enforcement:** Unit tests in `agent/cost_helpers_test.go` (8 cases), `agent/replay_agent_test.go` (2 new cases), `coding/dispatch_test.go` (4 new cases for cost-writer wiring), and the replay scenario at `tests/replay/developer_then_reviewer/replay_test.go` (cost row + sum assertion).
+
+**Status:** Introduced in Plan 121.
