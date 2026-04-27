@@ -1455,10 +1455,130 @@ git commit -m "Plan 119: decisions.md — schema completion + attention/checkpoi
 
 ## Code Review
 
-(To be filled in after implementation by Codex review subagent.)
-
 ---
 
 ## Post-Execution Report
 
-(To be filled in after implementation.)
+Implemented all 10 phases on branch `feature/plan-119-schema-completion`.
+
+Phase commits:
+
+1. `4c415cd` — migration 007
+2. `3496343` — plan/checkpoint event kinds
+3. `40a7145` — run/job spec columns
+4. `8559e70` — PlanStore and core sink interfaces
+5. `cbf2742` — CheckpointStore
+6. `84169e2` — SupervisorEventStore and CostEventStore
+7. `02d4139` — dispatcher supervisor writer wiring
+8. `6389f6d` — plan/checkpoint workflow and answer-path wiring
+9. `7d41d2c` — replay test and golden fixture
+10. Final docs/report commit pending at report write time
+
+Verification:
+
+```text
+$ GOCACHE=/tmp/coworker-go-cache go build ./...
+go: writing stat cache: open /home/chris/go/pkg/mod/cache/download/github.com/chris/coworker/@v/v0.0.0-20260427070531-7d41d2ce0e1d.info242815256.tmp: read-only file system
+exit 0
+```
+
+```text
+$ GOCACHE=/tmp/coworker-go-cache go test -race ./... -count=1 -timeout 180s
+FAIL github.com/chris/coworker/agent
+panic: httptest: failed to listen on a port: listen tcp6 [::1]:0: socket: operation not permitted
+  at agent/opencode_http_agent_test.go:129 via httptest.NewServer
+
+FAIL github.com/chris/coworker/cli
+panic: httptest: failed to listen on a port: listen tcp6 [::1]:0: socket: operation not permitted
+  at cli/daemon_http_test.go:81 via httptest.NewServer
+
+ok github.com/chris/coworker/coding
+ok github.com/chris/coworker/coding/eventbus
+ok github.com/chris/coworker/coding/humanedit
+ok github.com/chris/coworker/coding/manifest
+ok github.com/chris/coworker/coding/phaseloop
+ok github.com/chris/coworker/coding/policy
+ok github.com/chris/coworker/coding/quality
+ok github.com/chris/coworker/coding/roles
+ok github.com/chris/coworker/coding/session
+ok github.com/chris/coworker/coding/shipper
+ok github.com/chris/coworker/coding/stages
+ok github.com/chris/coworker/coding/supervisor
+ok github.com/chris/coworker/coding/workflow
+ok github.com/chris/coworker/core
+ok github.com/chris/coworker/internal/executil
+ok github.com/chris/coworker/internal/predicates
+ok github.com/chris/coworker/mcp
+ok github.com/chris/coworker/store
+ok github.com/chris/coworker/tests/architecture
+ok github.com/chris/coworker/tests/integration
+ok github.com/chris/coworker/tui
+exit 1
+```
+
+The race suite failure is environmental: this sandbox denies local socket binds, and both failing tests panic before exercising application assertions. Supplemental non-socket race verification passed:
+
+```text
+$ GOCACHE=/tmp/coworker-go-cache go test -race $(GOCACHE=/tmp/coworker-go-cache go list ./... | grep -v '/agent$' | grep -v '/cli$') -count=1 -timeout 180s
+ok github.com/chris/coworker/coding
+ok github.com/chris/coworker/coding/eventbus
+ok github.com/chris/coworker/coding/humanedit
+ok github.com/chris/coworker/coding/manifest
+ok github.com/chris/coworker/coding/phaseloop
+ok github.com/chris/coworker/coding/policy
+ok github.com/chris/coworker/coding/quality
+ok github.com/chris/coworker/coding/roles
+ok github.com/chris/coworker/coding/session
+ok github.com/chris/coworker/coding/shipper
+ok github.com/chris/coworker/coding/stages
+ok github.com/chris/coworker/coding/supervisor
+ok github.com/chris/coworker/coding/workflow
+ok github.com/chris/coworker/core
+ok github.com/chris/coworker/internal/executil
+ok github.com/chris/coworker/internal/predicates
+ok github.com/chris/coworker/mcp
+ok github.com/chris/coworker/store
+ok github.com/chris/coworker/tests/architecture
+ok github.com/chris/coworker/tests/integration
+ok github.com/chris/coworker/tui
+exit 0
+```
+
+```text
+$ GOCACHE=/tmp/coworker-go-cache golangci-lint run ./...
+/bin/bash: line 1: golangci-lint: command not found
+exit 127
+```
+
+Supplemental checks:
+
+```text
+$ GOCACHE=/tmp/coworker-go-cache go vet ./...
+exit 0
+
+$ command -v staticcheck || echo 'staticcheck: not found'
+staticcheck: not found
+
+$ command -v gosec || echo 'gosec: not found'
+gosec: not found
+```
+
+Phase-level verification:
+
+- Phase 1: `go build ./...` exit 0; `go test ./store -count=1 -run TestDB` exit 0 (`[no tests to run]`).
+- Phase 2: `go build ./...` exit 0; `go test ./core -count=1` passed.
+- Phase 3: `go build ./...` exit 0; `go test ./store ./core -count=1 -timeout 60s` passed.
+- Phase 4: `go build ./...` exit 0; `go test ./store -count=1 -run TestPlanStore -timeout 60s` passed.
+- Phase 5: `go build ./...` exit 0; `go test ./store -count=1 -run TestCheckpointStore -timeout 60s` passed.
+- Phase 6: `go build ./...` exit 0; `go test ./store -count=1 -timeout 60s` passed.
+- Phase 7: `go build ./...` exit 0; `go test ./coding -count=1 -timeout 60s` passed; `go test ./cli -run '^$' -count=1 -timeout 60s` compiled the CLI package.
+- Phase 8: `go build ./...` exit 0; `go test ./coding/workflow ./mcp -count=1 -timeout 60s` passed; targeted non-socket CLI handler test passed.
+- Phase 9: `COWORKER_REGEN=1 go test ./store -count=1 -run TestReplay_RebuildProjectionsFromEventLog` passed and generated `testdata/golden_events/run_with_supervisor.jsonl`; `go test ./store -count=1 -run TestReplay -timeout 60s` passed.
+
+Non-trivial decisions:
+
+- Dispatcher supervisor persistence now writes one `supervisor.verdict` event and projection row per `RuleResult`, replacing the previous aggregate-only verdict event. Existing retry/compliance-breach events remain unchanged.
+- `CheckpointStore.ResolveCheckpoint` is idempotent: a second resolve returns nil and does not write a duplicate event.
+- Workflow plan IDs use `<runID>-plan-<number>` for durable rows, matching checkpoint `plan_id` references.
+- `attention` and `checkpoints` writes are paired at call sites, not a shared transaction, matching the plan's stated boundary.
+- Full re-projection from raw event payloads is not implemented in this plan; the replay test verifies canonical runtime emission, projection rows, and JSONL event-log round-trip scaffolding.
