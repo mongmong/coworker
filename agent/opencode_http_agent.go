@@ -7,8 +7,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/chris/coworker/core"
@@ -140,6 +142,10 @@ type openCodeJobHandle struct {
 	resultCh <-chan *core.JobResult
 	// cancel cancels the SSE goroutine context.
 	cancel context.CancelFunc
+	// messageWG tracks the fire-and-forget sendMessage goroutine. Cancel
+	// waits on it (with a timeout) so callers don't leak when the network
+	// hangs. Plan 123 (B5).
+	messageWG sync.WaitGroup
 }
 
 // Dispatch starts a job by:
@@ -173,21 +179,27 @@ func (a *OpenCodeHTTPAgent) Dispatch(ctx context.Context, job *core.Job, prompt 
 		resultCh <- result
 	}()
 
-	// 3. Fire the message POST in a goroutine so Dispatch returns immediately.
-	//    Findings come from the SSE stream; the POST response body is drained and
-	//    discarded. If the POST itself fails (non-2xx), the SSE goroutine will
-	//    eventually time out or see a session.error event — the caller should
-	//    always use a deadline on the Wait context.
-	go func() {
-		_ = a.sendMessage(sseCtx, client, base, sessionID, prompt)
-	}()
-
 	handle := &openCodeJobHandle{
 		sessionID: sessionID,
 		agent:     a,
 		resultCh:  resultCh,
 		cancel:    sseCancel,
 	}
+
+	// 3. Fire the message POST in a goroutine so Dispatch returns immediately.
+	//    Findings come from the SSE stream; the POST response body is drained and
+	//    discarded. If the POST itself fails (non-2xx), the SSE goroutine will
+	//    eventually time out or see a session.error event — the caller should
+	//    always use a deadline on the Wait context.
+	//
+	//    Tracked via messageWG so Cancel() can drain the goroutine with a
+	//    timeout instead of leaking on hung-network conditions. Plan 123 (B5).
+	handle.messageWG.Add(1)
+	go func() {
+		defer handle.messageWG.Done()
+		_ = a.sendMessage(sseCtx, client, base, sessionID, prompt)
+	}()
+
 	return handle, nil
 }
 
@@ -202,9 +214,13 @@ func (h *openCodeJobHandle) Wait(ctx context.Context) (*core.JobResult, error) {
 }
 
 // Cancel aborts the running session. It posts /session/{id}/abort first
-// (best-effort, may fail if the session is already done) and then cancels the
-// SSE goroutine context. Aborting before cancelling avoids a race where the
+// (best-effort, may fail if the session is already done), cancels the
+// SSE goroutine context, and waits up to 5 seconds for the message
+// goroutine to drain. Aborting before cancelling avoids a race where the
 // SSE goroutine runs its DELETE cleanup before the abort request arrives.
+// On message-goroutine timeout, log a warning and return; the goroutine
+// is leaked rather than blocking Cancel forever (best-effort cancel).
+// Plan 123 (B5).
 func (h *openCodeJobHandle) Cancel() error {
 	abortCtx, abortCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer abortCancel()
@@ -213,6 +229,20 @@ func (h *openCodeJobHandle) Cancel() error {
 	_ = h.agent.abortSession(abortCtx, h.agent.httpClient(), h.agent.serverURL(), h.sessionID)
 
 	h.cancel()
+
+	// Drain the message goroutine. Bounded so a hung POST cannot block
+	// Cancel forever; on timeout we log and let the goroutine leak.
+	done := make(chan struct{})
+	go func() {
+		h.messageWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		slog.Warn("opencode message goroutine did not drain within 5s",
+			"session_id", h.sessionID)
+	}
 	return nil
 }
 

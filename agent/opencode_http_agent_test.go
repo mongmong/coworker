@@ -374,6 +374,91 @@ func TestOpenCodeHTTPAgent_Cancel(t *testing.T) {
 	}
 }
 
+// TestOpenCodeHTTPAgent_CancelDrainsMessageGoroutine verifies that
+// Cancel waits for the message goroutine before returning (so it does
+// not leak). The drain returns immediately when the network responds to
+// context cancellation; this test asserts the WaitGroup wiring is
+// connected, not that the 5s timeout actually fires (which would
+// require a true network hang we cannot easily simulate in httptest).
+// Plan 123 (B5).
+func TestOpenCodeHTTPAgent_CancelDrainsMessageGoroutine(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /session", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(openCodeSessionResponse{ID: testSessionID}) //nolint:errcheck
+	})
+	mux.HandleFunc("POST /session/{sessionID}/message", func(w http.ResponseWriter, r *http.Request) {
+		// Sleep briefly so the message goroutine is genuinely alive
+		// when Cancel runs; respect context cancellation so the test
+		// terminates promptly when sseCtx cancels.
+		select {
+		case <-time.After(2 * time.Second):
+			json.NewEncoder(w).Encode(openCodeMessageResponse{}) //nolint:errcheck
+		case <-r.Context().Done():
+		}
+	})
+	mux.HandleFunc("DELETE /session/{sessionID}", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("POST /session/{sessionID}/abort", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("GET /event", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-r.Context().Done()
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	ag := &OpenCodeHTTPAgent{
+		ServerURL:  srv.URL,
+		HTTPClient: srv.Client(),
+	}
+
+	job := &core.Job{ID: "j-drain", RunID: "r-drain", Role: "developer", CLI: "opencode"}
+	handle, err := ag.Dispatch(context.Background(), job, "drain test")
+	if err != nil {
+		t.Fatalf("Dispatch: %v", err)
+	}
+	// Brief pause so the message goroutine actually starts the POST.
+	time.Sleep(50 * time.Millisecond)
+
+	start := time.Now()
+	if err := handle.Cancel(); err != nil {
+		t.Logf("Cancel returned: %v", err)
+	}
+	elapsed := time.Since(start)
+
+	// Cancel must return within the bound. Healthy networks drain fast
+	// (sub-second); the WaitGroup tops out at 5s after which the goroutine
+	// is logged-and-leaked.
+	if elapsed > 7*time.Second {
+		t.Errorf("Cancel took %v; expected <= 7s", elapsed)
+	}
+
+	// After Cancel returns, the message goroutine must have completed
+	// (modulo timeout-leak). We can verify by attempting a second
+	// messageWG.Wait — should be a no-op since Cancel already drained.
+	openCodeHandle, ok := handle.(*openCodeJobHandle)
+	if !ok {
+		t.Fatalf("handle type = %T, want *openCodeJobHandle", handle)
+	}
+	doneCh := make(chan struct{})
+	go func() {
+		openCodeHandle.messageWG.Wait()
+		close(doneCh)
+	}()
+	select {
+	case <-doneCh:
+		// Expected: WaitGroup is already drained.
+	case <-time.After(500 * time.Millisecond):
+		t.Error("messageWG.Wait blocked after Cancel returned; goroutine leaked past Cancel")
+	}
+}
+
 // TestOpenCodeHTTPAgent_SSEReconnect verifies that when the SSE connection
 // drops mid-stream, the agent reconnects and eventually receives session.idle.
 func TestOpenCodeHTTPAgent_SSEReconnect(t *testing.T) {
