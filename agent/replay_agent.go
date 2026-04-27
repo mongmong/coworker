@@ -110,6 +110,8 @@ func (h *replayHandle) Wait(ctx context.Context) (*core.JobResult, error) {
 		case "done":
 			result.ExitCode = msg.ExitCode
 		}
+		// Plan 121: extract cost from result/turn.completed events.
+		populateCost(msg, result)
 
 		if h.delay > 0 {
 			select {
