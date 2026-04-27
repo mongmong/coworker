@@ -1,0 +1,14 @@
+{
+    "developer": {
+        "exit_code": 0,
+        "findings_count": 0
+    },
+    "reviewer.arch": {
+        "exit_code": 0,
+        "findings_count": 2,
+        "fingerprints": [
+            "main.go:42:important",
+            "store.go:17:minor"
+        ]
+    }
+}
