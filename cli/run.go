@@ -778,6 +778,7 @@ func buildRunDispatcher(db *store.DB, policy *core.Policy, logger *slog.Logger) 
 		Logger:           logger,
 		Policy:           policy,
 		SupervisorWriter: store.NewSupervisorEventStore(db, store.NewEventStore(db)),
+		CostWriter:       store.NewCostEventStore(db, store.NewEventStore(db)),
 	}
 	return d, nil
 }

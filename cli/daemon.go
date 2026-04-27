@@ -255,6 +255,7 @@ func buildDaemonDispatcher(db *store.DB, roleDir, promptDir, cliBinary, claudeBi
 		DB:               db,
 		Logger:           logger,
 		SupervisorWriter: store.NewSupervisorEventStore(db, store.NewEventStore(db)),
+		CostWriter:       store.NewCostEventStore(db, store.NewEventStore(db)),
 	}
 	return d, nil
 }
