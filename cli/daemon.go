@@ -1,19 +1,34 @@
 package cli
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/sync/errgroup"
 
+	"github.com/chris/coworker/agent"
+	"github.com/chris/coworker/coding"
 	"github.com/chris/coworker/coding/eventbus"
 	mcpserver "github.com/chris/coworker/mcp"
 	"github.com/chris/coworker/store"
 )
 
-var daemonDBPath string
+var (
+	daemonDBPath    string
+	daemonHTTPPort  int
+	daemonRoleDir   string
+	daemonPromptDir string
+	daemonCliBinary string
+)
 
 var daemonCmd = &cobra.Command{
 	Use:   "daemon",
@@ -24,11 +39,20 @@ The daemon runs the job scheduler, event bus, and MCP server. CLI workers
 (Claude Code, Codex, OpenCode) connect to the MCP server via stdio transport
 to receive dispatches and report results.
 
+An HTTP/SSE server is also started (default port 7700) providing:
+  GET  /events                — SSE event stream
+  GET  /runs                  — list runs
+  GET  /runs/{id}             — run details
+  GET  /runs/{id}/jobs        — jobs for a run
+  GET  /attention             — list pending attention items
+  POST /attention/{id}/answer — answer an attention item
+
 The daemon blocks until interrupted (SIGINT / SIGTERM).
 
 Example:
   coworker daemon
-  coworker daemon --db /path/to/state.db`,
+  coworker daemon --db /path/to/state.db
+  coworker daemon --http-port 8080`,
 	RunE: func(cmd *cobra.Command, _ []string) error {
 		return runDaemon(cmd)
 	},
@@ -36,11 +60,21 @@ Example:
 
 func init() {
 	daemonCmd.Flags().StringVar(&daemonDBPath, "db", "", "Path to SQLite database (default: .coworker/state.db)")
+	daemonCmd.Flags().IntVar(&daemonHTTPPort, "http-port", 7700, "Port for the HTTP/SSE server")
+	daemonCmd.Flags().StringVar(&daemonRoleDir, "role-dir", "", "Path to the role YAML directory (default: .coworker/roles or coding/roles)")
+	daemonCmd.Flags().StringVar(&daemonPromptDir, "prompt-dir", "", "Path to the prompt template directory (default: .coworker or coding)")
+	daemonCmd.Flags().StringVar(&daemonCliBinary, "cli-binary", "", "Path to the CLI binary (default: codex)")
 	rootCmd.AddCommand(daemonCmd)
 }
 
 func runDaemon(cmd *cobra.Command) error {
-	ctx := cmd.Context()
+	// Build root context that cancels on SIGINT/SIGTERM.
+	ctx, cancel := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	logger := slog.New(slog.NewTextHandler(cmd.ErrOrStderr(), &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
 
 	// Resolve DB path.
 	dbPath := daemonDBPath
@@ -60,34 +94,109 @@ func runDaemon(cmd *cobra.Command) error {
 	}
 	defer func() {
 		if closeErr := db.Close(); closeErr != nil {
-			slog.Error("close database", "error", closeErr)
+			logger.Error("close database", "error", closeErr)
 		}
 	}()
 
-	slog.Info("database opened", "path", dbPath)
+	logger.Info("database opened", "path", dbPath)
 
 	// Create the event bus.
 	bus := eventbus.NewInMemoryBus()
 
-	// Create the MCP server.
+	// Build the Dispatcher so MCP role invocations drive real jobs.
+	dispatcher, err := buildDaemonDispatcher(db, daemonRoleDir, daemonPromptDir, daemonCliBinary, logger)
+	if err != nil {
+		return fmt.Errorf("build dispatcher: %w", err)
+	}
+
+	// Create the MCP server with the real Dispatcher wired in.
 	srv, err := mcpserver.NewServer(mcpserver.ServerConfig{
-		DB:       db,
-		EventBus: bus,
-		// Dispatcher is wired in a later plan phase once the full dispatch
-		// pipeline is integrated with the persistent-worker protocol.
+		DB:         db,
+		EventBus:   bus,
+		Dispatcher: dispatcher,
 	})
 	if err != nil {
 		return fmt.Errorf("create mcp server: %w", err)
 	}
 
-	slog.Info("coworker daemon starting", "db", dbPath)
+	// Build the HTTP mux sharing the same DB and event bus.
+	es := store.NewEventStore(db)
+	mux := buildHTTPMux(bus, httpStores{
+		run:       store.NewRunStore(db, es),
+		job:       store.NewJobStore(db, es),
+		attention: store.NewAttentionStore(db),
+	})
 
-	// Run blocks until ctx is cancelled (SIGINT/SIGTERM via Execute's
-	// signal.NotifyContext) or the stdio transport closes.
-	if err := srv.Run(ctx); err != nil {
-		return fmt.Errorf("daemon: %w", err)
+	logger.Info("coworker daemon starting", "db", dbPath, "http_port", daemonHTTPPort)
+
+	// Run MCP stdio server and HTTP server concurrently with mutual cancellation.
+	// Whichever goroutine exits first calls cancel(), shutting down the other.
+	g, gCtx := errgroup.WithContext(ctx)
+
+	g.Go(func() error {
+		defer cancel() // MCP exit cancels HTTP peer
+		if err := srv.Run(gCtx); err != nil {
+			return fmt.Errorf("mcp server: %w", err)
+		}
+		return nil
+	})
+
+	g.Go(func() error {
+		defer cancel() // HTTP exit cancels MCP peer
+		httpSrv := &http.Server{
+			Addr:              fmt.Sprintf(":%d", daemonHTTPPort),
+			Handler:           mux,
+			ReadHeaderTimeout: 10 * time.Second, // mitigate Slowloris (gosec G112)
+		}
+		// Graceful shutdown when context is cancelled.
+		go func() {
+			<-gCtx.Done()
+			_ = httpSrv.Shutdown(context.Background())
+		}()
+		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return fmt.Errorf("http server: %w", err)
+		}
+		return nil
+	})
+
+	if err := g.Wait(); err != nil {
+		return err
 	}
 
-	slog.Info("coworker daemon stopped")
+	logger.Info("coworker daemon stopped")
 	return nil
+}
+
+// buildDaemonDispatcher constructs a *coding.Dispatcher for the daemon.
+// It resolves role/prompt directories using the same fallback logic as
+// buildRunDispatcher in cli/run.go.
+func buildDaemonDispatcher(db *store.DB, roleDir, promptDir, cliBinary string, logger *slog.Logger) (*coding.Dispatcher, error) {
+	if roleDir == "" {
+		roleDir = filepath.Join(".coworker", "roles")
+		if _, err := os.Stat(roleDir); os.IsNotExist(err) {
+			roleDir = filepath.Join("coding", "roles")
+		}
+	}
+
+	if promptDir == "" {
+		coworkerDir := ".coworker"
+		if _, err := os.Stat(coworkerDir); os.IsNotExist(err) {
+			promptDir = "coding"
+		} else {
+			promptDir = coworkerDir
+		}
+	}
+
+	if cliBinary == "" {
+		cliBinary = "codex"
+	}
+
+	d := &coding.Dispatcher{
+		RoleDir:   roleDir,
+		PromptDir: promptDir,
+		Agent:     agent.NewCliAgent(cliBinary),
+		DB:        db,
+		Logger:    logger,
+	}
+	return d, nil
 }

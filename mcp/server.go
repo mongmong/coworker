@@ -334,6 +334,42 @@ func (s *Server) registerTools() {
 		)
 	}
 
+	// --- checkpoint tools ----------------------------------------------------
+
+	if s.stores.attention != nil {
+		mcp.AddTool(s.inner,
+			&mcp.Tool{
+				Name:        "orch_checkpoint_list",
+				Description: "List all checkpoint attention items for a run. run_id is required.",
+			},
+			handleCheckpointList(s.stores.attention),
+		)
+		mcp.AddTool(s.inner,
+			&mcp.Tool{
+				Name:        "orch_checkpoint_advance",
+				Description: "Approve a checkpoint, writing answer=approve and resolving the item.",
+			},
+			handleCheckpointAdvance(s.stores.attention),
+		)
+		mcp.AddTool(s.inner,
+			&mcp.Tool{
+				Name:        "orch_checkpoint_rollback",
+				Description: "Reject a checkpoint, writing answer=reject and resolving the item.",
+			},
+			handleCheckpointRollback(s.stores.attention),
+		)
+	} else {
+		for _, name := range []string{"orch_checkpoint_list", "orch_checkpoint_advance", "orch_checkpoint_rollback"} {
+			n := name
+			mcp.AddTool(s.inner,
+				&mcp.Tool{Name: n},
+				func(_ context.Context, _ *mcp.CallToolRequest, _ emptyInput) (*mcp.CallToolResult, notImplemented, error) {
+					return nil, stubResult(), nil
+				},
+			)
+		}
+	}
+
 	// --- registry tools ------------------------------------------------------
 
 	if s.stores.worker != nil {
@@ -386,8 +422,11 @@ func (s *Server) Tools() []string {
 		"orch_findings_list",
 		"orch_artifact_read",
 		"orch_artifact_write",
-		"orch_register",   // Plan 105
-		"orch_heartbeat",  // Plan 105
-		"orch_deregister", // Plan 105
+		"orch_checkpoint_list",     // Plan 116
+		"orch_checkpoint_advance",  // Plan 116
+		"orch_checkpoint_rollback", // Plan 116
+		"orch_register",            // Plan 105
+		"orch_heartbeat",           // Plan 105
+		"orch_deregister",          // Plan 105
 	}
 }

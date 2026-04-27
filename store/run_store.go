@@ -76,6 +76,40 @@ func (s *RunStore) GetRun(ctx context.Context, id string) (*core.Run, error) {
 	return &run, nil
 }
 
+// ListRuns retrieves all runs ordered by started_at descending.
+func (s *RunStore) ListRuns(ctx context.Context) ([]*core.Run, error) {
+	rows, err := s.db.QueryContext(ctx,
+		"SELECT id, mode, state, started_at, ended_at FROM runs ORDER BY started_at DESC")
+	if err != nil {
+		return nil, fmt.Errorf("list runs: %w", err)
+	}
+	defer rows.Close()
+
+	var runs []*core.Run
+	for rows.Next() {
+		var run core.Run
+		var stateStr, startedAtStr string
+		var endedAtStr sql.NullString
+		if err := rows.Scan(&run.ID, &run.Mode, &stateStr, &startedAtStr, &endedAtStr); err != nil {
+			return nil, fmt.Errorf("scan run: %w", err)
+		}
+		run.State = core.RunState(stateStr)
+		run.StartedAt, _ = time.Parse("2006-01-02T15:04:05Z", startedAtStr)
+		if endedAtStr.Valid {
+			t, _ := time.Parse("2006-01-02T15:04:05Z", endedAtStr.String)
+			run.EndedAt = &t
+		}
+		runs = append(runs, &run)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows error: %w", err)
+	}
+	if runs == nil {
+		runs = []*core.Run{}
+	}
+	return runs, nil
+}
+
 // CompleteRun marks a run as completed and writes a run.completed event.
 func (s *RunStore) CompleteRun(ctx context.Context, runID string, state core.RunState) error {
 	now := time.Now()

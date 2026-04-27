@@ -20,7 +20,7 @@ func TestNewServer(t *testing.T) {
 }
 
 // TestServerToolsRegistered verifies that every orch.* tool required by the
-// Plan 104/105 spec is present in the server's tool list.
+// Plan 104/105/116 spec is present in the server's tool list.
 func TestServerToolsRegistered(t *testing.T) {
 	want := []string{
 		"orch_run_status",
@@ -34,9 +34,12 @@ func TestServerToolsRegistered(t *testing.T) {
 		"orch_findings_list",
 		"orch_artifact_read",
 		"orch_artifact_write",
-		"orch_register",   // Plan 105
-		"orch_heartbeat",  // Plan 105
-		"orch_deregister", // Plan 105
+		"orch_checkpoint_list",     // Plan 116
+		"orch_checkpoint_advance",  // Plan 116
+		"orch_checkpoint_rollback", // Plan 116
+		"orch_register",            // Plan 105
+		"orch_heartbeat",           // Plan 105
+		"orch_deregister",          // Plan 105
 	}
 
 	s, err := mcpserver.NewServer(mcpserver.ServerConfig{})
