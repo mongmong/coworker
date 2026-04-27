@@ -1,0 +1,37 @@
+name: supervisor
+concurrency: single
+cli: codex
+prompt_template: prompts/supervisor.md
+inputs:
+  required:
+    - job_id
+    - job_outputs_path
+    - rules_path
+outputs:
+  contract:
+    verdict_emitted: true
+    findings_have_severity: true
+  emits:
+    verdict: string  # "pass" | "retry" | "escalate"
+    rules_evaluated: []
+    failed_rules: []
+    notes: string
+sandbox: read-only
+permissions:
+  allowed_tools:
+    - read
+    - grep
+    - glob
+    - "bash:codex"
+  never:
+    - write
+    - edit
+    - "bash:rm"
+  requires_human: []
+budget:
+  max_tokens_per_job: 50000
+  max_wallclock_minutes: 5
+  max_cost_usd: 1.00
+retry_policy:
+  on_contract_fail: skip
+  on_job_error: retry_once

@@ -217,10 +217,40 @@ git commit -m "Plan 124 Phase 1: supervisor.yaml + supervisor.md (role files)"
 
 ## Code Review
 
-(To be filled in.)
+### Codex pre-implementation review (2026-04-27)
+All 6 questions cleared. Verdict: READY-TO-IMPLEMENT.
+
+(Plan was small enough that no post-impl review was warranted; verified end-to-end via the role loader test suite + full `-race` run + lint.)
+
+### Verification
+
+```text
+$ go build ./...                                  → clean
+$ go test -race ./... -count=1 -timeout 180s      → 30 ok, 0 failed, 0 races
+$ golangci-lint run ./...                         → 0 issues
+```
 
 ---
 
 ## Post-Execution Report
 
-(To be filled in.)
+### Date
+2026-04-27
+
+### Implementation summary
+
+Two files added; one decisions entry.
+
+- `coding/roles/supervisor.yaml` — full role definition matching the spec catalog. CLI=codex, sandbox=read-only, three required inputs (`job_id`, `job_outputs_path`, `rules_path`), declared verdict outputs.
+- `coding/prompts/supervisor.md` — prompt template for LLM-backed supervisor dispatch. Documents how to evaluate contract + quality rules and emit a verdict.
+- `docs/architecture/decisions.md` Decision 12 — documents the dual implementation: in-process (default, faster, V1 production) vs. dispatchable role (forward-looking, opt-in via future plan).
+
+`cli/init.go` already copies `coding/roles/*.yaml` and `coding/prompts/*.md` automatically — no init code changes needed.
+
+### Verification
+
+Existing role-loader tests pass with the new file picked up automatically. Full suite + lint clean.
+
+### Notes / deviations from plan
+
+None. Codex pre-impl review confirmed all six concerns cleared.
