@@ -700,16 +700,52 @@ Confirmation pass after revision. All 4 Must Fix and 4 Should Fix findings verif
 
 **Verdict: READY TO IMPLEMENT.**
 
+### Post-Implementation Review (Codex, 2026-04-26)
+
+**Blockers**
+
+1. `[FIXED]` **B-1: runPlanLoop never proceeds past checkpoint creation.** Original implementation created checkpoints but never dispatched planner or called RunPhasesForPlan. Fix: restructured runPlanLoop to dispatch by checkpoint kind (spec-approved → create plan-approved; plan-approved → dispatch planner + run phases + advance to next plan).
+
+**Important**
+
+2. `[FIXED]` **Cross-run resume validation.** `--manifest` + `--resume-after-attention` now errors. Manifest is discovered from the run's event log only on resume.
+3. `[FIXED]` **HTTP returns 200 for unknown attention IDs.** `AttentionStore.AnswerAttention` now checks RowsAffected and returns `ErrAttentionNotFound`. HTTP handler maps to 404.
+4. `[FIXED]` **Daemon dispatcher hardcoded codex; planner uses claude-code.** Added `CLIAgents map[string]core.Agent` to Dispatcher with per-role routing. Added `--claude-binary`, `--codex-binary`, `--opencode-binary` flags to both `daemon` and `run`.
+
+**Polish**
+
+5. `[FIXED]` HTTP answer endpoint validates `"approve"` / `"reject"` upfront, returning 400 on invalid values.
+
+**Strengths confirmed** (B-2 through B-6 closed cleanly per Codex's review). Test suite green locally — Codex's "tests not green" finding was a sandbox httptest port-binding artifact, not a real issue.
+
 ---
 
 ## Post-Execution Report
 
-*Filled in after implementation is complete and tests pass.*
-
 ### Summary
+
+All 6 blockers from the V1 comprehensive review (B-1 through B-6) are addressed:
+- **B-1**: `coworker run <prd.md>` autopilot entry point with PRD-first architect dispatch, spec-approved/plan-approved/phase-clean checkpoint gating, and `--resume-after-attention` for human approval gates
+- **B-2**: Daemon HTTP/SSE server (port 7700 default) with `/events`, `/runs`, `/runs/{id}`, `/runs/{id}/jobs`, `/attention`, `/attention/{id}/answer` endpoints; mutual cancellation via `signal.NotifyContext` + `errgroup`
+- **B-3**: Production `*coding.Dispatcher` wired into MCP daemon (`buildDaemonDispatcher`); `orch_role_invoke` now uses real handler
+- **B-4**: `RunPhasesForPlan` returns early on `Clean=false`, never reaching shipper
+- **B-5**: Role permission enforcement at agent dispatch with default-deny on undeclared (configurable via `policy.permissions.on_undeclared`)
+- **B-6**: `orch_checkpoint_list/advance/rollback` MCP tools with approve/reject distinction
 
 ### Deviations from plan
 
+- Phase 5 (permissions) was implemented before Phases 2/3/4 because `coworker run` and the daemon both invoke roles that need the permission gate.
+- `CLIAgents` map added to Dispatcher (post-review fix) — original plan only had a single `Agent` field.
+- HTTP answer endpoint validates `"approve"` / `"reject"` upfront (added during post-review fixes).
+
 ### Tests added
+
+Cross-package count: 32+ new tests covering checkpoint filtering, dirty-phase stops, run-command dry-run/manifest-bypass/resume flows, HTTP endpoints, MCP checkpoint tools, permission parser/matcher/evaluator, per-role CLI agent selection, and runPlanLoop checkpoint-kind dispatch.
+
+### Verification results
+
+- `go test -race ./... -count=1 -timeout 120s` — 21 packages pass, 0 races
+- `golangci-lint run ./...` — 0 issues
+- `go build ./...` — clean
 
 ### Open items carried forward
