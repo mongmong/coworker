@@ -1,0 +1,153 @@
+package store
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/chris/coworker/core"
+)
+
+func setupCostStoreTest(t *testing.T) (*EventStore, *RunStore, *JobStore, *CostEventStore, context.Context, string, string) {
+	t.Helper()
+	db := setupTestDB(t)
+	es := NewEventStore(db)
+	rs := NewRunStore(db, es)
+	js := NewJobStore(db, es)
+	cs := NewCostEventStore(db, es)
+	ctx := context.Background()
+	runID := "run_cost_store"
+	jobID := "job_cost_store"
+	createTestRun(t, rs, ctx, runID)
+	if err := js.CreateJob(ctx, &core.Job{
+		ID:           jobID,
+		RunID:        runID,
+		Role:         "developer",
+		State:        core.JobStatePending,
+		DispatchedBy: "scheduler",
+		StartedAt:    time.Now(),
+	}); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	return es, rs, js, cs, ctx, runID, jobID
+}
+
+func TestCostEventStore_RecordCostWritesRowEventAndBumpsTotals(t *testing.T) {
+	es, rs, js, cs, ctx, runID, jobID := setupCostStoreTest(t)
+	sample := core.CostSample{
+		Provider:  "anthropic",
+		Model:     "claude-opus",
+		TokensIn:  100,
+		TokensOut: 50,
+		USD:       0.25,
+	}
+	if err := cs.RecordCost(ctx, runID, jobID, sample); err != nil {
+		t.Fatalf("RecordCost: %v", err)
+	}
+
+	rows, err := cs.ListByJob(ctx, jobID)
+	if err != nil {
+		t.Fatalf("ListByJob: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("len(rows) = %d, want 1", len(rows))
+	}
+	if rows[0].Provider != sample.Provider || rows[0].Model != sample.Model ||
+		rows[0].TokensIn != sample.TokensIn || rows[0].TokensOut != sample.TokensOut || rows[0].USD != sample.USD {
+		t.Errorf("cost row mismatch: %+v", rows[0])
+	}
+
+	events, err := es.ListEvents(ctx, runID)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	if events[len(events)-1].Kind != core.EventCostDelta {
+		t.Errorf("last event kind = %q, want %q", events[len(events)-1].Kind, core.EventCostDelta)
+	}
+
+	run, err := rs.GetRun(ctx, runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if run.CostUSD != sample.USD {
+		t.Errorf("run.CostUSD = %v, want %v", run.CostUSD, sample.USD)
+	}
+	job, err := js.GetJob(ctx, jobID)
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	if job.CostUSD != sample.USD {
+		t.Errorf("job.CostUSD = %v, want %v", job.CostUSD, sample.USD)
+	}
+}
+
+func TestCostEventStore_SumsAndAccumulation(t *testing.T) {
+	_, rs, js, cs, ctx, runID, jobID := setupCostStoreTest(t)
+	if got, err := cs.SumByRun(ctx, runID); err != nil || got != 0 {
+		t.Fatalf("empty SumByRun = %v, %v; want 0, nil", got, err)
+	}
+	samples := []core.CostSample{
+		{Provider: "openai", Model: "gpt-a", TokensIn: 10, TokensOut: 5, USD: 0.10},
+		{Provider: "openai", Model: "gpt-a", TokensIn: 20, TokensOut: 7, USD: 0.15},
+	}
+	for _, sample := range samples {
+		if err := cs.RecordCost(ctx, runID, jobID, sample); err != nil {
+			t.Fatalf("RecordCost: %v", err)
+		}
+	}
+
+	for _, tc := range []struct {
+		name string
+		got  func() (float64, error)
+	}{
+		{name: "run", got: func() (float64, error) { return cs.SumByRun(ctx, runID) }},
+		{name: "job", got: func() (float64, error) { return cs.SumByJob(ctx, jobID) }},
+	} {
+		got, err := tc.got()
+		if err != nil {
+			t.Fatalf("SumBy%s: %v", tc.name, err)
+		}
+		if got != 0.25 {
+			t.Errorf("SumBy%s = %v, want 0.25", tc.name, got)
+		}
+	}
+
+	run, err := rs.GetRun(ctx, runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	job, err := js.GetJob(ctx, jobID)
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	if run.CostUSD != 0.25 || job.CostUSD != 0.25 {
+		t.Errorf("cumulative costs run/job = %v/%v, want 0.25/0.25", run.CostUSD, job.CostUSD)
+	}
+}
+
+func TestCostEventStore_RollsBackEventOnProjectionFailure(t *testing.T) {
+	db := setupTestDB(t)
+	es := NewEventStore(db)
+	cs := NewCostEventStore(db, es)
+	ctx := context.Background()
+
+	before, err := es.ListEvents(ctx, "missing-run")
+	if err != nil {
+		t.Fatalf("ListEvents before: %v", err)
+	}
+	err = cs.RecordCost(ctx, "missing-run", "missing-job", core.CostSample{
+		Provider: "openai",
+		Model:    "gpt",
+		USD:      0.01,
+	})
+	if err == nil {
+		t.Fatal("RecordCost with missing FK succeeded, want error")
+	}
+	after, err := es.ListEvents(ctx, "missing-run")
+	if err != nil {
+		t.Fatalf("ListEvents after: %v", err)
+	}
+	if len(after) != len(before) {
+		t.Fatalf("event count after failed projection = %d, want %d", len(after), len(before))
+	}
+}
