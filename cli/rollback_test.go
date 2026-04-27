@@ -92,6 +92,36 @@ func TestRollback_NotACheckpoint(t *testing.T) {
 	}
 }
 
+func TestRollback_AnsweredByFlag(t *testing.T) {
+	dbPath, _, attentionID := advanceTestEnv(t, true)
+
+	saveAndRestoreRollbackFlags(t)
+	rollbackDBPath = dbPath
+	rollbackAnsweredBy = "alice"
+
+	buf := &bytes.Buffer{}
+	cmd := &cobra.Command{}
+	cmd.SetOut(buf)
+	cmd.SetContext(context.Background())
+	if err := runRollback(cmd, []string{attentionID}); err != nil {
+		t.Fatalf("runRollback: %v", err)
+	}
+
+	db, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	as := store.NewAttentionStore(db)
+	item, err := as.GetAttentionByID(context.Background(), attentionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if item.AnsweredBy != "alice" {
+		t.Errorf("AnsweredBy = %q, want %q", item.AnsweredBy, "alice")
+	}
+}
+
 func TestRollback_ResolvesCheckpoint(t *testing.T) {
 	dbPath, _, attentionID := advanceTestEnv(t, true)
 

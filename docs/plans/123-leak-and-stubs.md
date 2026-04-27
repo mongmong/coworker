@@ -439,10 +439,64 @@ Expected: build clean, all tests PASS, 0 lint issues.
 
 ## Code Review
 
-(To be filled in after implementation by Codex review subagent.)
+### Codex post-implementation review (2026-04-27)
+
+#### Important — `--answered-by` flag not test-covered for rollback [FIXED]
+
+`cli/rollback_test.go` had no test asserting that `--answered-by` propagates through the CLI to the MCP wrapper. The flag was wired in production but coverage was asymmetric with `advance` (which had `TestAdvance_AnsweredByFlag`).
+
+→ Fixed: added `TestRollback_AnsweredByFlag` mirroring the advance test. 5 rollback tests total now.
+
+### Verification
+
+```text
+$ go build ./...                                    → clean
+$ go test -race ./... -count=1 -timeout 180s        → 30 ok, 0 failed, 0 races
+$ golangci-lint run ./...                           → 0 issues
+```
 
 ---
 
 ## Post-Execution Report
 
-(To be filled in after implementation.)
+### Date
+2026-04-27
+
+### Implementation summary
+
+Five phases.
+
+**Phase 0 — `AttentionStore.GetAnyUnansweredCheckpointForRun`**
+The existing `GetUnansweredCheckpointForRun` filters source by exact match; passing empty string would only return rows where `source = ''`. Added a sibling method that omits the source predicate. Used by the new `advance` CLI command.
+
+**Phase 1 — B5 fix: opencode message goroutine WaitGroup**
+- `openCodeJobHandle.messageWG sync.WaitGroup` field added.
+- `Dispatch` wraps the fire-and-forget `sendMessage` goroutine with `Add(1)` + `defer Done()`.
+- `Cancel` waits the WaitGroup with a 5-second timeout. On timeout, `slog.Warn` fires; Cancel returns nil regardless (best-effort posture per Decision 11).
+- New test `TestOpenCodeHTTPAgent_CancelDrainsMessageGoroutine` asserts (a) Cancel returns within 7s; (b) the WaitGroup is fully drained when Cancel returns (no second-pass blocking).
+
+**Phase 2 — B6: implement `advance`**
+- Reads active session, finds most-recent unanswered checkpoint via `GetAnyUnansweredCheckpointForRun`, calls `mcp.CallCheckpointAdvance` (one source of truth for advance semantics).
+- New `--answered-by <user>` flag (default "cli").
+- 4 tests: no-session, no-checkpoint, success path, --answered-by.
+
+**Phase 3 — B6: implement `rollback`**
+- Same pattern. `rollback <checkpoint-id>` is explicit; the MCP handler validates ID + kind.
+- 5 tests: no-session, unknown-id, not-a-checkpoint, --answered-by, success path.
+
+**Phase 4 — Decisions + lint fix**
+- `nolint:gosec G118` annotation on `sseCtx, sseCancel := context.WithCancel(ctx)` (cancel is invoked indirectly via `handle.cancel`).
+- Decisions 10 + 11 appended.
+
+### Verification
+
+```text
+go build ./...                                    → clean
+go test -race ./... -count=1 -timeout 180s        → 30 ok, 0 failed, 0 races
+golangci-lint run ./...                           → 0 issues
+```
+
+### Notes / deviations from plan
+
+- The drain test's lower-bound assertion (`elapsed >= 4.5s`) was dropped — when the network promptly cancels (which httptest does), the goroutine drains fast and the lower bound never fires. The test now asserts only the upper bound (Cancel returns within 7s) plus that the WaitGroup is genuinely drained (a second `Wait` returns immediately).
+- Codex post-impl review caught the missing `TestRollback_AnsweredByFlag`; added before merge.
