@@ -45,11 +45,13 @@ func (s *JobStore) CreateJob(ctx context.Context, job *core.Job) error {
 
 	return s.event.WriteEventThenRow(ctx, event, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx,
-			`INSERT INTO jobs (id, run_id, role, state, dispatched_by, cli, started_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			`INSERT INTO jobs (id, run_id, role, state, dispatched_by, cli, started_at,
+				plan_id, phase_index, cost_usd)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			job.ID, job.RunID, job.Role, string(job.State),
 			job.DispatchedBy, job.CLI,
 			job.StartedAt.Format("2006-01-02T15:04:05Z"),
+			job.PlanID, job.PhaseIndex, job.CostUSD,
 		)
 		return err
 	})
@@ -112,7 +114,9 @@ func (s *JobStore) UpdateJobState(ctx context.Context, jobID string, newState co
 // ListJobsByRun retrieves all jobs for a run ordered by started_at ascending.
 func (s *JobStore) ListJobsByRun(ctx context.Context, runID string) ([]*core.Job, error) {
 	rows, err := s.db.QueryContext(ctx,
-		"SELECT id, run_id, role, state, dispatched_by, cli, started_at, ended_at FROM jobs WHERE run_id = ? ORDER BY started_at ASC",
+		`SELECT id, run_id, role, state, dispatched_by, cli, started_at, ended_at,
+			plan_id, phase_index, cost_usd
+		FROM jobs WHERE run_id = ? ORDER BY started_at ASC`,
 		runID)
 	if err != nil {
 		return nil, fmt.Errorf("list jobs by run: %w", err)
@@ -125,7 +129,8 @@ func (s *JobStore) ListJobsByRun(ctx context.Context, runID string) ([]*core.Job
 		var stateStr, startedAtStr string
 		var endedAtStr sql.NullString
 		if err := rows.Scan(&job.ID, &job.RunID, &job.Role, &stateStr,
-			&job.DispatchedBy, &job.CLI, &startedAtStr, &endedAtStr); err != nil {
+			&job.DispatchedBy, &job.CLI, &startedAtStr, &endedAtStr,
+			&job.PlanID, &job.PhaseIndex, &job.CostUSD); err != nil {
 			return nil, fmt.Errorf("scan job: %w", err)
 		}
 		job.State = core.JobState(stateStr)
@@ -152,9 +157,12 @@ func (s *JobStore) GetJob(ctx context.Context, id string) (*core.Job, error) {
 	var endedAtStr sql.NullString
 
 	err := s.db.QueryRowContext(ctx,
-		"SELECT id, run_id, role, state, dispatched_by, cli, started_at, ended_at FROM jobs WHERE id = ?", id,
+		`SELECT id, run_id, role, state, dispatched_by, cli, started_at, ended_at,
+			plan_id, phase_index, cost_usd
+		FROM jobs WHERE id = ?`, id,
 	).Scan(&job.ID, &job.RunID, &job.Role, &stateStr,
-		&job.DispatchedBy, &job.CLI, &startedAtStr, &endedAtStr)
+		&job.DispatchedBy, &job.CLI, &startedAtStr, &endedAtStr,
+		&job.PlanID, &job.PhaseIndex, &job.CostUSD)
 	if err != nil {
 		return nil, fmt.Errorf("get job %q: %w", id, err)
 	}

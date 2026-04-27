@@ -175,3 +175,54 @@ func TestGetJob_NotFound(t *testing.T) {
 		t.Error("expected error for nonexistent job, got nil")
 	}
 }
+
+func TestJobStore_NewSpecColumnsRoundTrip(t *testing.T) {
+	db := setupTestDB(t)
+	es := NewEventStore(db)
+	rs := NewRunStore(db, es)
+	js := NewJobStore(db, es)
+	ctx := context.Background()
+
+	createTestRun(t, rs, ctx, "run_job_spec_columns")
+
+	in := &core.Job{
+		ID:           "job_spec_columns",
+		RunID:        "run_job_spec_columns",
+		Role:         "developer",
+		State:        core.JobStatePending,
+		DispatchedBy: "scheduler",
+		CLI:          "codex",
+		StartedAt:    time.Now(),
+		PlanID:       "plan-1",
+		PhaseIndex:   2,
+		CostUSD:      0.75,
+	}
+	if err := js.CreateJob(ctx, in); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+
+	out, err := js.GetJob(ctx, in.ID)
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	if out.PlanID != in.PlanID {
+		t.Errorf("PlanID = %q, want %q", out.PlanID, in.PlanID)
+	}
+	if out.PhaseIndex != in.PhaseIndex {
+		t.Errorf("PhaseIndex = %d, want %d", out.PhaseIndex, in.PhaseIndex)
+	}
+	if out.CostUSD != in.CostUSD {
+		t.Errorf("CostUSD = %v, want %v", out.CostUSD, in.CostUSD)
+	}
+
+	listed, err := js.ListJobsByRun(ctx, in.RunID)
+	if err != nil {
+		t.Fatalf("ListJobsByRun: %v", err)
+	}
+	if len(listed) != 1 {
+		t.Fatalf("ListJobsByRun len = %d, want 1", len(listed))
+	}
+	if listed[0].PlanID != in.PlanID || listed[0].PhaseIndex != in.PhaseIndex || listed[0].CostUSD != in.CostUSD {
+		t.Errorf("ListJobsByRun round-trip mismatch: got %+v, want %+v", listed[0], in)
+	}
+}

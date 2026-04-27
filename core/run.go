@@ -21,4 +21,8 @@ type Run struct {
 	State     RunState
 	StartedAt time.Time
 	EndedAt   *time.Time
+	PRDPath   string
+	SpecPath  string
+	CostUSD   float64
+	BudgetUSD *float64 // nil = no budget
 }
