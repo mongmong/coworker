@@ -116,6 +116,7 @@ func runAutopilot(cmd *cobra.Command, prdPath string) error {
 	eventStore := store.NewEventStore(db)
 	runStore := store.NewRunStore(db, eventStore)
 	attentionStore := store.NewAttentionStore(db)
+	checkpointStore := store.NewCheckpointStore(db, eventStore)
 
 	// Load policy (optional; nil if file doesn't exist).
 	policy := loadRunPolicy(runPolicyPath, logger)
@@ -136,7 +137,7 @@ func runAutopilot(cmd *cobra.Command, prdPath string) error {
 			return fmt.Errorf("cannot use --manifest with --resume-after-attention; " +
 				"the manifest is discovered automatically from the resumed run's event log — omit --manifest")
 		}
-		return resumeAfterAttention(ctx, cmd, runResumeAfterAttention, prdPath, db, runStore, attentionStore, eventStore, policy, logger)
+		return resumeAfterAttention(ctx, cmd, runResumeAfterAttention, prdPath, db, runStore, attentionStore, checkpointStore, eventStore, policy, logger)
 	}
 
 	// Obtain a run ID and resolved manifest path.
@@ -146,7 +147,7 @@ func runAutopilot(cmd *cobra.Command, prdPath string) error {
 	}
 
 	// Insert spec-approved checkpoint and pause.
-	return insertSpecApprovedCheckpoint(ctx, cmd, prdPath, runID, resolvedManifestPath, attentionStore, logger)
+	return insertSpecApprovedCheckpoint(ctx, cmd, prdPath, runID, resolvedManifestPath, attentionStore, checkpointStore, logger)
 }
 
 // runDryRunMode prints the dry-run schedule without touching the DB.
@@ -285,9 +286,10 @@ func insertSpecApprovedCheckpoint(
 	runID string,
 	manifestPath string,
 	attentionStore *store.AttentionStore,
+	checkpointWriter core.CheckpointWriter,
 	logger *slog.Logger,
 ) error {
-	checkpointID, err := insertRunCheckpoint(ctx, attentionStore, runID, "spec-approved", "run-command")
+	checkpointID, err := insertRunCheckpoint(ctx, attentionStore, checkpointWriter, runID, "spec-approved", "run-command")
 	if err != nil {
 		return fmt.Errorf("insert spec-approved checkpoint: %w", err)
 	}
@@ -313,6 +315,7 @@ func resumeAfterAttention(
 	db *store.DB,
 	runStore *store.RunStore,
 	attentionStore *store.AttentionStore,
+	checkpointWriter core.CheckpointWriter,
 	eventStore *store.EventStore,
 	policy *core.Policy,
 	logger *slog.Logger,
@@ -380,7 +383,7 @@ func resumeAfterAttention(
 
 	// Run the plan iteration loop, passing the approved item so the loop knows
 	// whether this resume is a spec-approved or plan-approved gate.
-	return runPlanLoop(ctx, cmd, runID, manifestPath, item, completed, active, db, policy, attentionStore, eventStore, logger)
+	return runPlanLoop(ctx, cmd, runID, manifestPath, item, completed, active, db, policy, attentionStore, checkpointWriter, eventStore, logger)
 }
 
 // WorkflowRunner is the interface used by runPlanLoop to execute plan phases.
@@ -428,10 +431,11 @@ func runPlanLoop(
 	db *store.DB,
 	policy *core.Policy,
 	attentionStore *store.AttentionStore,
+	checkpointWriter core.CheckpointWriter,
 	eventStore *store.EventStore,
 	logger *slog.Logger,
 ) error {
-	return runPlanLoopWithDeps(ctx, cmd, runID, manifestPath, item, completed, active, db, policy, attentionStore, eventStore, logger, nil)
+	return runPlanLoopWithDeps(ctx, cmd, runID, manifestPath, item, completed, active, db, policy, attentionStore, checkpointWriter, eventStore, logger, nil)
 }
 
 // runPlanLoopWithDeps is the testable variant of runPlanLoop.
@@ -448,6 +452,7 @@ func runPlanLoopWithDeps(
 	db *store.DB,
 	policy *core.Policy,
 	attentionStore *store.AttentionStore,
+	checkpointWriter core.CheckpointWriter,
 	eventStore *store.EventStore,
 	logger *slog.Logger,
 	deps *planLoopDeps,
@@ -457,13 +462,14 @@ func runPlanLoopWithDeps(
 		return fmt.Errorf("load manifest: %w", err)
 	}
 	logger.Info("manifest loaded", "spec_path", m.SpecPath, "plans", len(m.Plans))
+	recordRunPlans(ctx, runID, m, store.NewPlanStore(db, eventStore))
 
 	scheduler := manifest.NewDAGScheduler(m, policy)
 
 	// spec-approved gate: the user has approved the spec. Find the first ready
 	// plan, create a plan-approved checkpoint, and pause.
 	if item.Question == "spec-approved" {
-		return runPlanLoopCreateNextCheckpoint(ctx, cmd, runID, scheduler, completed, active, attentionStore, eventStore, logger)
+		return runPlanLoopCreateNextCheckpoint(ctx, cmd, runID, scheduler, completed, active, attentionStore, checkpointWriter, eventStore, logger)
 	}
 
 	// plan-approved gate: the user has approved a specific plan. Execute it.
@@ -495,11 +501,13 @@ func runPlanLoopWithDeps(
 				}
 			}
 			runner = &workflow.BuildFromPRDWorkflow{
-				ManifestPath: manifestPath,
-				Policy:       policy,
-				Logger:       logger,
-				WorkDir:      cwd,
-				RoleDir:      effectiveRoleDir,
+				ManifestPath:     manifestPath,
+				Policy:           policy,
+				Logger:           logger,
+				WorkDir:          cwd,
+				RoleDir:          effectiveRoleDir,
+				PlanWriter:       store.NewPlanStore(db, eventStore),
+				CheckpointWriter: checkpointWriter,
 			}
 		}
 
@@ -596,7 +604,7 @@ func runPlanLoopWithDeps(
 		}
 
 		// Continue to the next ready plan: create a checkpoint or print done.
-		return runPlanLoopCreateNextCheckpoint(ctx, cmd, runID, scheduler, completed, active, attentionStore, eventStore, logger)
+		return runPlanLoopCreateNextCheckpoint(ctx, cmd, runID, scheduler, completed, active, attentionStore, checkpointWriter, eventStore, logger)
 	}
 
 	return fmt.Errorf("unknown checkpoint question %q for attention item %s; expected spec-approved or plan-approved", item.Question, item.ID)
@@ -614,6 +622,7 @@ func runPlanLoopCreateNextCheckpoint(
 	completed map[int]bool,
 	active map[int]bool,
 	attentionStore *store.AttentionStore,
+	checkpointWriter core.CheckpointWriter,
 	eventStore *store.EventStore,
 	logger *slog.Logger,
 ) error {
@@ -638,7 +647,7 @@ func runPlanLoopCreateNextCheckpoint(
 			logger.Error("write phase.started event", "error", evtErr, "plan_id", plan.ID)
 		}
 
-		checkpointID, chkErr := insertRunCheckpoint(ctx, attentionStore, runID, "plan-approved", fmt.Sprintf("plan-%d", plan.ID))
+		checkpointID, chkErr := insertRunCheckpoint(ctx, attentionStore, checkpointWriter, runID, "plan-approved", fmt.Sprintf("plan-%d", plan.ID))
 		if chkErr != nil {
 			return fmt.Errorf("insert plan-approved checkpoint for plan %d: %w", plan.ID, chkErr)
 		}
@@ -773,8 +782,8 @@ func buildRunDispatcher(db *store.DB, policy *core.Policy, logger *slog.Logger) 
 	return d, nil
 }
 
-// insertRunCheckpoint inserts a checkpoint attention item and returns its ID.
-func insertRunCheckpoint(ctx context.Context, as *store.AttentionStore, runID, label, source string) (string, error) {
+// insertRunCheckpoint inserts a checkpoint attention item and paired checkpoint row, returning its ID.
+func insertRunCheckpoint(ctx context.Context, as *store.AttentionStore, cw core.CheckpointWriter, runID, label, source string) (string, error) {
 	item := &core.AttentionItem{
 		ID:        core.NewID(),
 		RunID:     runID,
@@ -786,7 +795,42 @@ func insertRunCheckpoint(ctx context.Context, as *store.AttentionStore, runID, l
 	if err := as.InsertAttention(ctx, item); err != nil {
 		return "", fmt.Errorf("insert checkpoint %q: %w", label, err)
 	}
+	if cw != nil {
+		if err := cw.CreateCheckpoint(ctx, core.CheckpointRecord{
+			ID:     item.ID,
+			RunID:  runID,
+			PlanID: checkpointPlanID(runID, source),
+			Kind:   label,
+			Notes:  source,
+		}); err != nil {
+			return "", fmt.Errorf("insert checkpoint row %q: %w", label, err)
+		}
+	}
 	return item.ID, nil
+}
+
+func checkpointPlanID(runID, source string) string {
+	planID := extractPlanIDFromSource(source)
+	if planID <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("%s-plan-%d", runID, planID)
+}
+
+func recordRunPlans(ctx context.Context, runID string, m *manifest.PlanManifest, pw core.PlanWriter) {
+	if pw == nil || m == nil {
+		return
+	}
+	for _, p := range m.Plans {
+		_ = pw.CreatePlan(ctx, core.PlanRecord{
+			ID:       fmt.Sprintf("%s-plan-%d", runID, p.ID),
+			RunID:    runID,
+			Number:   p.ID,
+			Title:    p.Title,
+			BlocksOn: p.BlocksOn,
+			State:    "pending",
+		})
+	}
 }
 
 // loadRunPolicy loads the policy YAML from policyPath. If policyPath is empty,

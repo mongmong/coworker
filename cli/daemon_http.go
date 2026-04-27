@@ -13,9 +13,10 @@ import (
 // httpStores bundles the store-layer objects used by the HTTP handlers.
 // All fields are expected to be non-nil when the HTTP server is active.
 type httpStores struct {
-	run       *store.RunStore
-	job       *store.JobStore
-	attention *store.AttentionStore
+	run        *store.RunStore
+	job        *store.JobStore
+	attention  *store.AttentionStore
+	checkpoint core.CheckpointWriter
 }
 
 // buildHTTPMux constructs the HTTP mux for the daemon's REST + SSE surface.
@@ -35,7 +36,7 @@ func buildHTTPMux(bus *eventbus.InMemoryBus, s httpStores) *http.ServeMux {
 	mux.HandleFunc("GET /runs/{id}", handleGetRun(s.run))
 	mux.HandleFunc("GET /runs/{id}/jobs", handleListJobs(s.job))
 	mux.HandleFunc("GET /attention", handleListAttention(s.attention))
-	mux.HandleFunc("POST /attention/{id}/answer", handleAnswerAttention(s.attention))
+	mux.HandleFunc("POST /attention/{id}/answer", handleAnswerAttention(s.attention, s.checkpoint))
 
 	return mux
 }
@@ -109,7 +110,7 @@ type answerRequest struct {
 }
 
 // handleAnswerAttention returns an http.HandlerFunc that answers an attention item.
-func handleAnswerAttention(as *store.AttentionStore) http.HandlerFunc {
+func handleAnswerAttention(as *store.AttentionStore, cw core.CheckpointWriter) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := r.PathValue("id")
 
@@ -130,6 +131,16 @@ func handleAnswerAttention(as *store.AttentionStore) http.HandlerFunc {
 			req.AnsweredBy = "http"
 		}
 
+		item, err := as.GetAttentionByID(r.Context(), id)
+		if err != nil {
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		if item == nil {
+			http.Error(w, "attention item not found", http.StatusNotFound)
+			return
+		}
+
 		if err := as.AnswerAttention(r.Context(), id, req.Answer, req.AnsweredBy); err != nil {
 			if errors.Is(err, store.ErrAttentionNotFound) {
 				http.Error(w, "attention item not found", http.StatusNotFound)
@@ -141,6 +152,12 @@ func handleAnswerAttention(as *store.AttentionStore) http.HandlerFunc {
 		// Best-effort: the answer is already persisted; resolution is a convenience.
 		//nolint:errcheck // best-effort resolve
 		_ = as.ResolveAttention(r.Context(), id)
+		if item.Kind == core.AttentionCheckpoint && cw != nil {
+			if err := cw.ResolveCheckpoint(r.Context(), id, req.Answer, req.AnsweredBy, ""); err != nil {
+				http.Error(w, "internal error", http.StatusInternalServerError)
+				return
+			}
+		}
 
 		respondJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	}

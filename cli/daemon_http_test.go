@@ -33,9 +33,10 @@ func newHTTPTestStores(t *testing.T, db *store.DB) httpStores {
 	t.Helper()
 	es := store.NewEventStore(db)
 	return httpStores{
-		run:       store.NewRunStore(db, es),
-		job:       store.NewJobStore(db, es),
-		attention: store.NewAttentionStore(db),
+		run:        store.NewRunStore(db, es),
+		job:        store.NewJobStore(db, es),
+		attention:  store.NewAttentionStore(db),
+		checkpoint: store.NewCheckpointStore(db, es),
 	}
 }
 
@@ -198,6 +199,11 @@ func TestHandleListAttention(t *testing.T) {
 	if err := s.attention.InsertAttention(context.Background(), item); err != nil {
 		t.Fatalf("InsertAttention: %v", err)
 	}
+	if err := s.checkpoint.CreateCheckpoint(context.Background(), core.CheckpointRecord{
+		ID: item.ID, RunID: item.RunID, Kind: string(item.Kind),
+	}); err != nil {
+		t.Fatalf("CreateCheckpoint: %v", err)
+	}
 
 	bus := eventbus.NewInMemoryBus()
 	ts := httptest.NewServer(buildHTTPMux(bus, s))
@@ -286,6 +292,13 @@ func TestHandleAnswerAttention(t *testing.T) {
 	}
 	if answered.AnsweredBy != "human" {
 		t.Errorf("answered_by = %q, want %q", answered.AnsweredBy, "human")
+	}
+	checkpoint, err := store.NewCheckpointStore(db, store.NewEventStore(db)).GetCheckpoint(context.Background(), item.ID)
+	if err != nil {
+		t.Fatalf("GetCheckpoint: %v", err)
+	}
+	if checkpoint.State != "resolved" || checkpoint.Decision != "approve" {
+		t.Errorf("checkpoint state/decision = %q/%q, want resolved/approve", checkpoint.State, checkpoint.Decision)
 	}
 }
 
@@ -451,6 +464,11 @@ func TestHandleListAttention_AfterAnswer(t *testing.T) {
 	if err := s.attention.InsertAttention(context.Background(), item); err != nil {
 		t.Fatalf("InsertAttention: %v", err)
 	}
+	if err := s.checkpoint.CreateCheckpoint(context.Background(), core.CheckpointRecord{
+		ID: item.ID, RunID: item.RunID, Kind: string(item.Kind),
+	}); err != nil {
+		t.Fatalf("CreateCheckpoint: %v", err)
+	}
 
 	bus := eventbus.NewInMemoryBus()
 	ts := httptest.NewServer(buildHTTPMux(bus, s))
@@ -571,6 +589,54 @@ func TestHandleAnswerAttention_InvalidAnswer(t *testing.T) {
 	if resp.StatusCode != http.StatusBadRequest {
 		bodyStr, _ := io.ReadAll(resp.Body)
 		t.Fatalf("status = %d, want 400; body: %s", resp.StatusCode, bodyStr)
+	}
+}
+
+type recordingCheckpointWriter struct {
+	created  []core.CheckpointRecord
+	resolved []string
+}
+
+func (r *recordingCheckpointWriter) CreateCheckpoint(_ context.Context, c core.CheckpointRecord) error {
+	r.created = append(r.created, c)
+	return nil
+}
+
+func (r *recordingCheckpointWriter) ResolveCheckpoint(_ context.Context, id, _, _, _ string) error {
+	r.resolved = append(r.resolved, id)
+	return nil
+}
+
+func TestAnswerAttention_NonCheckpointDoesNotResolveCheckpoint(t *testing.T) {
+	db := openHTTPTestDB(t)
+	s := newHTTPTestStores(t, db)
+	createHTTPTestRun(t, s, "run_non_checkpoint_answer", "autopilot")
+	rec := &recordingCheckpointWriter{}
+	s.checkpoint = rec
+
+	item := &core.AttentionItem{
+		ID:        core.NewID(),
+		RunID:     "run_non_checkpoint_answer",
+		Kind:      core.AttentionQuestion,
+		Source:    "test",
+		Question:  "Proceed?",
+		CreatedAt: time.Now(),
+	}
+	if err := s.attention.InsertAttention(context.Background(), item); err != nil {
+		t.Fatalf("InsertAttention: %v", err)
+	}
+
+	bodyBytes, _ := json.Marshal(map[string]string{"answer": "approve", "answered_by": "human"})
+	req := httptest.NewRequest(http.MethodPost, "/attention/"+item.ID+"/answer", bytes.NewReader(bodyBytes))
+	req.SetPathValue("id", item.ID)
+	rr := httptest.NewRecorder()
+	handleAnswerAttention(s.attention, s.checkpoint).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rr.Code, rr.Body.String())
+	}
+	if len(rec.resolved) != 0 {
+		t.Fatalf("resolved checkpoint calls = %v, want none", rec.resolved)
 	}
 }
 

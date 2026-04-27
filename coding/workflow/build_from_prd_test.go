@@ -25,6 +25,38 @@ func (s *stubOrchestrator) Orchestrate(_ context.Context, _ *coding.DispatchInpu
 	return &coding.DispatchResult{ExitCode: 0}, nil
 }
 
+type recordingPlanWriter struct {
+	mu      sync.Mutex
+	created []core.PlanRecord
+	states  []string
+}
+
+func (r *recordingPlanWriter) CreatePlan(_ context.Context, p core.PlanRecord) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.created = append(r.created, p)
+	return nil
+}
+
+func (r *recordingPlanWriter) UpdatePlanState(_ context.Context, planID, state string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.states = append(r.states, planID+":"+state)
+	return nil
+}
+
+func (r *recordingPlanWriter) UpdatePlanBranchAndPR(context.Context, string, string, string) error {
+	return nil
+}
+
+func (r *recordingPlanWriter) createdPlans() []core.PlanRecord {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]core.PlanRecord, len(r.created))
+	copy(out, r.created)
+	return out
+}
+
 // openTestDB opens an in-memory SQLite database for workflow tests.
 func openTestDB(t *testing.T) *store.DB {
 	t.Helper()
@@ -141,6 +173,29 @@ func TestBuildFromPRDWorkflow_Run_NoWorktrees(t *testing.T) {
 	}
 	if len(result.Worktrees) != 0 {
 		t.Errorf("expected no worktrees (no manager), got %d", len(result.Worktrees))
+	}
+}
+
+func TestSchedulePlans_CallsPlanWriter(t *testing.T) {
+	path := writeManifest(t, testManifestYAML)
+	writer := &recordingPlanWriter{}
+	w := workflow.NewBuildFromPRDWorkflow(path, nil)
+	w.PlanWriter = writer
+
+	_, err := w.Run(context.Background(), nil, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	created := writer.createdPlans()
+	if len(created) != 3 {
+		t.Fatalf("created plans = %d, want 3", len(created))
+	}
+	if created[0].Number != 100 || created[0].Title != "Core runtime" {
+		t.Errorf("created[0] = %+v, want plan 100 Core runtime", created[0])
+	}
+	if len(created[1].BlocksOn) != 1 || created[1].BlocksOn[0] != 100 {
+		t.Errorf("created[1].BlocksOn = %v, want [100]", created[1].BlocksOn)
 	}
 }
 
