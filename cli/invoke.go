@@ -114,10 +114,21 @@ func runInvoke(cmd *cobra.Command, roleName string) error {
 		Level: slog.LevelInfo,
 	}))
 
+	// Derive CoworkerDir from the --db flag's parent directory so JSONL logs
+	// are written under the correct .coworker directory.
+	coworkerDir := invokeDBPath
+	if coworkerDir == "" {
+		coworkerDir = ".coworker"
+	} else {
+		coworkerDir = filepath.Dir(coworkerDir)
+	}
+	cliAgent := agent.NewCliAgent(agentBinary)
+	cliAgent.CoworkerDir = coworkerDir
+
 	d := &coding.Dispatcher{
 		RoleDir:   roleDir,
 		PromptDir: promptDir,
-		Agent:     agent.NewCliAgent(agentBinary),
+		Agent:     cliAgent,
 		DB:        db,
 		Logger:    logger,
 	}

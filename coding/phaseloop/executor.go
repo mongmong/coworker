@@ -196,7 +196,7 @@ func (e *PhaseExecutor) runLoop(
 		}
 
 		// Step 2: fan-out reviewers + tester in parallel.
-		reviewerResults, err := e.fanOut(ctx, inputs, log)
+		reviewerResults, err := e.fanOut(ctx, runID, inputs, log)
 		if err != nil {
 			return nil, fmt.Errorf("phase %d/%d fan-out: %w", planID, phaseIndex, err)
 		}
@@ -304,6 +304,7 @@ func (e *PhaseExecutor) testerRoles() []string {
 // job.skipped event is emitted for each skipped role.
 func (e *PhaseExecutor) fanOut(
 	ctx context.Context,
+	runID string,
 	inputs map[string]string,
 	log *slog.Logger,
 ) ([]*coding.DispatchResult, error) {
@@ -337,7 +338,7 @@ func (e *PhaseExecutor) fanOut(
 					}
 				} else if shouldSkip {
 					log.Info("role skipped by applies_when", "role", roleName)
-					e.emitJobSkippedEvent(gCtx, roleName)
+					e.emitJobSkippedEvent(gCtx, runID, roleName)
 					results[i] = &coding.DispatchResult{} // sentinel: empty result, not nil
 					return nil
 				}
@@ -397,7 +398,7 @@ func (e *PhaseExecutor) roleShouldSkip(ctx context.Context, role *core.Role) (bo
 
 // emitJobSkippedEvent writes a job.skipped event to the EventStore.
 // Errors are logged but not returned — skipped events are best-effort.
-func (e *PhaseExecutor) emitJobSkippedEvent(ctx context.Context, roleName string) {
+func (e *PhaseExecutor) emitJobSkippedEvent(ctx context.Context, runID, roleName string) {
 	payload, err := json.Marshal(map[string]string{
 		"role":   roleName,
 		"reason": "applies_when=false",
@@ -409,6 +410,7 @@ func (e *PhaseExecutor) emitJobSkippedEvent(ctx context.Context, roleName string
 
 	event := &core.Event{
 		ID:            core.NewID(),
+		RunID:         runID,
 		Kind:          core.EventJobSkipped,
 		SchemaVersion: 1,
 		Payload:       string(payload),

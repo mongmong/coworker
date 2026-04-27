@@ -56,6 +56,14 @@ type BuildFromPRDWorkflow struct {
 	// by predicates (adequate for single-worktree runs).
 	WorkDir string
 
+	// RoleDir is the directory containing role YAML files. When set, it is
+	// propagated to PhaseExecutor.RoleDir before each RunPhasesForPlan call,
+	// enabling applies_when evaluation (role YAMLs are loaded to check
+	// predicates before dispatching). When empty, PhaseExecutor.RoleDir is
+	// not modified (applies_when evaluation is skipped if it was not already
+	// configured on PhaseExecutor).
+	RoleDir string
+
 	// Logger is the structured logger. Uses slog.Default() if nil.
 	Logger *slog.Logger
 }
@@ -226,6 +234,11 @@ func (w *BuildFromPRDWorkflow) RunPhasesForPlan(
 	// Propagate WorkDir to PhaseExecutor for applies_when evaluation.
 	if w.WorkDir != "" {
 		w.PhaseExecutor.WorkDir = w.WorkDir
+	}
+
+	// Propagate RoleDir to PhaseExecutor so applies_when can load role YAMLs.
+	if w.RoleDir != "" {
+		w.PhaseExecutor.RoleDir = w.RoleDir
 	}
 
 	log := w.logger()

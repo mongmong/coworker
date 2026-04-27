@@ -662,6 +662,100 @@ func TestRunPhasesForPlan_AttentionItemID_NilStore(t *testing.T) {
 	}
 }
 
+// TestBuildFromPRDWorkflow_RoleDir_PropagatedToPhaseExecutor verifies that
+// RoleDir set on BuildFromPRDWorkflow is propagated to PhaseExecutor before
+// each RunPhasesForPlan call.
+func TestBuildFromPRDWorkflow_RoleDir_PropagatedToPhaseExecutor(t *testing.T) {
+	path := writeManifest(t, testManifestYAML)
+
+	db := openTestDB(t)
+	exec := &phaseloop.PhaseExecutor{
+		Dispatcher: &stubOrchestrator{},
+		EventStore: store.NewEventStore(db),
+	}
+
+	w := workflow.NewBuildFromPRDWorkflow(path, nil)
+	w.PhaseExecutor = exec
+	w.RoleDir = "/custom/roles"
+
+	plan := manifest.PlanEntry{ID: 100, Title: "Core runtime", Phases: []string{"build"}}
+	_, err := w.RunPhasesForPlan(context.Background(), "run-roledir", plan, map[string]string{
+		"diff_path": "/tmp/test.diff",
+		"spec_path": "/tmp/spec.md",
+	})
+	if err != nil {
+		t.Fatalf("RunPhasesForPlan: %v", err)
+	}
+
+	// After RunPhasesForPlan the PhaseExecutor.RoleDir must equal w.RoleDir.
+	if exec.RoleDir != w.RoleDir {
+		t.Errorf("PhaseExecutor.RoleDir = %q, want %q", exec.RoleDir, w.RoleDir)
+	}
+}
+
+// TestBuildFromPRDWorkflow_StageRegistry_TesterOverride verifies that when a
+// StageRegistry overrides "phase-test", the custom tester role is dispatched
+// instead of (not in addition to) the default "tester" role.
+func TestBuildFromPRDWorkflow_StageRegistry_TesterOverride(t *testing.T) {
+	path := writeManifest(t, testManifestYAML)
+
+	// Policy overrides "phase-test" with a single custom tester.
+	policy := &core.Policy{
+		WorkflowOverrides: map[string]map[string][]string{
+			"build-from-prd": {
+				"phase-test": {"custom-tester"},
+			},
+		},
+	}
+
+	registry := stages.NewStageRegistry(
+		stages.WorkflowBuildFromPRD,
+		stages.DefaultStages,
+		policy,
+	)
+
+	rec := &recordingOrchestrator{}
+	db := openTestDB(t)
+	exec := &phaseloop.PhaseExecutor{
+		Dispatcher: rec,
+		EventStore: store.NewEventStore(db),
+	}
+
+	w := workflow.NewBuildFromPRDWorkflow(path, nil)
+	w.PhaseExecutor = exec
+	w.StageRegistry = registry
+
+	plan := manifest.PlanEntry{ID: 201, Title: "Phase-test registry test", Phases: []string{"build"}}
+	_, err := w.RunPhasesForPlan(context.Background(), "run-tester-registry", plan, map[string]string{
+		"diff_path": "/tmp/test.diff",
+		"spec_path": "/tmp/spec.md",
+	})
+	if err != nil {
+		t.Fatalf("RunPhasesForPlan: %v", err)
+	}
+
+	dispatched := rec.dispatched()
+
+	// "custom-tester" must appear in dispatched roles.
+	foundCustom := false
+	for _, r := range dispatched {
+		if r == "custom-tester" {
+			foundCustom = true
+			break
+		}
+	}
+	if !foundCustom {
+		t.Errorf("expected custom-tester to be dispatched; got roles: %v", dispatched)
+	}
+
+	// Default tester must NOT appear (it was replaced, not appended).
+	for _, r := range dispatched {
+		if r == "tester" {
+			t.Errorf("default tester dispatched despite phase-test registry override; got roles: %v", dispatched)
+		}
+	}
+}
+
 // TestRunPhasesForPlan_CleanPhases_ShipCalled verifies that when all phases
 // are clean, StoppedAtPhaseClean is false and the shipper is called.
 func TestRunPhasesForPlan_CleanPhases_ShipCalled(t *testing.T) {

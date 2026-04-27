@@ -1229,6 +1229,44 @@ All 5 Must Fix and 3 Should Fix items from the initial pre-implementation review
 **Verdict: READY TO IMPLEMENT**
 The revised plan now explicitly covers every prior Must Fix and Should Fix item with implementation steps and tests.
 
+### Post-Implementation Review (Codex, 2026-04-26)
+
+**Blockers**
+
+- **I-3: `applies_when` is not wired into the workflow path, so role predicates are skipped unless tests/manual callers set `PhaseExecutor.RoleDir`.** `fanOut` only loads role YAML and evaluates `AppliesWhen` when `e.RoleDir != ""` (`coding/phaseloop/executor.go:321`, `coding/phaseloop/executor.go:323`). `BuildFromPRDWorkflow` propagates only `WorkDir` to the executor (`coding/workflow/build_from_prd.go:226`, `coding/workflow/build_from_prd.go:229`) and has no `RoleDir` field or assignment. A repo-wide search found no production assignment to `PhaseExecutor.RoleDir`; the only assignment is in a test (`coding/phaseloop/executor_test.go:405`). Result: the shipped `reviewer_frontend.yaml` predicate (`coding/roles/reviewer_frontend.yaml:16`) is parsed by `roles.LoadRole`, but the phase-loop path will not evaluate it by default.
+
+- **I-9: JSONL persistence is implemented but not enabled in actual CLI/daemon dispatchers.** `OpenJobLog` intentionally returns `io.Discard` when `coworkerDir == ""` (`agent/log_writer.go:13`, `agent/log_writer.go:15`), and `CliAgent.CoworkerDir` defaults empty (`agent/cli_agent.go:20`, `agent/cli_agent.go:23`). The run, invoke, and daemon dispatchers construct agents with `agent.NewCliAgent(...)` and never set `CoworkerDir` (`cli/run.go:721`, `cli/run.go:730`; `cli/invoke.go:117`, `cli/invoke.go:121`; `cli/daemon.go:216`, `cli/daemon.go:223`). Result: normal `coworker run`, `coworker invoke`, and daemon dispatches parse output but do not persist `.coworker/runs/<run-id>/jobs/<job-id>.jsonl`.
+
+- **I-7: subprocess timeout handling does not meet the "all 5 sites with `BudgetTimeout` + `WaitDelay`" target.** The shared helper exists (`internal/executil/timeout.go:11`) and dispatcher wraps agent dispatch contexts with it (`coding/dispatch.go:375`, `coding/dispatch.go:379`), but `CliAgent` itself starts the subprocess without `cmd.WaitDelay` (`agent/cli_agent.go:50`, `agent/cli_agent.go:51`). Three of the other subprocess sites use package-local fixed `context.WithTimeout` calls instead of `executil.BudgetTimeout`: worktree git (`coding/manifest/worktree.go:118`, `coding/manifest/worktree.go:127`), human-edit git (`coding/humanedit/recorder.go:35`, `coding/humanedit/recorder.go:40`), and `gh pr create` (`coding/shipper/gh.go:12`, `coding/shipper/gh.go:26`). `CLIJudge` is the only direct subprocess site using `BudgetTimeout` and `WaitDelay` together (`coding/quality/judge.go:71`, `coding/quality/judge.go:75`).
+
+**Important**
+
+- **I-3: skipped-role events are not correlated to the run.** `fanOut` calls `emitJobSkippedEvent(gCtx, roleName)` without a `runID` argument (`coding/phaseloop/executor.go:338`, `coding/phaseloop/executor.go:340`), and the emitted `core.Event` omits `RunID` entirely (`coding/phaseloop/executor.go:410`, `coding/phaseloop/executor.go:416`). The event row may be written, but `ListEvents(ctx, runID)` will not return it for the run being audited.
+
+- **I-3: loader validation for empty `applies_when` is missing.** `core.Role` has `AppliesWhen *RoleAppliesWhen` (`core/role.go:17`) and YAML unmarshalling will populate it (`coding/roles/loader.go:29`, `coding/roles/loader.go:34`), but `validateRole` does not reject `applies_when: {}` or an empty `changes_touch` list (`coding/roles/loader.go:79`, `coding/roles/loader.go:99`). The phase-loop fallback then treats an `AppliesWhen` block with no `changes_touch` as unconditional dispatch (`coding/phaseloop/executor.go:383`, `coding/phaseloop/executor.go:395`). `coding/roles/loader_test.go` has no tests for `applies_when` parse or empty-predicate rejection (`coding/roles/loader_test.go:10`, `coding/roles/loader_test.go:153`).
+
+- **I-2: workflow-level `phase-test` registry behavior is not directly tested.** `RunPhasesForPlan` does assign `TesterRoles = RolesForStage("phase-test")` (`coding/workflow/build_from_prd.go:215`, `coding/workflow/build_from_prd.go:223`), and the executor helper has correct nil/non-empty/empty semantics (`coding/phaseloop/executor.go:292`, `coding/phaseloop/executor.go:299`). However, workflow tests only cover a `phase-review` override (`coding/workflow/build_from_prd_test.go:290`, `coding/workflow/build_from_prd_test.go:350`); the `phase-test: []` and default-registry tester behavior are covered only at `PhaseExecutor` level (`coding/phaseloop/executor_test.go:424`, `coding/phaseloop/executor_test.go:487`).
+
+**Polish**
+
+- **Phase 8 behavior is correct, but offset timestamp coverage is thinner than planned.** The writer uses `event.CreatedAt.UTC().Format(time.RFC3339)` (`store/event_store.go:61`) and the reader parses with `time.Parse(time.RFC3339, createdAtStr)` and returns parse errors (`store/event_store.go:139`, `store/event_store.go:142`). Tests cover non-zero round-trip and malformed timestamp errors (`store/event_store_test.go:387`, `store/event_store_test.go:425`), but there is no raw-SQL `+00:00`/offset timestamp test matching the plan's explicit `TestListEvents_TimestampWithOffset`.
+
+- **The new JSONL tests verify the empty-dir discard behavior but not actual raw-line preservation.** Empty `CoworkerDir` is safe (`agent/log_writer_test.go:13`, `agent/log_writer_test.go:24`), and a configured directory creates a non-empty log (`agent/log_writer_test.go:53`, `agent/log_writer_test.go:91`). The test does not assert that both expected JSONL lines are preserved verbatim, only that the file is non-empty.
+
+**Strengths**
+
+- **I-1 is implemented correctly.** The trigger blocks changes to `run_id`, `job_id`, `path`, `line`, `severity`, `body`, and `fingerprint` (`store/migrations/006_findings_immutability.sql:13`, `store/migrations/006_findings_immutability.sql:21`) while allowing `ResolveFinding` to update resolution fields, covered by tests (`store/finding_store_test.go:94`, `store/finding_store_test.go:173`).
+
+- **I-2 executor semantics are correct.** `TesterRoles == nil` uses the default tester, non-empty uses custom testers, and non-nil empty disables testers (`coding/phaseloop/executor.go:292`, `coding/phaseloop/executor.go:299`), with unit coverage for all three (`coding/phaseloop/executor_test.go:424`, `coding/phaseloop/executor_test.go:487`).
+
+- **I-3 predicate logic is shared between supervisor and phase-loop.** The shared implementation lives in `internal/predicates/changes_touch.go` (`internal/predicates/changes_touch.go:12`, `internal/predicates/changes_touch.go:24`), supervisor delegates to it (`coding/supervisor/predicates.go:255`, `coding/supervisor/predicates.go:258`), and phase-loop uses the same function when `RoleDir`/`WorkDir` are configured (`coding/phaseloop/executor.go:383`, `coding/phaseloop/executor.go:392`).
+
+- **I-4 and I-5 target behavior is covered.** Supervisor evaluation errors mark the job failed and are returned (`coding/dispatch.go:409`, `coding/dispatch.go:416`), and `Orchestrate` marks the run failed on attempt errors (`coding/dispatch.go:194`, `coding/dispatch.go:202`), with tests asserting both persisted states (`coding/dispatch_test.go:985`, `coding/dispatch_test.go:1068`). Judge errors emit `quality.verdict` with `status="error"` and block-capable errors create attention items (`coding/quality/evaluator.go:88`, `coding/quality/evaluator.go:120`; `coding/quality/evaluator_test.go:402`, `coding/quality/evaluator_test.go:521`).
+
+- **I-10 read/write timestamp paths are fixed.** Both event writes and reads use `time.RFC3339`, and malformed timestamps return errors instead of zero values (`store/event_store.go:61`, `store/event_store.go:139`; `store/event_store_test.go:425`, `store/event_store_test.go:443`).
+
+- **Test run:** `go test ./...` was run. All packages passed except `github.com/chris/coworker/cli`, which failed in `TestHandleListRuns` at `cli/daemon_http_test.go:80` because `httptest.NewServer` could not bind `tcp6 [::1]:0` (`socket: operation not permitted`). Per the task note, this is treated as a Codex sandbox port-binding quirk, not a product bug.
+
 ---
 
 ## Post-Execution Report

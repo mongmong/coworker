@@ -189,8 +189,16 @@ func buildDaemonDispatcher(db *store.DB, roleDir, promptDir, cliBinary, claudeBi
 		}
 	}
 
+	// Resolve the effective coworker directory for JSONL log persistence.
+	// The daemon always uses .coworker (derived from the DB path's parent).
+	coworkerDir := daemonDBPath
+	if coworkerDir == "" {
+		coworkerDir = ".coworker"
+	} else {
+		coworkerDir = filepath.Dir(coworkerDir)
+	}
+
 	if promptDir == "" {
-		coworkerDir := ".coworker"
 		if _, err := os.Stat(coworkerDir); os.IsNotExist(err) {
 			promptDir = "coding"
 		} else {
@@ -203,7 +211,6 @@ func buildDaemonDispatcher(db *store.DB, roleDir, promptDir, cliBinary, claudeBi
 	}
 
 	// Build per-CLI agent map. Defaults from PATH when flags are empty.
-	cliAgents := make(map[string]core.Agent)
 	if claudeBinary == "" {
 		claudeBinary = "claude"
 	}
@@ -213,14 +220,23 @@ func buildDaemonDispatcher(db *store.DB, roleDir, promptDir, cliBinary, claudeBi
 	if openCodeBinary == "" {
 		openCodeBinary = "opencode"
 	}
-	cliAgents["claude-code"] = agent.NewCliAgent(claudeBinary)
-	cliAgents["codex"] = agent.NewCliAgent(codexBinary)
-	cliAgents["opencode"] = agent.NewCliAgent(openCodeBinary)
+
+	newAgentWithDir := func(bin string) *agent.CliAgent {
+		a := agent.NewCliAgent(bin)
+		a.CoworkerDir = coworkerDir
+		return a
+	}
+
+	cliAgents := map[string]core.Agent{
+		"claude-code": newAgentWithDir(claudeBinary),
+		"codex":       newAgentWithDir(codexBinary),
+		"opencode":    newAgentWithDir(openCodeBinary),
+	}
 
 	d := &coding.Dispatcher{
 		RoleDir:   roleDir,
 		PromptDir: promptDir,
-		Agent:     agent.NewCliAgent(cliBinary),
+		Agent:     newAgentWithDir(cliBinary),
 		CLIAgents: cliAgents,
 		DB:        db,
 		Logger:    logger,

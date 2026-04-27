@@ -484,11 +484,20 @@ func runPlanLoopWithDeps(
 			runner = deps.Runner
 		} else {
 			cwd, _ := os.Getwd()
+			// Resolve the effective role directory (same logic as buildRunDispatcher).
+			effectiveRoleDir := runRoleDir
+			if effectiveRoleDir == "" {
+				effectiveRoleDir = filepath.Join(".coworker", "roles")
+				if _, statErr := os.Stat(effectiveRoleDir); os.IsNotExist(statErr) {
+					effectiveRoleDir = filepath.Join("coding", "roles")
+				}
+			}
 			runner = &workflow.BuildFromPRDWorkflow{
 				ManifestPath: manifestPath,
 				Policy:       policy,
 				Logger:       logger,
 				WorkDir:      cwd,
+				RoleDir:      effectiveRoleDir,
 			}
 		}
 
@@ -705,6 +714,15 @@ func buildRunDispatcher(db *store.DB, policy *core.Policy, logger *slog.Logger) 
 		agentBinary = "codex"
 	}
 
+	// Derive CoworkerDir from the --db flag's parent directory so JSONL logs
+	// are written under the correct .coworker directory.
+	coworkerDir := runDBPath
+	if coworkerDir == "" {
+		coworkerDir = ".coworker"
+	} else {
+		coworkerDir = filepath.Dir(coworkerDir)
+	}
+
 	// Build per-CLI agent map. Defaults from PATH when flags are empty.
 	claudeBin := runClaudeBinary
 	if claudeBin == "" {
@@ -718,16 +736,23 @@ func buildRunDispatcher(db *store.DB, policy *core.Policy, logger *slog.Logger) 
 	if openCodeBin == "" {
 		openCodeBin = "opencode"
 	}
+
+	newAgentWithDir := func(bin string) *agent.CliAgent {
+		a := agent.NewCliAgent(bin)
+		a.CoworkerDir = coworkerDir
+		return a
+	}
+
 	cliAgents := map[string]core.Agent{
-		"claude-code": agent.NewCliAgent(claudeBin),
-		"codex":       agent.NewCliAgent(codexBin),
-		"opencode":    agent.NewCliAgent(openCodeBin),
+		"claude-code": newAgentWithDir(claudeBin),
+		"codex":       newAgentWithDir(codexBin),
+		"opencode":    newAgentWithDir(openCodeBin),
 	}
 
 	d := &coding.Dispatcher{
 		RoleDir:   roleDir,
 		PromptDir: promptDir,
-		Agent:     agent.NewCliAgent(agentBinary),
+		Agent:     newAgentWithDir(agentBinary),
 		CLIAgents: cliAgents,
 		DB:        db,
 		Logger:    logger,

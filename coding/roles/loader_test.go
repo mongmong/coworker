@@ -134,6 +134,60 @@ func TestLoadPromptTemplate_MissingFile(t *testing.T) {
 	}
 }
 
+func TestLoadRole_AppliesWhenEmptyChangesTouch(t *testing.T) {
+	// applies_when present but changes_touch is empty → validation error.
+	dir := t.TempDir()
+	yaml := `
+name: test.role
+cli: codex
+concurrency: single
+prompt_template: prompts/test.md
+inputs:
+  required: [diff_path]
+applies_when:
+  changes_touch: []
+`
+	err := os.WriteFile(filepath.Join(dir, "test_role.yaml"), []byte(yaml), 0600)
+	if err != nil {
+		t.Fatalf("write test file: %v", err)
+	}
+
+	_, err = LoadRole(dir, "test.role")
+	if err == nil {
+		t.Error("expected validation error for applies_when with empty changes_touch, got nil")
+	}
+	if !strings.Contains(err.Error(), "applies_when") {
+		t.Errorf("error should mention applies_when: %v", err)
+	}
+}
+
+func TestLoadRole_AppliesWhenWithPatterns(t *testing.T) {
+	// applies_when with non-empty changes_touch → should be valid.
+	dir := t.TempDir()
+	yaml := `
+name: test.role
+cli: codex
+concurrency: single
+prompt_template: prompts/test.md
+inputs:
+  required: [diff_path]
+applies_when:
+  changes_touch: ["web/**"]
+`
+	err := os.WriteFile(filepath.Join(dir, "test_role.yaml"), []byte(yaml), 0600)
+	if err != nil {
+		t.Fatalf("write test file: %v", err)
+	}
+
+	role, err := LoadRole(dir, "test.role")
+	if err != nil {
+		t.Fatalf("unexpected error for applies_when with patterns: %v", err)
+	}
+	if role.AppliesWhen == nil || len(role.AppliesWhen.ChangesTouch) != 1 {
+		t.Errorf("expected applies_when.changes_touch to have 1 entry, got %v", role.AppliesWhen)
+	}
+}
+
 func TestDotToUnderscore(t *testing.T) {
 	tests := []struct {
 		input string

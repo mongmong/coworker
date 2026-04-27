@@ -96,6 +96,12 @@ func validateRole(role *core.Role) error {
 	if len(role.Inputs.Required) == 0 {
 		return fmt.Errorf("inputs.required must have at least one entry")
 	}
+	// Validate applies_when: if present, it must specify at least one non-empty
+	// filter. An applies_when block with no filter fields is meaningless and
+	// likely indicates a configuration mistake.
+	if role.AppliesWhen != nil && len(role.AppliesWhen.ChangesTouch) == 0 {
+		return fmt.Errorf("applies_when is set but has no filter fields (changes_touch is empty); remove applies_when or add at least one pattern")
+	}
 	return nil
 }
 
