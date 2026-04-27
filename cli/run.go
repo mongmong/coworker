@@ -292,7 +292,7 @@ func insertSpecApprovedCheckpoint(
 	checkpointWriter core.CheckpointWriter,
 	logger *slog.Logger,
 ) error {
-	checkpointID, err := insertRunCheckpoint(ctx, attentionStore, checkpointWriter, runID, "spec-approved", "run-command")
+	checkpointID, err := insertRunCheckpoint(ctx, attentionStore, checkpointWriter, runID, core.CheckpointKindSpecApproved, "run-command")
 	if err != nil {
 		return fmt.Errorf("insert spec-approved checkpoint: %w", err)
 	}
@@ -639,7 +639,7 @@ func runPlanLoopCreateNextCheckpoint(
 			logger.Error("write phase.started event", "error", evtErr, "plan_id", plan.ID)
 		}
 
-		checkpointID, chkErr := insertRunCheckpoint(ctx, attentionStore, checkpointWriter, runID, "plan-approved", fmt.Sprintf("plan-%d", plan.ID))
+		checkpointID, chkErr := insertRunCheckpoint(ctx, attentionStore, checkpointWriter, runID, core.CheckpointKindPlanApproved, fmt.Sprintf("plan-%d", plan.ID))
 		if chkErr != nil {
 			return fmt.Errorf("insert plan-approved checkpoint for plan %d: %w", plan.ID, chkErr)
 		}

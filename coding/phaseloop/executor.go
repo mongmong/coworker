@@ -277,7 +277,7 @@ func (e *PhaseExecutor) runLoop(
 					if cpErr := e.CheckpointWriter.CreateCheckpoint(ctx, core.CheckpointRecord{
 						ID:    item.ID,
 						RunID: runID,
-						Kind:  string(core.AttentionCheckpoint),
+						Kind:  core.CheckpointKindPhaseClean,
 					}); cpErr != nil {
 						e.logger().Error("failed to insert phase-clean checkpoint row",
 							"phase_index", phaseIndex,

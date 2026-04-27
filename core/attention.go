@@ -23,6 +23,17 @@ const (
 	AttentionAnswerReject = "reject"
 )
 
+// Checkpoint kinds. Used as CheckpointRecord.Kind / checkpoints.kind.
+// Spec §Workflow line 82 enumerates the canonical set. Plan 126 (I2).
+const (
+	CheckpointKindSpecApproved     = "spec-approved"
+	CheckpointKindPlanApproved     = "plan-approved"
+	CheckpointKindPhaseClean       = "phase-clean"
+	CheckpointKindReadyToShip      = "ready-to-ship"
+	CheckpointKindComplianceBreach = "compliance-breach"
+	CheckpointKindQualityGate      = "quality-gate"
+)
+
 // AttentionItem is a unified human-input request blocking a run or job.
 type AttentionItem struct {
 	ID          string        `json:"id"`

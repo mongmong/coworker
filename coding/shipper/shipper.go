@@ -111,7 +111,7 @@ func (s *Shipper) Ship(
 				if cpErr := s.CheckpointWriter.CreateCheckpoint(ctx, core.CheckpointRecord{
 					ID:    item.ID,
 					RunID: runID,
-					Kind:  string(core.AttentionCheckpoint),
+					Kind:  core.CheckpointKindReadyToShip,
 				}); cpErr != nil {
 					log.Error("shipper: failed to insert ready-to-ship checkpoint row",
 						"plan_id", planEntry.ID,
