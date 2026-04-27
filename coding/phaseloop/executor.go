@@ -50,6 +50,12 @@ type PhaseExecutor struct {
 	// is created (true blocking is deferred to Plan 103).
 	AttentionStore *store.AttentionStore
 
+	// CheckpointWriter, when non-nil, is paired with AttentionStore: every
+	// phase-clean attention item also gets a matching checkpoints row so the
+	// durable record exists for later resolution. Optional; when nil, only
+	// the attention row is created (legacy behavior).
+	CheckpointWriter core.CheckpointWriter
+
 	// Policy controls fix-cycle limits and checkpoint behavior.
 	// May be nil; defaults are used when nil.
 	Policy *core.Policy
@@ -258,6 +264,18 @@ func (e *PhaseExecutor) runLoop(
 						"phase_name", phaseName,
 						"error", insertErr,
 					)
+				} else if e.CheckpointWriter != nil {
+					if cpErr := e.CheckpointWriter.CreateCheckpoint(ctx, core.CheckpointRecord{
+						ID:    item.ID,
+						RunID: runID,
+						Kind:  string(core.AttentionCheckpoint),
+					}); cpErr != nil {
+						e.logger().Error("failed to insert phase-clean checkpoint row",
+							"phase_index", phaseIndex,
+							"phase_name", phaseName,
+							"error", cpErr,
+						)
+					}
 				}
 			}
 			return &PhaseResult{

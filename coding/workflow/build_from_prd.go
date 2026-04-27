@@ -66,6 +66,13 @@ type BuildFromPRDWorkflow struct {
 
 	// Logger is the structured logger. Uses slog.Default() if nil.
 	Logger *slog.Logger
+
+	// PlanWriter persists plan projection rows. Optional; when nil the workflow
+	// still schedules and runs plans without projection writes.
+	PlanWriter core.PlanWriter
+
+	// CheckpointWriter persists checkpoint projection rows. Optional.
+	CheckpointWriter core.CheckpointWriter
 }
 
 // NewBuildFromPRDWorkflow creates a BuildFromPRDWorkflow with the given manifest
@@ -174,6 +181,7 @@ func (w *BuildFromPRDWorkflow) Run(
 		return nil, err
 	}
 	log.Info("manifest loaded", "spec_path", m.SpecPath, "plans", len(m.Plans))
+	w.recordManifestPlans(ctx, "", m)
 
 	ready := w.Schedule(m, completed, active)
 	log.Info("plans scheduled", "ready", len(ready))
@@ -241,12 +249,23 @@ func (w *BuildFromPRDWorkflow) RunPhasesForPlan(
 		w.PhaseExecutor.RoleDir = w.RoleDir
 	}
 
+	// Propagate CheckpointWriter so phase-clean attention items are paired
+	// with checkpoints rows. Same pattern for the shipper.
+	if w.CheckpointWriter != nil {
+		w.PhaseExecutor.CheckpointWriter = w.CheckpointWriter
+		if w.Shipper != nil {
+			w.Shipper.CheckpointWriter = w.CheckpointWriter
+		}
+	}
+
 	log := w.logger()
 	log.Info("running phases for plan",
 		"plan_id", plan.ID,
 		"plan_title", plan.Title,
 		"phases", len(plan.Phases),
 	)
+	w.createPlan(ctx, runID, plan)
+	w.updatePlanState(ctx, runID, plan.ID, "running")
 
 	phaseResults := make([]*phaseloop.PhaseResult, 0, len(plan.Phases))
 	for i, phaseName := range plan.Phases {
@@ -258,6 +277,7 @@ func (w *BuildFromPRDWorkflow) RunPhasesForPlan(
 
 		result, err := w.PhaseExecutor.Execute(ctx, runID, plan.ID, i, phaseName, inputs)
 		if err != nil {
+			w.updatePlanState(ctx, runID, plan.ID, "failed")
 			return &RunPhasesResult{PhaseResults: phaseResults}, fmt.Errorf("plan %d phase %d (%q): %w", plan.ID, i, phaseName, err)
 		}
 		phaseResults = append(phaseResults, result)
@@ -292,6 +312,7 @@ func (w *BuildFromPRDWorkflow) RunPhasesForPlan(
 				"phase_name", phaseName,
 				"attention_id", out.AttentionItemID,
 			)
+			w.updatePlanState(ctx, runID, plan.ID, "failed")
 			return out, nil
 		}
 	}
@@ -306,16 +327,70 @@ func (w *BuildFromPRDWorkflow) RunPhasesForPlan(
 		}
 		shipResult, err := w.Shipper.Ship(ctx, runID, &plan, branch)
 		if err != nil {
+			w.updatePlanState(ctx, runID, plan.ID, "failed")
 			return out, fmt.Errorf("plan %d ship: %w", plan.ID, err)
 		}
 		out.ShipResult = shipResult
+		w.updatePlanBranchAndPR(ctx, runID, plan.ID, branch, shipResult.PRURL)
 		log.Info("plan shipped",
 			"plan_id", plan.ID,
 			"pr_url", shipResult.PRURL,
 		)
 	}
 
+	w.updatePlanState(ctx, runID, plan.ID, "done")
 	return out, nil
+}
+
+func (w *BuildFromPRDWorkflow) recordManifestPlans(ctx context.Context, runID string, m *manifest.PlanManifest) {
+	if w.PlanWriter == nil || m == nil {
+		return
+	}
+	for _, p := range m.Plans {
+		_ = w.PlanWriter.CreatePlan(ctx, core.PlanRecord{
+			ID:       workflowPlanID(runID, p.ID),
+			RunID:    runID,
+			Number:   p.ID,
+			Title:    p.Title,
+			BlocksOn: p.BlocksOn,
+			State:    "pending",
+		})
+	}
+}
+
+func (w *BuildFromPRDWorkflow) createPlan(ctx context.Context, runID string, p manifest.PlanEntry) {
+	if w.PlanWriter == nil {
+		return
+	}
+	_ = w.PlanWriter.CreatePlan(ctx, core.PlanRecord{
+		ID:       workflowPlanID(runID, p.ID),
+		RunID:    runID,
+		Number:   p.ID,
+		Title:    p.Title,
+		BlocksOn: p.BlocksOn,
+		State:    "pending",
+	})
+}
+
+func (w *BuildFromPRDWorkflow) updatePlanState(ctx context.Context, runID string, planNumber int, state string) {
+	if w.PlanWriter == nil {
+		return
+	}
+	_ = w.PlanWriter.UpdatePlanState(ctx, workflowPlanID(runID, planNumber), state)
+}
+
+func (w *BuildFromPRDWorkflow) updatePlanBranchAndPR(ctx context.Context, runID string, planNumber int, branch, prURL string) {
+	if w.PlanWriter == nil {
+		return
+	}
+	_ = w.PlanWriter.UpdatePlanBranchAndPR(ctx, workflowPlanID(runID, planNumber), branch, prURL)
+}
+
+func workflowPlanID(runID string, planNumber int) string {
+	if runID == "" {
+		return fmt.Sprintf("plan-%d", planNumber)
+	}
+	return fmt.Sprintf("%s-plan-%d", runID, planNumber)
 }
 
 // RunPhasesResult holds the aggregated output of RunPhasesForPlan.

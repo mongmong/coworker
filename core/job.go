@@ -24,6 +24,9 @@ type Job struct {
 	CLI          string // "codex" | "claude-code" | "opencode"
 	StartedAt    time.Time
 	EndedAt      *time.Time
+	PlanID       string
+	PhaseIndex   int
+	CostUSD      float64
 }
 
 // JobResult holds the output of a completed job.

@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -77,6 +78,7 @@ type checkpointActionOutput struct {
 // It writes AttentionAnswerApprove ("approve") for the checkpoint item and resolves it.
 func handleCheckpointAdvance(
 	as *store.AttentionStore,
+	cw core.CheckpointWriter,
 ) mcp.ToolHandlerFor[checkpointAdvanceInput, checkpointActionOutput] {
 	return func(
 		ctx context.Context,
@@ -110,6 +112,15 @@ func handleCheckpointAdvance(
 			// Best-effort: answer is recorded; resolution can be retried.
 			_ = err
 		}
+		if cw != nil {
+			// Best-effort: a missing checkpoint row is tolerated (legacy
+			// attention items, items created before Plan 119 wired the paired
+			// write). Other errors still surface.
+			if err := cw.ResolveCheckpoint(ctx, in.AttentionID, core.AttentionAnswerApprove, answeredBy, in.Notes); err != nil &&
+				!errors.Is(err, store.ErrCheckpointNotFound) {
+				return nil, checkpointActionOutput{}, fmt.Errorf("resolve checkpoint: %w", err)
+			}
+		}
 
 		return nil, checkpointActionOutput{
 			Status:      "approved",
@@ -120,8 +131,12 @@ func handleCheckpointAdvance(
 
 // CallCheckpointAdvance is an exported wrapper around the orch_checkpoint_advance
 // handler logic, used by tests to exercise the handler directly.
-func CallCheckpointAdvance(ctx context.Context, as *store.AttentionStore, attentionID, answeredBy string) (map[string]interface{}, error) {
-	h := handleCheckpointAdvance(as)
+func CallCheckpointAdvance(ctx context.Context, as *store.AttentionStore, attentionID, answeredBy string, writers ...core.CheckpointWriter) (map[string]interface{}, error) {
+	var cw core.CheckpointWriter
+	if len(writers) > 0 {
+		cw = writers[0]
+	}
+	h := handleCheckpointAdvance(as, cw)
 	_, out, err := h(ctx, nil, checkpointAdvanceInput{
 		AttentionID: attentionID,
 		AnsweredBy:  answeredBy,
@@ -145,6 +160,7 @@ type checkpointRollbackInput struct {
 // It writes AttentionAnswerReject ("reject") for the checkpoint item and resolves it.
 func handleCheckpointRollback(
 	as *store.AttentionStore,
+	cw core.CheckpointWriter,
 ) mcp.ToolHandlerFor[checkpointRollbackInput, checkpointActionOutput] {
 	return func(
 		ctx context.Context,
@@ -178,6 +194,13 @@ func handleCheckpointRollback(
 			// Best-effort: answer is recorded; resolution can be retried.
 			_ = err
 		}
+		if cw != nil {
+			// Best-effort: tolerate ErrCheckpointNotFound for legacy items.
+			if err := cw.ResolveCheckpoint(ctx, in.AttentionID, core.AttentionAnswerReject, answeredBy, in.Notes); err != nil &&
+				!errors.Is(err, store.ErrCheckpointNotFound) {
+				return nil, checkpointActionOutput{}, fmt.Errorf("resolve checkpoint: %w", err)
+			}
+		}
 
 		return nil, checkpointActionOutput{
 			Status:      "rejected",
@@ -188,8 +211,12 @@ func handleCheckpointRollback(
 
 // CallCheckpointRollback is an exported wrapper around the orch_checkpoint_rollback
 // handler logic, used by tests to exercise the handler directly.
-func CallCheckpointRollback(ctx context.Context, as *store.AttentionStore, attentionID, answeredBy string) (map[string]interface{}, error) {
-	h := handleCheckpointRollback(as)
+func CallCheckpointRollback(ctx context.Context, as *store.AttentionStore, attentionID, answeredBy string, writers ...core.CheckpointWriter) (map[string]interface{}, error) {
+	var cw core.CheckpointWriter
+	if len(writers) > 0 {
+		cw = writers[0]
+	}
+	h := handleCheckpointRollback(as, cw)
 	_, out, err := h(ctx, nil, checkpointRollbackInput{
 		AttentionID: attentionID,
 		AnsweredBy:  answeredBy,

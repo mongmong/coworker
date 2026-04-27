@@ -186,6 +186,7 @@ type attentionAnswerOutput struct {
 // It calls AttentionStore.AnswerAttention then ResolveAttention.
 func handleAttentionAnswer(
 	as *store.AttentionStore,
+	cw core.CheckpointWriter,
 ) mcp.ToolHandlerFor[attentionAnswerInput, attentionAnswerOutput] {
 	return func(
 		ctx context.Context,
@@ -202,6 +203,14 @@ func handleAttentionAnswer(
 			return nil, attentionAnswerOutput{}, fmt.Errorf("answered_by is required")
 		}
 
+		item, err := as.GetAttentionByID(ctx, in.AttentionID)
+		if err != nil {
+			return nil, attentionAnswerOutput{}, fmt.Errorf("get attention: %w", err)
+		}
+		if item == nil {
+			return nil, attentionAnswerOutput{}, fmt.Errorf("attention item not found: %s", in.AttentionID)
+		}
+
 		if err := as.AnswerAttention(ctx, in.AttentionID, in.Answer, in.AnsweredBy); err != nil {
 			return nil, attentionAnswerOutput{}, fmt.Errorf("answer attention: %w", err)
 		}
@@ -212,6 +221,11 @@ func handleAttentionAnswer(
 			slog.Warn("failed to resolve attention after answer",
 				"attention_id", in.AttentionID, "error", err)
 		}
+		if item.Kind == core.AttentionCheckpoint && cw != nil {
+			if err := cw.ResolveCheckpoint(ctx, in.AttentionID, in.Answer, in.AnsweredBy, ""); err != nil {
+				return nil, attentionAnswerOutput{}, fmt.Errorf("resolve checkpoint: %w", err)
+			}
+		}
 
 		return nil, attentionAnswerOutput{Status: "ok"}, nil
 	}
@@ -219,8 +233,12 @@ func handleAttentionAnswer(
 
 // CallAttentionAnswer is an exported wrapper around the orch_attention_answer
 // handler logic, used by tests to exercise the handler directly.
-func CallAttentionAnswer(ctx context.Context, as *store.AttentionStore, attentionID, answer, answeredBy string) (map[string]interface{}, error) {
-	h := handleAttentionAnswer(as)
+func CallAttentionAnswer(ctx context.Context, as *store.AttentionStore, attentionID, answer, answeredBy string, writers ...core.CheckpointWriter) (map[string]interface{}, error) {
+	var cw core.CheckpointWriter
+	if len(writers) > 0 {
+		cw = writers[0]
+	}
+	h := handleAttentionAnswer(as, cw)
 	_, out, err := h(ctx, nil, attentionAnswerInput{
 		AttentionID: attentionID,
 		Answer:      answer,

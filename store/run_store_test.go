@@ -109,3 +109,81 @@ func TestCompleteRun(t *testing.T) {
 		t.Errorf("second event kind = %q, want %q", events[1].Kind, core.EventRunCompleted)
 	}
 }
+
+func TestRunStore_NewSpecColumnsRoundTrip(t *testing.T) {
+	db := setupTestDB(t)
+	es := NewEventStore(db)
+	rs := NewRunStore(db, es)
+	ctx := context.Background()
+
+	budget := 5.0
+	in := &core.Run{
+		ID:        "run_spec_columns",
+		Mode:      "autopilot",
+		State:     core.RunStateActive,
+		StartedAt: time.Now(),
+		PRDPath:   "docs/prd.md",
+		SpecPath:  "docs/spec.md",
+		CostUSD:   1.25,
+		BudgetUSD: &budget,
+	}
+	if err := rs.CreateRun(ctx, in); err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+
+	out, err := rs.GetRun(ctx, in.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if out.PRDPath != in.PRDPath {
+		t.Errorf("PRDPath = %q, want %q", out.PRDPath, in.PRDPath)
+	}
+	if out.SpecPath != in.SpecPath {
+		t.Errorf("SpecPath = %q, want %q", out.SpecPath, in.SpecPath)
+	}
+	if out.CostUSD != in.CostUSD {
+		t.Errorf("CostUSD = %v, want %v", out.CostUSD, in.CostUSD)
+	}
+	if out.BudgetUSD == nil || *out.BudgetUSD != *in.BudgetUSD {
+		t.Fatalf("BudgetUSD = %v, want %v", out.BudgetUSD, *in.BudgetUSD)
+	}
+
+	listed, err := rs.ListRuns(ctx)
+	if err != nil {
+		t.Fatalf("ListRuns: %v", err)
+	}
+	if len(listed) != 1 {
+		t.Fatalf("ListRuns len = %d, want 1", len(listed))
+	}
+	if listed[0].PRDPath != in.PRDPath || listed[0].SpecPath != in.SpecPath ||
+		listed[0].CostUSD != in.CostUSD ||
+		listed[0].BudgetUSD == nil || *listed[0].BudgetUSD != *in.BudgetUSD {
+		t.Errorf("ListRuns round-trip mismatch: got %+v, want %+v", listed[0], in)
+	}
+}
+
+func TestRunStore_NilBudgetPreserved(t *testing.T) {
+	db := setupTestDB(t)
+	es := NewEventStore(db)
+	rs := NewRunStore(db, es)
+	ctx := context.Background()
+
+	in := &core.Run{
+		ID:        "run_nil_budget",
+		Mode:      "interactive",
+		State:     core.RunStateActive,
+		StartedAt: time.Now(),
+		BudgetUSD: nil,
+	}
+	if err := rs.CreateRun(ctx, in); err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+
+	out, err := rs.GetRun(ctx, in.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if out.BudgetUSD != nil {
+		t.Errorf("BudgetUSD = %v, want nil", *out.BudgetUSD)
+	}
+}

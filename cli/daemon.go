@@ -131,9 +131,10 @@ func runDaemon(cmd *cobra.Command) error {
 	// Build the HTTP mux sharing the same DB and event bus.
 	es := store.NewEventStore(db)
 	mux := buildHTTPMux(bus, httpStores{
-		run:       store.NewRunStore(db, es),
-		job:       store.NewJobStore(db, es),
-		attention: store.NewAttentionStore(db),
+		run:        store.NewRunStore(db, es),
+		job:        store.NewJobStore(db, es),
+		attention:  store.NewAttentionStore(db),
+		checkpoint: store.NewCheckpointStore(db, es),
 	})
 
 	logger.Info("coworker daemon starting", "db", dbPath, "http_port", daemonHTTPPort)
@@ -247,12 +248,13 @@ func buildDaemonDispatcher(db *store.DB, roleDir, promptDir, cliBinary, claudeBi
 	}
 
 	d := &coding.Dispatcher{
-		RoleDir:   roleDir,
-		PromptDir: promptDir,
-		Agent:     newAgentWithDir(cliBinary),
-		CLIAgents: cliAgents,
-		DB:        db,
-		Logger:    logger,
+		RoleDir:          roleDir,
+		PromptDir:        promptDir,
+		Agent:            newAgentWithDir(cliBinary),
+		CLIAgents:        cliAgents,
+		DB:               db,
+		Logger:           logger,
+		SupervisorWriter: store.NewSupervisorEventStore(db, store.NewEventStore(db)),
 	}
 	return d, nil
 }

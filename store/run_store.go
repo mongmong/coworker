@@ -41,10 +41,16 @@ func (s *RunStore) CreateRun(ctx context.Context, run *core.Run) error {
 	}
 
 	return s.event.WriteEventThenRow(ctx, event, func(tx *sql.Tx) error {
+		var budget any
+		if run.BudgetUSD != nil {
+			budget = *run.BudgetUSD
+		}
 		_, err := tx.ExecContext(ctx,
-			`INSERT INTO runs (id, mode, state, started_at) VALUES (?, ?, ?, ?)`,
+			`INSERT INTO runs (id, mode, state, started_at, prd_path, spec_path, cost_usd, budget_usd)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 			run.ID, run.Mode, string(run.State),
 			run.StartedAt.Format("2006-01-02T15:04:05Z"),
+			run.PRDPath, run.SpecPath, run.CostUSD, budget,
 		)
 		if err != nil {
 			return fmt.Errorf("insert run: %w", err)
@@ -58,10 +64,14 @@ func (s *RunStore) GetRun(ctx context.Context, id string) (*core.Run, error) {
 	var run core.Run
 	var stateStr, startedAtStr string
 	var endedAtStr sql.NullString
+	var budgetUSD sql.NullFloat64
 
 	err := s.db.QueryRowContext(ctx,
-		"SELECT id, mode, state, started_at, ended_at FROM runs WHERE id = ?", id,
-	).Scan(&run.ID, &run.Mode, &stateStr, &startedAtStr, &endedAtStr)
+		`SELECT id, mode, state, started_at, ended_at,
+			prd_path, spec_path, cost_usd, budget_usd
+		FROM runs WHERE id = ?`, id,
+	).Scan(&run.ID, &run.Mode, &stateStr, &startedAtStr, &endedAtStr,
+		&run.PRDPath, &run.SpecPath, &run.CostUSD, &budgetUSD)
 	if err != nil {
 		return nil, fmt.Errorf("get run %q: %w", id, err)
 	}
@@ -72,6 +82,10 @@ func (s *RunStore) GetRun(ctx context.Context, id string) (*core.Run, error) {
 		t, _ := time.Parse("2006-01-02T15:04:05Z", endedAtStr.String)
 		run.EndedAt = &t
 	}
+	if budgetUSD.Valid {
+		v := budgetUSD.Float64
+		run.BudgetUSD = &v
+	}
 
 	return &run, nil
 }
@@ -79,7 +93,9 @@ func (s *RunStore) GetRun(ctx context.Context, id string) (*core.Run, error) {
 // ListRuns retrieves all runs ordered by started_at descending.
 func (s *RunStore) ListRuns(ctx context.Context) ([]*core.Run, error) {
 	rows, err := s.db.QueryContext(ctx,
-		"SELECT id, mode, state, started_at, ended_at FROM runs ORDER BY started_at DESC")
+		`SELECT id, mode, state, started_at, ended_at,
+			prd_path, spec_path, cost_usd, budget_usd
+		FROM runs ORDER BY started_at DESC`)
 	if err != nil {
 		return nil, fmt.Errorf("list runs: %w", err)
 	}
@@ -90,7 +106,9 @@ func (s *RunStore) ListRuns(ctx context.Context) ([]*core.Run, error) {
 		var run core.Run
 		var stateStr, startedAtStr string
 		var endedAtStr sql.NullString
-		if err := rows.Scan(&run.ID, &run.Mode, &stateStr, &startedAtStr, &endedAtStr); err != nil {
+		var budgetUSD sql.NullFloat64
+		if err := rows.Scan(&run.ID, &run.Mode, &stateStr, &startedAtStr, &endedAtStr,
+			&run.PRDPath, &run.SpecPath, &run.CostUSD, &budgetUSD); err != nil {
 			return nil, fmt.Errorf("scan run: %w", err)
 		}
 		run.State = core.RunState(stateStr)
@@ -98,6 +116,10 @@ func (s *RunStore) ListRuns(ctx context.Context) ([]*core.Run, error) {
 		if endedAtStr.Valid {
 			t, _ := time.Parse("2006-01-02T15:04:05Z", endedAtStr.String)
 			run.EndedAt = &t
+		}
+		if budgetUSD.Valid {
+			v := budgetUSD.Float64
+			run.BudgetUSD = &v
 		}
 		runs = append(runs, &run)
 	}

@@ -59,6 +59,12 @@ type Evaluator struct {
 	// May be nil in tests that don't exercise blocking paths.
 	AttentionStore *store.AttentionStore
 
+	// CheckpointWriter, when non-nil, is paired with AttentionStore: every
+	// quality-gate attention item also gets a matching checkpoints row so the
+	// durable record exists for later resolution. Optional; legacy callers
+	// that leave it nil only get the attention row.
+	CheckpointWriter core.CheckpointWriter
+
 	// EventStore is used to write quality.verdict and quality-gate events.
 	EventStore *store.EventStore
 
@@ -204,6 +210,15 @@ func (e *Evaluator) createAttentionItem(
 
 	if err := e.AttentionStore.InsertAttention(ctx, item); err != nil {
 		return "", fmt.Errorf("insert attention item: %w", err)
+	}
+	if e.CheckpointWriter != nil {
+		if err := e.CheckpointWriter.CreateCheckpoint(ctx, core.CheckpointRecord{
+			ID:    item.ID,
+			RunID: cpCtx.RunID,
+			Kind:  string(core.AttentionCheckpoint),
+		}); err != nil {
+			return "", fmt.Errorf("insert checkpoint row: %w", err)
+		}
 	}
 	return item.ID, nil
 }

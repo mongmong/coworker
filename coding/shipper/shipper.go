@@ -26,6 +26,11 @@ type Shipper struct {
 	// True blocking is deferred to Plan 103; here we only record.
 	AttentionStore *store.AttentionStore
 
+	// CheckpointWriter, when non-nil, is paired with AttentionStore: every
+	// ready-to-ship attention item also gets a matching checkpoints row so
+	// the durable record exists for later resolution. Optional.
+	CheckpointWriter core.CheckpointWriter
+
 	// EventStore writes the plan.shipped event.
 	EventStore *store.EventStore
 
@@ -102,6 +107,18 @@ func (s *Shipper) Ship(
 		} else {
 			attentionID = item.ID
 			log.Info("shipper: ready-to-ship checkpoint created", "attention_id", attentionID)
+			if s.CheckpointWriter != nil {
+				if cpErr := s.CheckpointWriter.CreateCheckpoint(ctx, core.CheckpointRecord{
+					ID:    item.ID,
+					RunID: runID,
+					Kind:  string(core.AttentionCheckpoint),
+				}); cpErr != nil {
+					log.Error("shipper: failed to insert ready-to-ship checkpoint row",
+						"plan_id", planEntry.ID,
+						"error", cpErr,
+					)
+				}
+			}
 		}
 	}
 

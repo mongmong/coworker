@@ -298,6 +298,7 @@ func TestResumeAfterAttention_NotFound(t *testing.T) {
 		db,
 		runStore,
 		attentionStore,
+		nil,
 		eventStore,
 		nil,
 		newTestLogger(),
@@ -357,6 +358,7 @@ func TestResumeAfterAttention_Unanswered(t *testing.T) {
 		db,
 		runStore,
 		attentionStore,
+		nil,
 		eventStore,
 		nil,
 		newTestLogger(),
@@ -423,6 +425,7 @@ func TestResumeAfterAttention_Rejected(t *testing.T) {
 		db,
 		runStore,
 		attentionStore,
+		nil,
 		eventStore,
 		nil,
 		newTestLogger(),
@@ -500,6 +503,7 @@ func TestResumeAfterAttention_ApprovedNoManifest(t *testing.T) {
 		db,
 		runStore,
 		attentionStore,
+		nil,
 		eventStore,
 		nil,
 		newTestLogger(),
@@ -596,6 +600,7 @@ plans:
 		db,
 		runStore,
 		attentionStore,
+		nil,
 		eventStore,
 		nil,
 		newTestLogger(),
@@ -979,7 +984,7 @@ plans:
 	err := runPlanLoopWithDeps(
 		ctx, cmd, run.ID, manifestFile, specItem,
 		map[int]bool{}, map[int]bool{},
-		db, nil, attentionStore, eventStore, newTestLogger(), nil,
+		db, nil, attentionStore, nil, eventStore, newTestLogger(), nil,
 	)
 	if err != nil {
 		t.Fatalf("runPlanLoopWithDeps: %v", err)
@@ -1066,7 +1071,7 @@ plans:
 	err := runPlanLoopWithDeps(
 		ctx, cmd, run.ID, manifestFile, planItem,
 		map[int]bool{}, map[int]bool{1: true},
-		db, nil, attentionStore, eventStore, newTestLogger(),
+		db, nil, attentionStore, nil, eventStore, newTestLogger(),
 		&planLoopDeps{Runner: stubRunner, Dispatcher: stubDispatcher},
 	)
 	if err != nil {
@@ -1150,7 +1155,7 @@ plans:
 	err := runPlanLoopWithDeps(
 		ctx, cmd, run.ID, manifestFile, planItem,
 		map[int]bool{}, map[int]bool{1: true},
-		db, nil, attentionStore, eventStore, newTestLogger(),
+		db, nil, attentionStore, nil, eventStore, newTestLogger(),
 		&planLoopDeps{Runner: stubRunner, Dispatcher: stubDispatcher},
 	)
 	if err != nil {
@@ -1232,7 +1237,7 @@ plans:
 	err := runPlanLoopWithDeps(
 		ctx, cmd, run.ID, manifestFile, planItem,
 		map[int]bool{}, map[int]bool{1: true},
-		db, nil, attentionStore, eventStore, newTestLogger(),
+		db, nil, attentionStore, nil, eventStore, newTestLogger(),
 		&planLoopDeps{Runner: stubRunner, Dispatcher: stubDispatcher},
 	)
 	if err == nil {

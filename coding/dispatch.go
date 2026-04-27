@@ -54,6 +54,10 @@ type Dispatcher struct {
 	// supply a stub.
 	Supervisor SupervisorEvaluator
 
+	// SupervisorWriter records each supervisor rule result as an event-first
+	// projection row. Optional; when nil, supervisor persistence is skipped.
+	SupervisorWriter core.SupervisorWriter
+
 	// MaxRetries is the maximum number of supervisor retries per job.
 	// Zero means use DefaultMaxRetries. Negative means no retries.
 	MaxRetries int
@@ -417,19 +421,7 @@ func (d *Dispatcher) executeAttempt(
 	}
 	attemptResult.verdict = verdict
 
-	verdictPayload := d.marshalVerdictPayload(jobID, verdict)
-	verdictEvent := &core.Event{
-		ID:            core.NewID(),
-		RunID:         runID,
-		Kind:          core.EventSupervisorVerdict,
-		SchemaVersion: 1,
-		CorrelationID: jobID,
-		Payload:       verdictPayload,
-		CreatedAt:     time.Now(),
-	}
-	if writeErr := eventStore.WriteEventThenRow(ctx, verdictEvent, nil); writeErr != nil {
-		logger.Error("failed to write supervisor.verdict event", "error", writeErr)
-	}
+	d.recordSupervisorResults(ctx, logger, runID, jobID, verdict)
 
 	if verdict.Pass {
 		return attemptResult, nil
@@ -489,6 +481,20 @@ func (d *Dispatcher) executeAttempt(
 	return attemptResult, nil
 }
 
+func (d *Dispatcher) recordSupervisorResults(ctx context.Context, logger *slog.Logger, runID, jobID string, verdict *core.SupervisorVerdict) {
+	if d.SupervisorWriter == nil || verdict == nil {
+		return
+	}
+	for _, result := range verdict.Results {
+		if result.RuleName == "" && result.Message == "" {
+			continue
+		}
+		if err := d.SupervisorWriter.RecordVerdict(ctx, runID, jobID, result); err != nil {
+			logger.Error("failed to record supervisor verdict", "error", err, "job_id", jobID, "rule", result.RuleName)
+		}
+	}
+}
+
 // maxRetries returns the effective max retry count.
 func (d *Dispatcher) maxRetries() int {
 	if d.MaxRetries < 0 {
@@ -511,29 +517,6 @@ func (d *Dispatcher) buildRetryFeedback(verdict *core.SupervisorVerdict) string 
 	}
 	sb.WriteString("Please fix these issues and try again.")
 	return sb.String()
-}
-
-// marshalVerdictPayload serializes a verdict to JSON for the event payload.
-func (d *Dispatcher) marshalVerdictPayload(jobID string, verdict *core.SupervisorVerdict) string {
-	type resultJSON struct {
-		RuleName string `json:"rule_name"`
-		Passed   bool   `json:"passed"`
-		Message  string `json:"message"`
-	}
-	var results []resultJSON
-	for _, r := range verdict.Results {
-		results = append(results, resultJSON{
-			RuleName: r.RuleName,
-			Passed:   r.Passed,
-			Message:  r.Message,
-		})
-	}
-	payload, _ := json.Marshal(map[string]interface{}{
-		"job_id":  jobID,
-		"pass":    verdict.Pass,
-		"results": results,
-	})
-	return string(payload)
 }
 
 // snakeToPascal converts "diff_path" to "DiffPath".

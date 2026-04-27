@@ -52,6 +52,14 @@ const (
 
 	// Plan shipping events — emitted by the shipper after PR creation.
 	EventPlanShipped EventKind = "plan.shipped"
+
+	// Plan lifecycle events.
+	EventPlanCreated      EventKind = "plan.created"
+	EventPlanStateChanged EventKind = "plan.state_changed"
+
+	// Checkpoint lifecycle events, paired with attention items of kind=checkpoint.
+	EventCheckpointOpened   EventKind = "checkpoint.opened"
+	EventCheckpointResolved EventKind = "checkpoint.resolved"
 )
 
 // Event is a single entry in the append-only event log.

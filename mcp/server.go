@@ -8,20 +8,22 @@ import (
 
 	"github.com/chris/coworker/coding"
 	"github.com/chris/coworker/coding/eventbus"
+	"github.com/chris/coworker/core"
 	"github.com/chris/coworker/store"
 )
 
 // stores bundles the store layer objects derived from ServerConfig.DB.
 // They are nil when DB is nil (stubs active during early plan phases).
 type stores struct {
-	run       *store.RunStore
-	event     *store.EventStore
-	dispatch  *store.DispatchStore
-	job       *store.JobStore
-	attention *store.AttentionStore
-	finding   *store.FindingStore
-	artifact  *store.ArtifactStore
-	worker    *store.WorkerStore // Plan 105
+	run        *store.RunStore
+	event      *store.EventStore
+	dispatch   *store.DispatchStore
+	job        *store.JobStore
+	attention  *store.AttentionStore
+	checkpoint core.CheckpointWriter
+	finding    *store.FindingStore
+	artifact   *store.ArtifactStore
+	worker     *store.WorkerStore // Plan 105
 }
 
 // ServerConfig holds the runtime dependencies required to construct the MCP
@@ -66,14 +68,15 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	if cfg.DB != nil {
 		es := store.NewEventStore(cfg.DB)
 		s.stores = stores{
-			event:     es,
-			run:       store.NewRunStore(cfg.DB, es),
-			dispatch:  store.NewDispatchStore(cfg.DB, es),
-			job:       store.NewJobStore(cfg.DB, es),
-			attention: store.NewAttentionStore(cfg.DB),
-			finding:   store.NewFindingStore(cfg.DB, es),
-			artifact:  store.NewArtifactStore(cfg.DB, es),
-			worker:    store.NewWorkerStore(cfg.DB, es), // Plan 105
+			event:      es,
+			run:        store.NewRunStore(cfg.DB, es),
+			dispatch:   store.NewDispatchStore(cfg.DB, es),
+			job:        store.NewJobStore(cfg.DB, es),
+			attention:  store.NewAttentionStore(cfg.DB),
+			checkpoint: store.NewCheckpointStore(cfg.DB, es),
+			finding:    store.NewFindingStore(cfg.DB, es),
+			artifact:   store.NewArtifactStore(cfg.DB, es),
+			worker:     store.NewWorkerStore(cfg.DB, es), // Plan 105
 		}
 	}
 
@@ -248,7 +251,7 @@ func (s *Server) registerTools() {
 				Name:        "orch_attention_answer",
 				Description: "Submit a human answer for an open attention request, unblocking the waiting job.",
 			},
-			handleAttentionAnswer(s.stores.attention),
+			handleAttentionAnswer(s.stores.attention, s.stores.checkpoint),
 		)
 	} else {
 		mcp.AddTool(s.inner,
@@ -349,14 +352,14 @@ func (s *Server) registerTools() {
 				Name:        "orch_checkpoint_advance",
 				Description: "Approve a checkpoint, writing answer=approve and resolving the item.",
 			},
-			handleCheckpointAdvance(s.stores.attention),
+			handleCheckpointAdvance(s.stores.attention, s.stores.checkpoint),
 		)
 		mcp.AddTool(s.inner,
 			&mcp.Tool{
 				Name:        "orch_checkpoint_rollback",
 				Description: "Reject a checkpoint, writing answer=reject and resolving the item.",
 			},
-			handleCheckpointRollback(s.stores.attention),
+			handleCheckpointRollback(s.stores.attention, s.stores.checkpoint),
 		)
 	} else {
 		for _, name := range []string{"orch_checkpoint_list", "orch_checkpoint_advance", "orch_checkpoint_rollback"} {

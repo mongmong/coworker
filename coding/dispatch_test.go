@@ -52,6 +52,29 @@ func (a *countingAgent) Dispatch(ctx context.Context, job *core.Job, prompt stri
 	}, nil
 }
 
+type captureSupervisorWriter struct {
+	rows []core.RuleResult
+}
+
+func (c *captureSupervisorWriter) RecordVerdict(_ context.Context, _ string, _ string, r core.RuleResult) error {
+	c.rows = append(c.rows, r)
+	return nil
+}
+
+type failingSupervisorWriter struct{}
+
+func (failingSupervisorWriter) RecordVerdict(context.Context, string, string, core.RuleResult) error {
+	return fmt.Errorf("writer failed")
+}
+
+type staticSupervisor struct {
+	verdict *core.SupervisorVerdict
+}
+
+func (s staticSupervisor) Evaluate(*supervisor.EvalContext) (*core.SupervisorVerdict, error) {
+	return s.verdict, nil
+}
+
 func findRepoRoot(t *testing.T) string {
 	t.Helper()
 	wd, err := os.Getwd()
@@ -156,6 +179,81 @@ func TestOrchestrate_WithMockCodex(t *testing.T) {
 	}
 }
 
+func TestOrchestrate_PersistsSupervisorRuleResults(t *testing.T) {
+	repoRoot := findRepoRoot(t)
+	db, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("Open(:memory:): %v", err)
+	}
+	defer db.Close()
+
+	writer := &captureSupervisorWriter{}
+	d := &Dispatcher{
+		RoleDir:   filepath.Join(repoRoot, "coding", "roles"),
+		PromptDir: filepath.Join(repoRoot, "coding"),
+		Agent: &countingAgent{wait: func(context.Context, *core.Job, string) (*core.JobResult, error) {
+			return &core.JobResult{ExitCode: 0}, nil
+		}},
+		DB: db,
+		Supervisor: staticSupervisor{verdict: &core.SupervisorVerdict{
+			Pass: true,
+			Results: []core.RuleResult{
+				{RuleName: "rule-a", Passed: true, Message: "ok"},
+				{RuleName: "rule-b", Passed: true, Message: "ok"},
+			},
+		}},
+		SupervisorWriter: writer,
+		Policy:           warnPolicy(),
+	}
+
+	if _, err := d.Orchestrate(context.Background(), &DispatchInput{
+		RoleName: "reviewer.arch",
+		Inputs: map[string]string{
+			"diff_path": "/tmp/test.diff",
+			"spec_path": "/tmp/spec.md",
+		},
+	}); err != nil {
+		t.Fatalf("Orchestrate: %v", err)
+	}
+	if len(writer.rows) != 2 {
+		t.Fatalf("captured rule results = %d, want 2", len(writer.rows))
+	}
+}
+
+func TestOrchestrate_SupervisorWriterFailureDoesNotFailDispatch(t *testing.T) {
+	repoRoot := findRepoRoot(t)
+	db, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("Open(:memory:): %v", err)
+	}
+	defer db.Close()
+
+	d := &Dispatcher{
+		RoleDir:   filepath.Join(repoRoot, "coding", "roles"),
+		PromptDir: filepath.Join(repoRoot, "coding"),
+		Agent: &countingAgent{wait: func(context.Context, *core.Job, string) (*core.JobResult, error) {
+			return &core.JobResult{ExitCode: 0}, nil
+		}},
+		DB: db,
+		Supervisor: staticSupervisor{verdict: &core.SupervisorVerdict{
+			Pass:    true,
+			Results: []core.RuleResult{{RuleName: "rule-a", Passed: true}},
+		}},
+		SupervisorWriter: failingSupervisorWriter{},
+		Policy:           warnPolicy(),
+	}
+
+	if _, err := d.Orchestrate(context.Background(), &DispatchInput{
+		RoleName: "reviewer.arch",
+		Inputs: map[string]string{
+			"diff_path": "/tmp/test.diff",
+			"spec_path": "/tmp/spec.md",
+		},
+	}); err != nil {
+		t.Fatalf("Orchestrate: %v", err)
+	}
+}
+
 func TestOrchestrate_WithSupervisor_AllPass(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell script mock requires unix")
@@ -184,11 +282,12 @@ rules:
 	}
 
 	d := &Dispatcher{
-		RoleDir:    filepath.Join(repoRoot, "coding", "roles"),
-		PromptDir:  filepath.Join(repoRoot, "coding"),
-		Agent:      agent.NewCliAgent(mockBin),
-		DB:         db,
-		Supervisor: engine,
+		RoleDir:          filepath.Join(repoRoot, "coding", "roles"),
+		PromptDir:        filepath.Join(repoRoot, "coding"),
+		Agent:            agent.NewCliAgent(mockBin),
+		DB:               db,
+		Supervisor:       engine,
+		SupervisorWriter: store.NewSupervisorEventStore(db, store.NewEventStore(db)),
 	}
 
 	ctx := context.Background()
@@ -271,13 +370,14 @@ rules:
 	}
 
 	d := &Dispatcher{
-		RoleDir:    filepath.Join(repoRoot, "coding", "roles"),
-		PromptDir:  filepath.Join(repoRoot, "coding"),
-		Agent:      agent.NewCliAgent(mockBin),
-		DB:         db,
-		Supervisor: engine,
-		MaxRetries: 3,
-		Policy:     warnPolicy(), // mock binary basename differs from allowed_tools; test supervisor logic only
+		RoleDir:          filepath.Join(repoRoot, "coding", "roles"),
+		PromptDir:        filepath.Join(repoRoot, "coding"),
+		Agent:            agent.NewCliAgent(mockBin),
+		DB:               db,
+		Supervisor:       engine,
+		SupervisorWriter: store.NewSupervisorEventStore(db, store.NewEventStore(db)),
+		MaxRetries:       3,
+		Policy:           warnPolicy(), // mock binary basename differs from allowed_tools; test supervisor logic only
 	}
 
 	ctx := context.Background()
@@ -321,9 +421,9 @@ rules:
 			retryCount++
 		}
 	}
-	// 2 verdicts: one for failed attempt, one for passing attempt.
-	if verdictCount != 2 {
-		t.Errorf("supervisor.verdict events = %d, want 2", verdictCount)
+	// 4 verdicts: two rule results on the failed attempt, two on the passing attempt.
+	if verdictCount != 4 {
+		t.Errorf("supervisor.verdict events = %d, want 4", verdictCount)
 	}
 	// 1 retry event (between attempt 0 and attempt 1).
 	if retryCount != 1 {
@@ -364,12 +464,13 @@ rules:
 	}
 
 	d := &Dispatcher{
-		RoleDir:    filepath.Join(repoRoot, "coding", "roles"),
-		PromptDir:  filepath.Join(repoRoot, "coding"),
-		Agent:      agent.NewCliAgent(mockBin),
-		DB:         db,
-		Supervisor: engine,
-		Policy:     warnPolicy(), // mock binary basename differs from allowed_tools; test supervisor logic only
+		RoleDir:          filepath.Join(repoRoot, "coding", "roles"),
+		PromptDir:        filepath.Join(repoRoot, "coding"),
+		Agent:            agent.NewCliAgent(mockBin),
+		DB:               db,
+		Supervisor:       engine,
+		SupervisorWriter: store.NewSupervisorEventStore(db, store.NewEventStore(db)),
+		Policy:           warnPolicy(), // mock binary basename differs from allowed_tools; test supervisor logic only
 	}
 
 	ctx := context.Background()
@@ -418,8 +519,9 @@ rules:
 			}
 		}
 	}
-	if verdictCount != DefaultMaxRetries+1 {
-		t.Errorf("supervisor.verdict events = %d, want %d", verdictCount, DefaultMaxRetries+1)
+	wantVerdicts := 2 * (DefaultMaxRetries + 1)
+	if verdictCount != wantVerdicts {
+		t.Errorf("supervisor.verdict events = %d, want %d", verdictCount, wantVerdicts)
 	}
 	if retryCount != DefaultMaxRetries {
 		t.Errorf("supervisor.retry events = %d, want %d", retryCount, DefaultMaxRetries)
@@ -535,8 +637,8 @@ rules:
 			breachCount++
 		}
 	}
-	if verdictCount != 1 {
-		t.Errorf("supervisor.verdict events = %d, want 1", verdictCount)
+	if verdictCount != 0 {
+		t.Errorf("supervisor.verdict events = %d, want 0", verdictCount)
 	}
 	if retryCount != 0 {
 		t.Errorf("supervisor.retry events = %d, want 0", retryCount)

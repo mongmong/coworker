@@ -174,6 +174,32 @@ func TestHandleCheckpointAdvance_HappyPath(t *testing.T) {
 	}
 }
 
+func TestCheckpointAdvance_ResolvesCheckpoint(t *testing.T) {
+	db := openTestDB(t)
+	createRunForAttention(t, db, "run_adv_checkpoint_row")
+	as := newAttentionStore(t, db)
+	es := store.NewEventStore(db)
+	cs := store.NewCheckpointStore(db, es)
+
+	id := insertCheckpointItem(t, as, "run_adv_checkpoint_row", "phase-loop", "phase clean?")
+	if err := cs.CreateCheckpoint(context.Background(), core.CheckpointRecord{
+		ID: id, RunID: "run_adv_checkpoint_row", Kind: "phase-clean",
+	}); err != nil {
+		t.Fatalf("CreateCheckpoint: %v", err)
+	}
+
+	if _, err := mcpserver.CallCheckpointAdvance(context.Background(), as, id, "mcp", cs); err != nil {
+		t.Fatalf("CallCheckpointAdvance: %v", err)
+	}
+	row, err := cs.GetCheckpoint(context.Background(), id)
+	if err != nil {
+		t.Fatalf("GetCheckpoint: %v", err)
+	}
+	if row.State != "resolved" || row.Decision != core.AttentionAnswerApprove {
+		t.Errorf("checkpoint state/decision = %q/%q, want resolved/approve", row.State, row.Decision)
+	}
+}
+
 func TestHandleCheckpointAdvance_MissingAttentionID(t *testing.T) {
 	db := openTestDB(t)
 	as := newAttentionStore(t, db)
@@ -261,6 +287,32 @@ func TestHandleCheckpointRollback_HappyPath(t *testing.T) {
 	}
 	if item.ResolvedAt == nil {
 		t.Error("resolved_at should be set after rollback")
+	}
+}
+
+func TestCheckpointRollback_ResolvesCheckpoint(t *testing.T) {
+	db := openTestDB(t)
+	createRunForAttention(t, db, "run_roll_checkpoint_row")
+	as := newAttentionStore(t, db)
+	es := store.NewEventStore(db)
+	cs := store.NewCheckpointStore(db, es)
+
+	id := insertCheckpointItem(t, as, "run_roll_checkpoint_row", "phase-loop", "phase clean?")
+	if err := cs.CreateCheckpoint(context.Background(), core.CheckpointRecord{
+		ID: id, RunID: "run_roll_checkpoint_row", Kind: "phase-clean",
+	}); err != nil {
+		t.Fatalf("CreateCheckpoint: %v", err)
+	}
+
+	if _, err := mcpserver.CallCheckpointRollback(context.Background(), as, id, "mcp", cs); err != nil {
+		t.Fatalf("CallCheckpointRollback: %v", err)
+	}
+	row, err := cs.GetCheckpoint(context.Background(), id)
+	if err != nil {
+		t.Fatalf("GetCheckpoint: %v", err)
+	}
+	if row.State != "resolved" || row.Decision != core.AttentionAnswerReject {
+		t.Errorf("checkpoint state/decision = %q/%q, want resolved/reject", row.State, row.Decision)
 	}
 }
 

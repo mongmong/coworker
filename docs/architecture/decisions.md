@@ -52,3 +52,19 @@ Updated whenever a plan introduces or revises a cross-cutting decision.
 **Enforcement:** `core.NewID()` is the only ID generation function.
 
 **Status:** Introduced in Plan 100.
+
+## Decision 6: Schema Completion Projections (Plan 119)
+
+**Context:** The V1 runtime data model requires durable plan, checkpoint, supervisor verdict, and cost projections in addition to the authoritative event log.
+
+**Decision:** `plans`, `checkpoints`, `supervisor_events`, and `cost_events` are projection tables of event-log records. All writes to these projection tables go through `EventStore.WriteEventThenRow` so the event-log-before-state invariant is preserved.
+
+**Decision:** `attention` and `checkpoints` remain separate. `attention` is the live human-input UI surface; `checkpoints` is the durable decision record. Every checkpoint-kind attention answer path must pair the attention answer with `CheckpointWriter.ResolveCheckpoint` for the same ID.
+
+**Decision:** `runs.budget_usd` is metadata only in this plan. Budget enforcement is deferred to Plan 121 or later.
+
+**Decision:** Existing checkpoint-kind attention rows are not backfilled into `checkpoints`; coworker had no shipped production runs at the time of this migration.
+
+**Enforcement:** Store APIs for the new projection tables use `WriteEventThenRow`. Coding package consumers depend on `core.*Writer` sink interfaces. Tests cover event-first rollback, checkpoint answer pairing, and supervisor/cost replay shape.
+
+**Status:** Introduced in Plan 119.
