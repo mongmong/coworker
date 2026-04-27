@@ -3,12 +3,12 @@ package supervisor
 import (
 	"fmt"
 	"os/exec"
-	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 
 	"github.com/chris/coworker/core"
+	"github.com/chris/coworker/internal/predicates"
 )
 
 // EvalContext provides the data needed to evaluate predicates.
@@ -252,66 +252,10 @@ func EvalAppliesWhen(ctx *EvalContext, clause *AppliesWhenClause) (bool, error) 
 	return true, nil
 }
 
-// globMatch matches a file path against a glob pattern that may contain **.
-//
-// filepath.Match does not support **, which is a common convention meaning
-// "any depth of subdirectories". This function handles two ** forms:
-//
-//   - "web/**"  → true if file starts with "web/" (any depth under web/)
-//   - "**/*.tsx" → true if the file's base name matches "*.tsx" at any depth
-//
-// All other patterns are delegated to filepath.Match.
-func globMatch(pattern, file string) (bool, error) {
-	if strings.Contains(pattern, "**") {
-		// "prefix/**" — match any file under the prefix directory.
-		if strings.HasSuffix(pattern, "/**") {
-			prefix := strings.TrimSuffix(pattern, "/**")
-			return strings.HasPrefix(file, prefix+"/"), nil
-		}
-		// "**/<rest>" — match the base name (or sub-path) at any depth.
-		if strings.HasPrefix(pattern, "**/") {
-			suffix := strings.TrimPrefix(pattern, "**/")
-			return filepath.Match(suffix, filepath.Base(file))
-		}
-		// Other ** patterns (e.g. "a/**/b") — not supported; return no-match
-		// without error so callers are not broken by unknown patterns.
-		return false, nil
-	}
-	return filepath.Match(pattern, file)
-}
-
 // evalChangesTouch checks whether the current git diff touches any file
-// matching the given glob patterns.
+// matching the given glob patterns. Delegates to internal/predicates.
 func evalChangesTouch(ctx *EvalContext, globs []string) (bool, error) {
-	files, err := gitDiffChangedFiles(ctx.WorkDir)
-	if err != nil {
-		return false, fmt.Errorf("changes_touch: %w", err)
-	}
-
-	for _, f := range files {
-		for _, g := range globs {
-			matched, err := globMatch(g, f)
-			if err != nil {
-				return false, fmt.Errorf("changes_touch: invalid glob %q: %w", g, err)
-			}
-			if matched {
-				return true, nil
-			}
-			// Also match the basename against patterns that don't contain a slash.
-			if !strings.Contains(g, "/") {
-				base := filepath.Base(f)
-				matched, err = globMatch(g, base)
-				if err != nil {
-					return false, fmt.Errorf("changes_touch: invalid glob %q: %w", g, err)
-				}
-				if matched {
-					return true, nil
-				}
-			}
-		}
-	}
-
-	return false, nil
+	return predicates.ChangesTouchInDir(ctx.WorkDir, globs)
 }
 
 // changesTouch is the PredicateFn form of changes_touch, for use in check
@@ -349,35 +293,4 @@ func gitLastCommitMsg(workDir string) (string, error) {
 		return "", fmt.Errorf("git log -1 --format=%%s: %w", err)
 	}
 	return strings.TrimSpace(string(out)), nil
-}
-
-// gitDiffChangedFiles returns the list of files changed between HEAD~1 and
-// HEAD. If there is only one commit (no parent), it returns the files
-// introduced by that commit using the empty-tree comparison.
-func gitDiffChangedFiles(workDir string) ([]string, error) {
-	// Try HEAD~1..HEAD first.
-	cmd := exec.Command("git", "diff", "--name-only", "HEAD~1..HEAD")
-	if workDir != "" {
-		cmd.Dir = workDir
-	}
-	out, err := cmd.Output()
-	if err != nil {
-		// If HEAD has no parent (initial commit), fall back to HEAD vs empty tree.
-		emptyTree := "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
-		cmd2 := exec.Command("git", "diff", "--name-only", emptyTree, "HEAD")
-		if workDir != "" {
-			cmd2.Dir = workDir
-		}
-		out2, err2 := cmd2.Output()
-		if err2 != nil {
-			return nil, fmt.Errorf("git diff HEAD~1..HEAD: %w; git diff empty-tree HEAD: %v", err, err2)
-		}
-		out = out2
-	}
-
-	raw := strings.TrimSpace(string(out))
-	if raw == "" {
-		return nil, nil
-	}
-	return strings.Split(raw, "\n"), nil
 }

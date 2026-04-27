@@ -19,6 +19,12 @@ import (
 // before escalating to a compliance-breach event.
 const DefaultMaxRetries = 3
 
+// SupervisorEvaluator is the interface for evaluating supervisor rules against
+// job outputs. Implemented by *supervisor.RuleEngine; can be stubbed in tests.
+type SupervisorEvaluator interface {
+	Evaluate(ctx *supervisor.EvalContext) (*core.SupervisorVerdict, error)
+}
+
 // Dispatcher orchestrates the end-to-end flow: load role -> create run/job
 // -> render prompt -> dispatch agent -> capture result -> supervisor check
 // -> persist findings (with retry loop on contract failure).
@@ -43,7 +49,9 @@ type Dispatcher struct {
 
 	// Supervisor is the optional rule engine. If nil, no contract
 	// checks are performed (equivalent to all-pass).
-	Supervisor *supervisor.RuleEngine
+	// The interface is satisfied by *supervisor.RuleEngine; tests may
+	// supply a stub.
+	Supervisor SupervisorEvaluator
 
 	// MaxRetries is the maximum number of supervisor retries per job.
 	// Zero means use DefaultMaxRetries. Negative means no retries.
@@ -184,6 +192,12 @@ func (d *Dispatcher) Orchestrate(ctx context.Context, input *DispatchInput) (*Di
 
 		attemptResult, err := d.executeAttempt(ctx, logger, eventStore, jobStore, runID, role, selectedAgent, prompt, originalPrompt, attempt, maxRetries)
 		if err != nil {
+			// Mark the run as failed so state is consistent even though the
+			// job was already marked failed inside executeAttempt.
+			if completeErr := runStore.CompleteRun(ctx, runID, core.RunStateFailed); completeErr != nil {
+				logger.Error("failed to mark run as failed after attempt error",
+					"run_id", runID, "error", completeErr)
+			}
 			return nil, err
 		}
 		lastJobID = attemptResult.jobID
@@ -390,9 +404,11 @@ func (d *Dispatcher) executeAttempt(
 	verdict, evalErr := d.Supervisor.Evaluate(evalCtx)
 	if evalErr != nil {
 		logger.Error("supervisor evaluation error", "error", evalErr)
-		// Treat evaluation error as a pass — don't block the job
-		// for engine bugs.
-		verdict = &core.SupervisorVerdict{Pass: true}
+		// Evaluation error means something is wrong with the rule engine or
+		// its inputs. Silently passing would hide the bug. Return the error
+		// so the caller marks the job and run as failed.
+		jobStore.UpdateJobState(ctx, jobID, core.JobStateFailed) //nolint:errcheck
+		return nil, fmt.Errorf("supervisor.Evaluate: %w", evalErr)
 	}
 	attemptResult.verdict = verdict
 

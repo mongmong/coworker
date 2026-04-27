@@ -50,6 +50,12 @@ type BuildFromPRDWorkflow struct {
 	// When nil, defaults from coding/stages are used.
 	StageRegistry *stages.StageRegistry
 
+	// WorkDir is the working directory for git-based applies_when predicates.
+	// When set, it is propagated to PhaseExecutor.WorkDir before each
+	// RunPhasesForPlan call. Empty means the current working directory is used
+	// by predicates (adequate for single-worktree runs).
+	WorkDir string
+
 	// Logger is the structured logger. Uses slog.Default() if nil.
 	Logger *slog.Logger
 }
@@ -202,13 +208,24 @@ func (w *BuildFromPRDWorkflow) RunPhasesForPlan(
 		return nil, fmt.Errorf("build-from-prd: PhaseExecutor is required for RunPhasesForPlan")
 	}
 
-	// Populate ReviewerRoles from the StageRegistry so policy.yaml overrides
-	// take effect. Fall back to PhaseExecutor defaults when no registry is set
-	// or when the registry returns nil (stage not registered).
+	// Populate ReviewerRoles and TesterRoles from the StageRegistry so
+	// policy.yaml overrides take effect. Fall back to PhaseExecutor defaults
+	// when no registry is set or when the registry returns nil (stage not
+	// registered).
 	if w.StageRegistry != nil {
 		if roles := w.StageRegistry.RolesForStage("phase-review"); roles != nil {
 			w.PhaseExecutor.ReviewerRoles = roles
 		}
+		// Assign directly — preserves nil-vs-empty distinction.
+		// RolesForStage returns nil when the stage is not registered at all
+		// (no override; default applies) and an empty non-nil slice when
+		// registered with no roles (disabled).
+		w.PhaseExecutor.TesterRoles = w.StageRegistry.RolesForStage("phase-test")
+	}
+
+	// Propagate WorkDir to PhaseExecutor for applies_when evaluation.
+	if w.WorkDir != "" {
+		w.PhaseExecutor.WorkDir = w.WorkDir
 	}
 
 	log := w.logger()

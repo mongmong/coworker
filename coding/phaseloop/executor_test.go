@@ -370,6 +370,122 @@ func TestPhaseExecutor_FeedbackPassedToDevOnFixCycle(t *testing.T) {
 	}
 }
 
+// --- Phase 3 (I-3): applies_when tests ---
+
+func TestPhaseExecutor_RoleShouldSkip_NilAppliesWhen(t *testing.T) {
+	exec := &PhaseExecutor{}
+	role := &core.Role{Name: "reviewer.arch"}
+	skip, err := exec.roleShouldSkip(context.Background(), role)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if skip {
+		t.Error("expected skip=false when AppliesWhen is nil")
+	}
+}
+
+func TestPhaseExecutor_RoleShouldSkip_EmptyWorkDir(t *testing.T) {
+	// WorkDir not set → error, caller logs warning and dispatches anyway.
+	exec := &PhaseExecutor{WorkDir: ""}
+	role := &core.Role{
+		Name:        "reviewer.frontend",
+		AppliesWhen: &core.RoleAppliesWhen{ChangesTouch: []string{"web/**"}},
+	}
+	_, err := exec.roleShouldSkip(context.Background(), role)
+	if err == nil {
+		t.Error("expected error when WorkDir is empty and applies_when is set")
+	}
+}
+
+func TestPhaseExecutor_FanOut_RoleNotInDir_DispatchesAnyway(t *testing.T) {
+	// When RoleDir is set but role file doesn't exist, fanOut dispatches anyway
+	// (graceful degradation).
+	orch := newStubOrchestrator(nil)
+	exec := newTestExecutor(t, orch, nil)
+	exec.RoleDir = t.TempDir() // empty dir — no role files
+	exec.ReviewerRoles = []string{"custom.reviewer"}
+	exec.TesterRoles = []string{} // disable tester
+
+	_, err := exec.Execute(context.Background(), "run-aw1", 300, 0, "phase", map[string]string{
+		"diff_path": "/tmp/test.diff",
+		"spec_path": "/tmp/spec.md",
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	// developer + custom.reviewer = 2 dispatches (even though role file is missing).
+	if orch.roleCounts["custom.reviewer"] != 1 {
+		t.Errorf("expected 1 custom.reviewer dispatch, got %d", orch.roleCounts["custom.reviewer"])
+	}
+}
+
+// --- Phase 2 (I-2): TesterRoles tests ---
+
+func TestPhaseExecutor_TesterNil_UsesDefault(t *testing.T) {
+	// TesterRoles=nil → "tester" is dispatched via defaultTesterRoles.
+	orch := newStubOrchestrator(nil)
+	exec := newTestExecutor(t, orch, nil)
+	// TesterRoles is nil by default.
+
+	_, err := exec.Execute(context.Background(), "run-t1", 200, 0, "phase", map[string]string{
+		"diff_path": "/tmp/test.diff",
+		"spec_path": "/tmp/spec.md",
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	// developer + reviewer.arch + reviewer.frontend + tester = 4.
+	if orch.roleCounts["tester"] != 1 {
+		t.Errorf("expected 1 tester dispatch, got %d", orch.roleCounts["tester"])
+	}
+}
+
+func TestPhaseExecutor_CustomTesterRoles(t *testing.T) {
+	// TesterRoles=["perf-tester"] → perf-tester dispatched, not default tester.
+	orch := newStubOrchestrator(nil)
+	exec := newTestExecutor(t, orch, nil)
+	exec.TesterRoles = []string{"perf-tester"}
+
+	_, err := exec.Execute(context.Background(), "run-t2", 201, 0, "phase", map[string]string{
+		"diff_path": "/tmp/test.diff",
+		"spec_path": "/tmp/spec.md",
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	if orch.roleCounts["perf-tester"] != 1 {
+		t.Errorf("expected 1 perf-tester dispatch, got %d", orch.roleCounts["perf-tester"])
+	}
+	if orch.roleCounts["tester"] != 0 {
+		t.Errorf("expected 0 tester dispatches when custom TesterRoles set, got %d", orch.roleCounts["tester"])
+	}
+}
+
+func TestPhaseExecutor_TesterDisabled_EmptyNonNilSlice(t *testing.T) {
+	// TesterRoles=[]string{} (non-nil empty) → no tester dispatch.
+	orch := newStubOrchestrator(nil)
+	exec := newTestExecutor(t, orch, nil)
+	exec.TesterRoles = []string{} // non-nil empty = disabled
+
+	_, err := exec.Execute(context.Background(), "run-t3", 202, 0, "phase", map[string]string{
+		"diff_path": "/tmp/test.diff",
+		"spec_path": "/tmp/spec.md",
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	if orch.roleCounts["tester"] != 0 {
+		t.Errorf("expected 0 tester dispatches when disabled, got %d", orch.roleCounts["tester"])
+	}
+	// developer + reviewer.arch + reviewer.frontend = 3 only.
+	if orch.callCount != 3 {
+		t.Errorf("expected 3 dispatches (no tester), got %d", orch.callCount)
+	}
+}
+
 // capturingOrchestratorForFeedback captures developer inputs across calls.
 type capturingOrchestratorForFeedback struct {
 	capturedInputs *[]map[string]string

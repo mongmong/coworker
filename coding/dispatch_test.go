@@ -3,6 +3,7 @@ package coding
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -926,6 +927,144 @@ permissions:
 	// No subprocess should have been started.
 	if ca.dispatches != 0 {
 		t.Errorf("dispatches = %d, want 0", ca.dispatches)
+	}
+}
+
+// --- Phase 4 (I-4): Supervisor error handling ---
+
+// errorSupervisor is a stub SupervisorEvaluator that always returns an error.
+type errorSupervisor struct{ msg string }
+
+func (e *errorSupervisor) Evaluate(ctx *supervisor.EvalContext) (*core.SupervisorVerdict, error) {
+	return nil, fmt.Errorf("%s", e.msg)
+}
+
+func TestOrchestrate_SupervisorEvalError_FailsJob(t *testing.T) {
+	// A supervisor that returns an error should cause the job and run to be
+	// marked as failed — not silently passed.
+	repoRoot := findRepoRoot(t)
+
+	db, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("Open(:memory:): %v", err)
+	}
+	defer db.Close()
+
+	ca := &countingAgent{
+		wait: func(_ context.Context, _ *core.Job, _ string) (*core.JobResult, error) {
+			return &core.JobResult{ExitCode: 0}, nil
+		},
+	}
+
+	d := &Dispatcher{
+		RoleDir:    filepath.Join(repoRoot, "coding", "roles"),
+		PromptDir:  filepath.Join(repoRoot, "coding"),
+		Agent:      ca,
+		DB:         db,
+		Supervisor: &errorSupervisor{msg: "rule engine internal error"},
+		Policy:     warnPolicy(),
+		MaxRetries: -1, // no retries
+	}
+
+	ctx := context.Background()
+	_, err = d.Orchestrate(ctx, &DispatchInput{
+		RoleName: "reviewer.arch",
+		Inputs: map[string]string{
+			"diff_path": "/tmp/test.diff",
+			"spec_path": "/tmp/spec.md",
+		},
+	})
+	if err == nil {
+		t.Fatal("expected error when supervisor returns an error, got nil")
+	}
+	if !strings.Contains(err.Error(), "supervisor.Evaluate") {
+		t.Errorf("expected error to mention supervisor.Evaluate, got: %v", err)
+	}
+}
+
+func TestOrchestrate_SupervisorEvalError_JobAndRunFailed(t *testing.T) {
+	// After supervisor eval error: verify job state=failed and run state=failed
+	// are persisted.
+	repoRoot := findRepoRoot(t)
+
+	db, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("Open(:memory:): %v", err)
+	}
+	defer db.Close()
+
+	ca := &countingAgent{
+		wait: func(_ context.Context, _ *core.Job, _ string) (*core.JobResult, error) {
+			return &core.JobResult{ExitCode: 0}, nil
+		},
+	}
+
+	d := &Dispatcher{
+		RoleDir:    filepath.Join(repoRoot, "coding", "roles"),
+		PromptDir:  filepath.Join(repoRoot, "coding"),
+		Agent:      ca,
+		DB:         db,
+		Supervisor: &errorSupervisor{msg: "rule engine boom"},
+		Policy:     warnPolicy(),
+		MaxRetries: -1,
+	}
+
+	ctx := context.Background()
+	_, orchestErr := d.Orchestrate(ctx, &DispatchInput{
+		RoleName: "reviewer.arch",
+		Inputs: map[string]string{
+			"diff_path": "/tmp/test.diff",
+			"spec_path": "/tmp/spec.md",
+		},
+	})
+	if orchestErr == nil {
+		t.Fatal("expected error from Orchestrate, got nil")
+	}
+
+	// Job state must be "failed".
+	es := store.NewEventStore(db)
+	jobStore := store.NewJobStore(db, es)
+	runStore := store.NewRunStore(db, es)
+
+	// List all jobs via events (we don't know the run ID since Orchestrate failed).
+	// Instead, directly query the DB.
+	rows, queryErr := db.QueryContext(ctx, "SELECT id, state FROM jobs LIMIT 1")
+	if queryErr != nil {
+		t.Fatalf("query jobs: %v", queryErr)
+	}
+	defer rows.Close()
+	var jobID, jobState string
+	var runID string
+	for rows.Next() {
+		if scanErr := rows.Scan(&jobID, &jobState); scanErr != nil {
+			t.Fatalf("scan job: %v", scanErr)
+		}
+	}
+	if jobState != string(core.JobStateFailed) {
+		t.Errorf("job state = %q, want %q", jobState, core.JobStateFailed)
+	}
+
+	// Get run_id from the job.
+	rowR := db.QueryRowContext(ctx, "SELECT run_id FROM jobs WHERE id = ?", jobID)
+	if scanErr := rowR.Scan(&runID); scanErr != nil {
+		t.Fatalf("scan run_id from job: %v", scanErr)
+	}
+
+	job, getErr := jobStore.GetJob(ctx, jobID)
+	if getErr != nil {
+		t.Fatalf("GetJob: %v", getErr)
+	}
+	if job.State != core.JobStateFailed {
+		t.Errorf("job state = %q, want %q", job.State, core.JobStateFailed)
+	}
+
+	// Run state must be "failed".
+	run, getRunErr := runStore.GetRun(ctx, runID)
+	if getRunErr != nil {
+		t.Fatalf("GetRun: %v", getRunErr)
+	}
+	if run.State != core.RunStateFailed {
+		t.Errorf("run state = %q, want %q", run.State, core.RunStateFailed)
 	}
 }
 

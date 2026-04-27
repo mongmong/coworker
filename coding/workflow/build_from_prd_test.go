@@ -505,10 +505,10 @@ func TestRunPhasesForPlan_DirtyPhase_SecondPhase(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 
-	// Phase 0 with maxFixCycles=1 and 1 reviewer:
-	//   cycle 0: developer(1) + reviewer.arch(1) = 2 calls → clean check → pass
-	// Phase 1 (calls 2+): dirty immediately → exhausts at cycle 1.
-	threshold := 2
+	// Phase 0 with maxFixCycles=1 and 1 reviewer + default tester:
+	//   cycle 0: developer(1) + reviewer.arch(1) + tester(1) = 3 calls → clean check → pass
+	// Phase 1 (calls 3+): dirty immediately → exhausts at cycle 1.
+	threshold := 3
 	callIdx := 0
 	var callIdxMu sync.Mutex
 

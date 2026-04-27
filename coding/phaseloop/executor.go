@@ -10,7 +10,9 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/chris/coworker/coding"
+	"github.com/chris/coworker/coding/roles"
 	"github.com/chris/coworker/core"
+	"github.com/chris/coworker/internal/predicates"
 	"github.com/chris/coworker/store"
 )
 
@@ -22,9 +24,12 @@ type Orchestrator interface {
 }
 
 // defaultReviewerRoles are the roles dispatched in parallel after each developer
-// job when no override is provided. tester is included so test failures block
-// the phase.
-var defaultReviewerRoles = []string{"reviewer.arch", "reviewer.frontend", "tester"}
+// job when no override is provided.
+var defaultReviewerRoles = []string{"reviewer.arch", "reviewer.frontend"}
+
+// defaultTesterRoles are the tester roles dispatched in parallel alongside
+// reviewer roles when no override is provided.
+var defaultTesterRoles = []string{"tester"}
 
 // PhaseExecutor runs one phase of a plan through the full cycle:
 // developer → fan-out reviewers/tester → dedupe → fix-loop → checkpoint.
@@ -50,10 +55,32 @@ type PhaseExecutor struct {
 	Policy *core.Policy
 
 	// ReviewerRoles is the list of roles dispatched in parallel after each
-	// developer job. When nil or empty, defaultReviewerRoles is used.
+	// developer job. When nil, defaultReviewerRoles is used.
 	// Set by BuildFromPRDWorkflow from StageRegistry.RolesForStage("phase-review")
 	// so policy.yaml workflow_overrides take effect.
 	ReviewerRoles []string
+
+	// TesterRoles controls which tester roles are dispatched in parallel
+	// alongside ReviewerRoles after each developer job.
+	//
+	//   nil              → use defaultTesterRoles (["tester"])
+	//   non-nil, empty   → tester stage disabled; no tester is dispatched
+	//   non-nil, non-empty → dispatch the listed roles
+	//
+	// This mirrors the nil-vs-empty semantics of ReviewerRoles.
+	TesterRoles []string
+
+	// WorkDir is the working directory used for git-based applies_when
+	// predicates. When empty, predicates use the current working directory
+	// (safe for single-worktree runs; callers should set this explicitly
+	// when using worktrees or for reproducibility).
+	WorkDir string
+
+	// RoleDir is the directory containing role YAML files. When non-empty,
+	// fanOut loads each role to evaluate its AppliesWhen clause before
+	// dispatching. When empty, AppliesWhen evaluation is skipped (all roles
+	// are dispatched unconditionally).
+	RoleDir string
 
 	// Logger is the structured logger. Uses slog.Default() if nil.
 	Logger *slog.Logger
@@ -253,33 +280,69 @@ func (e *PhaseExecutor) runLoop(
 	}
 }
 
-// reviewerRoles returns the effective reviewer role list: e.ReviewerRoles when
-// non-empty, otherwise the package-level default.
+// reviewerRoles returns the effective reviewer role list.
+// nil → defaultReviewerRoles; non-nil (even empty) → as-is.
 func (e *PhaseExecutor) reviewerRoles() []string {
-	if len(e.ReviewerRoles) > 0 {
-		return e.ReviewerRoles
+	if e.ReviewerRoles == nil {
+		return defaultReviewerRoles
 	}
-	return defaultReviewerRoles
+	return e.ReviewerRoles
 }
 
-// fanOut dispatches all reviewer roles and tester in parallel and collects
+// testerRoles returns the effective tester role list.
+// nil → defaultTesterRoles; non-nil (even empty) → as-is (empty = disabled).
+func (e *PhaseExecutor) testerRoles() []string {
+	if e.TesterRoles == nil {
+		return defaultTesterRoles
+	}
+	return e.TesterRoles
+}
+
+// fanOut dispatches all reviewer roles and tester roles in parallel and collects
 // results. An error from any goroutine cancels the rest via errgroup.
+// Roles whose AppliesWhen clause evaluates to false are skipped; a
+// job.skipped event is emitted for each skipped role.
 func (e *PhaseExecutor) fanOut(
 	ctx context.Context,
 	inputs map[string]string,
 	log *slog.Logger,
 ) ([]*coding.DispatchResult, error) {
-	roles := e.reviewerRoles()
+	roleNames := append(e.reviewerRoles(), e.testerRoles()...)
 
 	// Preallocate results slice — each goroutine writes to its own index,
-	// so no mutex is needed.
-	results := make([]*coding.DispatchResult, len(roles))
+	// so no mutex is needed. Skipped roles leave a nil entry.
+	results := make([]*coding.DispatchResult, len(roleNames))
 
 	g, gCtx := errgroup.WithContext(ctx)
 
-	for i, roleName := range roles {
+	for i, roleName := range roleNames {
 		i, roleName := i, roleName // capture loop vars
 		g.Go(func() error {
+			// Evaluate applies_when if RoleDir is set.
+			if e.RoleDir != "" {
+				role, err := roles.LoadRole(e.RoleDir, roleName)
+				if err != nil {
+					// Role file not found or invalid: log a warning and dispatch
+					// anyway (graceful degradation — applies_when is optional).
+					log.Warn("could not load role for applies_when check; dispatching unconditionally",
+						"role", roleName, "error", err)
+				} else if shouldSkip, skipErr := e.roleShouldSkip(gCtx, role); skipErr != nil {
+					// Predicate error: log warning and dispatch anyway (don't crash the phase).
+					if e.WorkDir == "" {
+						log.Warn("WorkDir not set for applies_when evaluation; dispatching unconditionally",
+							"role", roleName)
+					} else {
+						log.Warn("applies_when evaluation error; dispatching unconditionally",
+							"role", roleName, "error", skipErr)
+					}
+				} else if shouldSkip {
+					log.Info("role skipped by applies_when", "role", roleName)
+					e.emitJobSkippedEvent(gCtx, roleName)
+					results[i] = &coding.DispatchResult{} // sentinel: empty result, not nil
+					return nil
+				}
+			}
+
 			log.Info("dispatching reviewer/tester", "role", roleName)
 			result, err := e.Dispatcher.Orchestrate(gCtx, &coding.DispatchInput{
 				RoleName: roleName,
@@ -297,7 +360,64 @@ func (e *PhaseExecutor) fanOut(
 		return nil, err
 	}
 
-	return results, nil
+	// Filter out nil entries (roles that were somehow not dispatched and not skipped).
+	filtered := results[:0]
+	for _, r := range results {
+		if r != nil {
+			filtered = append(filtered, r)
+		}
+	}
+
+	return filtered, nil
+}
+
+// roleShouldSkip returns true if the role's AppliesWhen clause evaluates to
+// false (meaning the role should be skipped, not dispatched).
+// Returns (false, nil) when AppliesWhen is nil (no filter → always dispatch).
+func (e *PhaseExecutor) roleShouldSkip(ctx context.Context, role *core.Role) (bool, error) {
+	_ = ctx // reserved for future async predicate evaluation
+	if role.AppliesWhen == nil {
+		return false, nil // no filter → dispatch
+	}
+
+	if len(role.AppliesWhen.ChangesTouch) > 0 {
+		if e.WorkDir == "" {
+			// WorkDir not set: log warning and dispatch unconditionally.
+			return false, fmt.Errorf("WorkDir not set; cannot evaluate changes_touch for role %q", role.Name)
+		}
+		touched, err := predicates.ChangesTouchInDir(e.WorkDir, role.AppliesWhen.ChangesTouch)
+		if err != nil {
+			return false, err
+		}
+		return !touched, nil // skip if NOT touched
+	}
+
+	return false, nil // unknown applies_when keys → dispatch (forward-compat)
+}
+
+// emitJobSkippedEvent writes a job.skipped event to the EventStore.
+// Errors are logged but not returned — skipped events are best-effort.
+func (e *PhaseExecutor) emitJobSkippedEvent(ctx context.Context, roleName string) {
+	payload, err := json.Marshal(map[string]string{
+		"role":   roleName,
+		"reason": "applies_when=false",
+	})
+	if err != nil {
+		e.logger().Error("failed to marshal job.skipped payload", "role", roleName, "error", err)
+		return
+	}
+
+	event := &core.Event{
+		ID:            core.NewID(),
+		Kind:          core.EventJobSkipped,
+		SchemaVersion: 1,
+		Payload:       string(payload),
+		CreatedAt:     time.Now(),
+	}
+
+	if writeErr := e.EventStore.WriteEventThenRow(ctx, event, nil); writeErr != nil {
+		e.logger().Error("failed to write job.skipped event", "role", roleName, "error", writeErr)
+	}
 }
 
 // emitPhaseEvent writes a phase lifecycle event to the event store.

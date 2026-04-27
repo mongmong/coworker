@@ -483,10 +483,12 @@ func runPlanLoopWithDeps(
 		if deps != nil && deps.Runner != nil {
 			runner = deps.Runner
 		} else {
+			cwd, _ := os.Getwd()
 			runner = &workflow.BuildFromPRDWorkflow{
 				ManifestPath: manifestPath,
 				Policy:       policy,
 				Logger:       logger,
+				WorkDir:      cwd,
 			}
 		}
 

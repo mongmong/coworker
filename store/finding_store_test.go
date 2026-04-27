@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -90,12 +91,94 @@ func TestInsertFinding(t *testing.T) {
 	}
 }
 
+func TestFindingsImmutableTrigger_AllImmutableColumns(t *testing.T) {
+	// Table-driven test: each protected column must be rejected by the trigger.
+	tests := []struct {
+		name  string
+		query string
+	}{
+		{"path", "UPDATE findings SET path = 'tampered' WHERE id = 'find_immut'"},
+		{"line", "UPDATE findings SET line = 999 WHERE id = 'find_immut'"},
+		{"severity", "UPDATE findings SET severity = 'minor' WHERE id = 'find_immut'"},
+		{"body", "UPDATE findings SET body = 'tampered body' WHERE id = 'find_immut'"},
+		{"fingerprint", "UPDATE findings SET fingerprint = 'tampered-fp' WHERE id = 'find_immut'"},
+		{"run_id", "UPDATE findings SET run_id = 'run_other' WHERE id = 'find_immut'"},
+		{"job_id", "UPDATE findings SET job_id = 'job_other' WHERE id = 'find_immut'"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			db, _, _, _, fs := setupFindingTestDB(t)
+			ctx := context.Background()
+
+			finding := &core.Finding{
+				ID:       "find_immut",
+				RunID:    "run_f1",
+				JobID:    "job_f1",
+				Path:     "main.go",
+				Line:     42,
+				Severity: core.SeverityImportant,
+				Body:     "Original body text",
+			}
+
+			if err := fs.InsertFinding(ctx, finding); err != nil {
+				t.Fatalf("InsertFinding: %v", err)
+			}
+
+			_, err := db.ExecContext(ctx, tc.query)
+			if err == nil {
+				t.Fatalf("expected error updating immutable column %q, got nil", tc.name)
+			}
+			if !strings.Contains(err.Error(), "immutable") && !strings.Contains(err.Error(), "resolved_by_job_id") {
+				t.Errorf("expected 'immutable' in error, got: %v", err)
+			}
+		})
+	}
+}
+
+func TestFindingsImmutableTrigger_ResolveAllowed(t *testing.T) {
+	// ResolveFinding (which only updates resolved_by_job_id + resolved_at) must not be blocked.
+	_, _, _, _, fs := setupFindingTestDB(t)
+	ctx := context.Background()
+
+	finding := &core.Finding{
+		ID:       "find_resolve_trigger",
+		RunID:    "run_f1",
+		JobID:    "job_f1",
+		Path:     "store.go",
+		Line:     17,
+		Severity: core.SeverityMinor,
+		Body:     "Consider using prepared statement",
+	}
+
+	if err := fs.InsertFinding(ctx, finding); err != nil {
+		t.Fatalf("InsertFinding: %v", err)
+	}
+
+	// ResolveFinding must succeed (trigger must not block resolution updates).
+	if err := fs.ResolveFinding(ctx, "find_resolve_trigger", "fix_job_trigger"); err != nil {
+		t.Fatalf("ResolveFinding after trigger migration: %v", err)
+	}
+
+	findings, err := fs.ListFindings(ctx, "run_f1")
+	if err != nil {
+		t.Fatalf("ListFindings: %v", err)
+	}
+	if len(findings) != 1 {
+		t.Fatalf("expected 1 finding, got %d", len(findings))
+	}
+	if findings[0].ResolvedByJobID != "fix_job_trigger" {
+		t.Errorf("resolved_by_job_id = %q, want %q", findings[0].ResolvedByJobID, "fix_job_trigger")
+	}
+}
+
 func TestFindingImmutability_DirectUpdateBlocked(t *testing.T) {
+	// Legacy test kept for documentation: this now tests the SQL trigger path.
 	db, _, _, _, fs := setupFindingTestDB(t)
 	ctx := context.Background()
 
 	finding := &core.Finding{
-		ID:       "find_immut",
+		ID:       "find_immut_legacy",
 		RunID:    "run_f1",
 		JobID:    "job_f1",
 		Path:     "main.go",
@@ -108,24 +191,14 @@ func TestFindingImmutability_DirectUpdateBlocked(t *testing.T) {
 		t.Fatalf("InsertFinding: %v", err)
 	}
 
-	// Try to update body directly via SQL -- this should work at the SQL level
-	// but the store API does not expose it. We test that the store layer
-	// only provides InsertFinding and ResolveFinding.
-	// The store API is the enforcement boundary.
-
-	// Verify the finding body via the store API.
-	findings, err := fs.ListFindings(ctx, "run_f1")
-	if err != nil {
-		t.Fatalf("ListFindings: %v", err)
+	// Direct SQL update on body should now be blocked by the trigger (migration 006).
+	_, err := db.ExecContext(ctx, "UPDATE findings SET body = 'tampered' WHERE id = 'find_immut_legacy'")
+	if err == nil {
+		t.Fatal("expected trigger to block direct body UPDATE, got nil error")
 	}
-	if findings[0].Body != "Original body text" {
-		t.Errorf("body = %q, want %q", findings[0].Body, "Original body text")
+	if !strings.Contains(err.Error(), "immutable") && !strings.Contains(err.Error(), "resolved_by_job_id") {
+		t.Errorf("expected 'immutable' in error, got: %v", err)
 	}
-
-	// Direct SQL update should work (SQLite doesn't have column-level triggers
-	// in our schema), but we rely on the Go API boundary for immutability.
-	// This is documented: "enforced by store layer" per the plan manifest.
-	_ = db
 }
 
 func TestResolveFinding(t *testing.T) {
