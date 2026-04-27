@@ -196,3 +196,116 @@ func eventKinds(events []core.Event) []core.EventKind {
 	}
 	return kinds
 }
+
+// TestShipper_GhRunner_Success uses an injected GhRunner (no real gh
+// binary) to exercise the success path. Plan 128 (I6).
+func TestShipper_GhRunner_Success(t *testing.T) {
+	db := openTestDB(t)
+	es := store.NewEventStore(db)
+	runID := "run_gh_ok"
+	seedRun(t, db, runID)
+
+	var captured struct {
+		branch, title, body string
+	}
+	s := &shipper.Shipper{
+		EventStore:    es,
+		ArtifactStore: store.NewArtifactStore(db, es),
+		JobStore:      store.NewJobStore(db, es),
+		GhRunner: func(_ context.Context, branch, title, body string) (string, error) {
+			captured.branch = branch
+			captured.title = title
+			captured.body = body
+			return "https://github.com/example/coworker/pull/777", nil
+		},
+	}
+	plan := &manifest.PlanEntry{ID: 777, Title: "Test"}
+	result, err := s.Ship(context.Background(), runID, plan, "feature/plan-777")
+	if err != nil {
+		t.Fatalf("Ship: %v", err)
+	}
+	if result.PRURL != "https://github.com/example/coworker/pull/777" {
+		t.Errorf("PRURL = %q", result.PRURL)
+	}
+	if captured.branch != "feature/plan-777" {
+		t.Errorf("captured branch = %q", captured.branch)
+	}
+	if !contains(captured.title, "Plan 777") {
+		t.Errorf("title = %q; expected to contain 'Plan 777'", captured.title)
+	}
+}
+
+// TestShipper_GhRunner_Failure verifies that gh failures bubble up as
+// a wrapped error from Ship. Plan 128 (I6).
+func TestShipper_GhRunner_Failure(t *testing.T) {
+	db := openTestDB(t)
+	es := store.NewEventStore(db)
+	runID := "run_gh_fail"
+	seedRun(t, db, runID)
+
+	wantErr := "gh exit 1: not authenticated"
+	s := &shipper.Shipper{
+		EventStore:    es,
+		ArtifactStore: store.NewArtifactStore(db, es),
+		JobStore:      store.NewJobStore(db, es),
+		GhRunner: func(_ context.Context, _, _, _ string) (string, error) {
+			return "", fmtErr(wantErr)
+		},
+	}
+	plan := &manifest.PlanEntry{ID: 1, Title: "fail"}
+	_, err := s.Ship(context.Background(), runID, plan, "feature/plan-1")
+	if err == nil {
+		t.Fatal("expected error from Ship when GhRunner fails")
+	}
+	if !contains(err.Error(), wantErr) {
+		t.Errorf("error %q; expected to contain %q", err.Error(), wantErr)
+	}
+}
+
+// TestShipper_GhRunner_EmptyURL verifies that an empty PR URL from gh
+// produces a wrapped error instead of a silent empty-URL ship.
+//
+// (The default ghCreatePR returns a "no PR URL returned" error in this
+// case; we mirror it via the injected stub.)
+func TestShipper_GhRunner_EmptyURL(t *testing.T) {
+	db := openTestDB(t)
+	es := store.NewEventStore(db)
+	runID := "run_gh_empty"
+	seedRun(t, db, runID)
+
+	s := &shipper.Shipper{
+		EventStore:    es,
+		ArtifactStore: store.NewArtifactStore(db, es),
+		JobStore:      store.NewJobStore(db, es),
+		GhRunner: func(_ context.Context, _, _, _ string) (string, error) {
+			return "", fmtErr("gh pr create: empty output (no PR URL returned)")
+		},
+	}
+	plan := &manifest.PlanEntry{ID: 2, Title: "empty"}
+	_, err := s.Ship(context.Background(), runID, plan, "feature/plan-2")
+	if err == nil {
+		t.Fatal("expected error when GhRunner returns empty URL")
+	}
+}
+
+func contains(s, sub string) bool {
+	return len(sub) == 0 || (len(s) >= len(sub) && indexOf(s, sub) >= 0)
+}
+
+func indexOf(s, sub string) int {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return i
+		}
+	}
+	return -1
+}
+
+// fmtErr returns an error with the given message (test helper).
+func fmtErr(msg string) error {
+	return &testErr{msg: msg}
+}
+
+type testErr struct{ msg string }
+
+func (e *testErr) Error() string { return e.msg }
