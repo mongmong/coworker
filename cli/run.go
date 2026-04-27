@@ -15,6 +15,7 @@ import (
 	"github.com/chris/coworker/agent"
 	"github.com/chris/coworker/coding"
 	"github.com/chris/coworker/coding/manifest"
+	"github.com/chris/coworker/coding/workflow"
 	"github.com/chris/coworker/core"
 	"github.com/chris/coworker/store"
 )
@@ -30,6 +31,9 @@ var (
 	runRoleDir              string
 	runPromptDir            string
 	runCliBinary            string
+	runClaudeBinary         string
+	runCodexBinary          string
+	runOpenCodeBinary       string
 )
 
 var runCmd = &cobra.Command{
@@ -71,7 +75,10 @@ func init() {
 	runCmd.Flags().StringVar(&runResumeAfterAttention, "resume-after-attention", "", "Resume after a human approved or rejected a checkpoint")
 	runCmd.Flags().StringVar(&runRoleDir, "role-dir", "", "Path to the role YAML directory (default: .coworker/roles or coding/roles)")
 	runCmd.Flags().StringVar(&runPromptDir, "prompt-dir", "", "Path to the prompt template directory (default: .coworker or coding)")
-	runCmd.Flags().StringVar(&runCliBinary, "cli-binary", "", "Path to the CLI binary (default: codex)")
+	runCmd.Flags().StringVar(&runCliBinary, "cli-binary", "", "Fallback CLI binary for all roles (default: codex). Overridden by per-CLI flags.")
+	runCmd.Flags().StringVar(&runClaudeBinary, "claude-binary", "", "Path to the claude-code binary (default: resolved from PATH)")
+	runCmd.Flags().StringVar(&runCodexBinary, "codex-binary", "", "Path to the codex binary (default: resolved from PATH)")
+	runCmd.Flags().StringVar(&runOpenCodeBinary, "opencode-binary", "", "Path to the opencode binary (default: resolved from PATH)")
 	rootCmd.AddCommand(runCmd)
 }
 
@@ -119,6 +126,14 @@ func runAutopilot(cmd *cobra.Command, prdPath string) error {
 
 	// --resume-after-attention path.
 	if runResumeAfterAttention != "" {
+		// Disallow --manifest with --resume-after-attention: the manifest must
+		// be discovered from the original run's event log to prevent unsafe
+		// cross-run resume where the caller accidentally supplies a different
+		// manifest. Tell the user to omit --manifest and let the run discover it.
+		if runManifestPath != "" {
+			return fmt.Errorf("cannot use --manifest with --resume-after-attention; " +
+				"the manifest is discovered automatically from the resumed run's event log — omit --manifest")
+		}
 		return resumeAfterAttention(ctx, cmd, runResumeAfterAttention, prdPath, db, runStore, attentionStore, eventStore, policy, logger)
 	}
 
@@ -352,36 +367,88 @@ func resumeAfterAttention(
 		"active_at_crash", len(active),
 	)
 
-	// Determine manifest path: check --manifest flag first, then look for
-	// a persisted manifest path in the run's event log.
-	manifestPath := runManifestPath
+	// Determine manifest path from the run's event log.
+	manifestPath := discoverManifestFromEvents(events)
 	if manifestPath == "" {
-		manifestPath = discoverManifestFromEvents(events)
-	}
-	if manifestPath == "" {
-		return fmt.Errorf("cannot determine manifest path for run %s; use --manifest flag", runID)
+		return fmt.Errorf("cannot determine manifest path for run %s; the original run must have written a manifest_path event", runID)
 	}
 	if err := validateRunFileExists(manifestPath, "manifest"); err != nil {
 		return err
 	}
 
-	// Run the plan iteration loop.
-	return runPlanLoop(ctx, cmd, runID, manifestPath, completed, active, policy, attentionStore, eventStore, logger)
+	// Run the plan iteration loop, passing the approved item so the loop knows
+	// whether this resume is a spec-approved or plan-approved gate.
+	return runPlanLoop(ctx, cmd, runID, manifestPath, item, completed, active, db, policy, attentionStore, eventStore, logger)
+}
+
+// WorkflowRunner is the interface used by runPlanLoop to execute plan phases.
+// It is satisfied by *workflow.BuildFromPRDWorkflow. The interface exists so
+// that tests can inject a stub without needing a real CLI binary.
+type WorkflowRunner interface {
+	RunPhasesForPlan(ctx context.Context, runID string, plan manifest.PlanEntry, inputs map[string]string) (*workflow.RunPhasesResult, error)
+}
+
+// PlannerDispatcher is the interface used by runPlanLoop to dispatch the
+// planner role for a given plan. It is a subset of coding.Dispatcher's API.
+type PlannerDispatcher interface {
+	Orchestrate(ctx context.Context, input *coding.DispatchInput) (*coding.DispatchResult, error)
+}
+
+// planLoopDeps bundles injectable dependencies for runPlanLoop. When a field is
+// nil the loop builds the real dependency from run flags. Non-nil values are
+// used in unit tests to avoid touching real CLI binaries.
+type planLoopDeps struct {
+	Runner     WorkflowRunner
+	Dispatcher PlannerDispatcher
 }
 
 // runPlanLoop iterates the manifest's ready plans sequentially, gating each
 // plan on a plan-approved checkpoint before continuing.
+//
+// item is the attention item that was just approved. Its Question field
+// identifies the kind of gate ("spec-approved" or "plan-approved"). When
+// resuming after a spec-approved gate the loop creates the first plan-approved
+// checkpoint and pauses. When resuming after a plan-approved gate the loop
+// dispatches the planner, runs the phase executor, and (on success) continues
+// to the next ready plan.
+//
+// deps may be nil (uses real dependencies from run flags and workflow package).
+//
+//nolint:gocyclo // Linear orchestration flow; complexity is inherent.
 func runPlanLoop(
 	ctx context.Context,
 	cmd *cobra.Command,
 	runID string,
 	manifestPath string,
+	item *core.AttentionItem,
 	completed map[int]bool,
 	active map[int]bool,
+	db *store.DB,
 	policy *core.Policy,
 	attentionStore *store.AttentionStore,
 	eventStore *store.EventStore,
 	logger *slog.Logger,
+) error {
+	return runPlanLoopWithDeps(ctx, cmd, runID, manifestPath, item, completed, active, db, policy, attentionStore, eventStore, logger, nil)
+}
+
+// runPlanLoopWithDeps is the testable variant of runPlanLoop.
+//
+//nolint:gocyclo // Linear orchestration flow; complexity is inherent.
+func runPlanLoopWithDeps(
+	ctx context.Context,
+	cmd *cobra.Command,
+	runID string,
+	manifestPath string,
+	item *core.AttentionItem,
+	completed map[int]bool,
+	active map[int]bool,
+	db *store.DB,
+	policy *core.Policy,
+	attentionStore *store.AttentionStore,
+	eventStore *store.EventStore,
+	logger *slog.Logger,
+	deps *planLoopDeps,
 ) error {
 	m, err := manifest.LoadManifest(manifestPath)
 	if err != nil {
@@ -391,10 +458,156 @@ func runPlanLoop(
 
 	scheduler := manifest.NewDAGScheduler(m, policy)
 
+	// spec-approved gate: the user has approved the spec. Find the first ready
+	// plan, create a plan-approved checkpoint, and pause.
+	if item.Question == "spec-approved" {
+		return runPlanLoopCreateNextCheckpoint(ctx, cmd, runID, scheduler, completed, active, attentionStore, eventStore, logger)
+	}
+
+	// plan-approved gate: the user has approved a specific plan. Execute it.
+	if item.Question == "plan-approved" {
+		// item.Source encodes the plan ID as "plan-N".
+		planID := extractPlanIDFromSource(item.Source)
+		if planID <= 0 {
+			return fmt.Errorf("cannot parse plan ID from attention item source %q", item.Source)
+		}
+
+		// Find the plan entry in the manifest.
+		plan, found := findPlanByID(m, planID)
+		if !found {
+			return fmt.Errorf("plan %d not found in manifest %s", planID, manifestPath)
+		}
+
+		// Build or use the provided workflow runner.
+		var runner WorkflowRunner
+		if deps != nil && deps.Runner != nil {
+			runner = deps.Runner
+		} else {
+			runner = &workflow.BuildFromPRDWorkflow{
+				ManifestPath: manifestPath,
+				Policy:       policy,
+				Logger:       logger,
+			}
+		}
+
+		// Build or use the provided dispatcher for the planner role.
+		var plDispatcher PlannerDispatcher
+		if deps != nil && deps.Dispatcher != nil {
+			plDispatcher = deps.Dispatcher
+		} else {
+			d, dispatchErr := buildRunDispatcher(db, policy, logger)
+			if dispatchErr != nil {
+				return fmt.Errorf("build dispatcher for planner: %w", dispatchErr)
+			}
+			plDispatcher = d
+		}
+
+		plannerInputs := map[string]string{
+			"spec_path":     m.SpecPath,
+			"plan_skeleton": plan.Title,
+		}
+		logger.Info("dispatching planner role", "plan_id", plan.ID, "title", plan.Title)
+		plannerResult, plannerErr := plDispatcher.Orchestrate(ctx, &coding.DispatchInput{
+			RoleName: "planner",
+			Inputs:   plannerInputs,
+		})
+		if plannerErr != nil {
+			return fmt.Errorf("planner dispatch for plan %d: %w", plan.ID, plannerErr)
+		}
+		logger.Info("planner completed", "plan_id", plan.ID, "job_id", plannerResult.JobID)
+
+		// Emit phase.started event.
+		planStartedEvent := &core.Event{
+			ID:            core.NewID(),
+			RunID:         runID,
+			Kind:          core.EventPhaseStarted,
+			SchemaVersion: 1,
+			CorrelationID: fmt.Sprintf("plan-%d", plan.ID),
+			Payload:       fmt.Sprintf(`{"plan_id":%d,"title":%q}`, plan.ID, plan.Title),
+			CreatedAt:     time.Now(),
+		}
+		if evtErr := eventStore.WriteEventThenRow(ctx, planStartedEvent, nil); evtErr != nil {
+			logger.Error("write phase.started event", "error", evtErr, "plan_id", plan.ID)
+		}
+
+		// Run the phase executor.
+		phaseResult, phaseErr := runner.RunPhasesForPlan(ctx, runID, plan, map[string]string{
+			"spec_path": m.SpecPath,
+		})
+		if phaseErr != nil {
+			return fmt.Errorf("run phases for plan %d: %w", plan.ID, phaseErr)
+		}
+
+		// Phase did not converge — surface the attention item and pause.
+		if phaseResult.StoppedAtPhaseClean {
+			msg := fmt.Sprintf("Plan %d phase %q did not converge.", plan.ID, phaseResult.DirtyPhaseName)
+			if phaseResult.AttentionItemID != "" {
+				msg += fmt.Sprintf(" Fix the issues and resume with --resume-after-attention %s", phaseResult.AttentionItemID)
+			}
+			fmt.Fprintln(cmd.OutOrStdout(), msg)
+			logger.Warn("plan stopped at dirty phase",
+				"plan_id", plan.ID,
+				"phase", phaseResult.DirtyPhaseName,
+				"attention_id", phaseResult.AttentionItemID,
+			)
+			return fmt.Errorf("plan %d stopped at dirty phase %q", plan.ID, phaseResult.DirtyPhaseName)
+		}
+
+		// Plan succeeded. Mark it complete.
+		completed[plan.ID] = true
+		delete(active, plan.ID)
+
+		// Emit plan.shipped event (or a plan.completed event when no shipper).
+		shippedPayload := fmt.Sprintf(`{"plan_id":%d}`, plan.ID)
+		if phaseResult.ShipResult != nil {
+			shippedPayload = fmt.Sprintf(`{"plan_id":%d,"pr_url":%q}`, plan.ID, phaseResult.ShipResult.PRURL)
+		}
+		shippedEvent := &core.Event{
+			ID:            core.NewID(),
+			RunID:         runID,
+			Kind:          core.EventPlanShipped,
+			SchemaVersion: 1,
+			CorrelationID: fmt.Sprintf("plan-%d", plan.ID),
+			Payload:       shippedPayload,
+			CreatedAt:     time.Now(),
+		}
+		if evtErr := eventStore.WriteEventThenRow(ctx, shippedEvent, nil); evtErr != nil {
+			logger.Error("write plan.shipped event", "error", evtErr, "plan_id", plan.ID)
+		}
+
+		logger.Info("plan completed", "plan_id", plan.ID)
+		if phaseResult.ShipResult != nil {
+			fmt.Fprintf(cmd.OutOrStdout(), "Plan %d (%s) shipped: %s\n", plan.ID, plan.Title, phaseResult.ShipResult.PRURL)
+		} else {
+			fmt.Fprintf(cmd.OutOrStdout(), "Plan %d (%s) complete.\n", plan.ID, plan.Title)
+		}
+
+		// Continue to the next ready plan: create a checkpoint or print done.
+		return runPlanLoopCreateNextCheckpoint(ctx, cmd, runID, scheduler, completed, active, attentionStore, eventStore, logger)
+	}
+
+	return fmt.Errorf("unknown checkpoint question %q for attention item %s; expected spec-approved or plan-approved", item.Question, item.ID)
+}
+
+// runPlanLoopCreateNextCheckpoint finds the next ready plan and creates a
+// plan-approved checkpoint for it. If no plans are left it prints the success
+// summary. This is extracted from runPlanLoop to avoid repeating the logic
+// after spec-approved and after a plan completes.
+func runPlanLoopCreateNextCheckpoint(
+	ctx context.Context,
+	cmd *cobra.Command,
+	runID string,
+	scheduler *manifest.DAGScheduler,
+	completed map[int]bool,
+	active map[int]bool,
+	attentionStore *store.AttentionStore,
+	eventStore *store.EventStore,
+	logger *slog.Logger,
+) error {
+	m := scheduler.Manifest
 	ready := scheduler.ReadyPlans(completed, active)
 	if len(ready) > 0 {
-		// Take the first ready plan. This command pauses after each plan-approved
-		// checkpoint; the caller resumes via --resume-after-attention.
+		// Take the first ready plan and gate on a plan-approved checkpoint.
 		plan := ready[0]
 		active[plan.ID] = true
 
@@ -412,13 +625,6 @@ func runPlanLoop(
 			logger.Error("write phase.started event", "error", evtErr, "plan_id", plan.ID)
 		}
 
-		logger.Info("gating on plan-approved checkpoint",
-			"plan_id", plan.ID,
-			"title", plan.Title,
-		)
-
-		// Insert plan-approved checkpoint — pause for human review before
-		// executing any phases for this plan.
 		checkpointID, chkErr := insertRunCheckpoint(ctx, attentionStore, runID, "plan-approved", fmt.Sprintf("plan-%d", plan.ID))
 		if chkErr != nil {
 			return fmt.Errorf("insert plan-approved checkpoint for plan %d: %w", plan.ID, chkErr)
@@ -431,11 +637,10 @@ func runPlanLoop(
 			"plan_id", plan.ID,
 			"attention_id", checkpointID,
 		)
-		// Pause here — caller must resume via --resume-after-attention.
 		return nil
 	}
 
-	// All ready plans are exhausted (all completed or no more ready plans).
+	// No more ready plans.
 	allDone := true
 	for _, p := range m.Plans {
 		if !completed[p.ID] {
@@ -449,6 +654,26 @@ func runPlanLoop(
 		fmt.Fprintf(cmd.OutOrStdout(), "No more plans ready. Completed: %d/%d\n", len(completed), len(m.Plans))
 	}
 	return nil
+}
+
+// extractPlanIDFromSource parses the plan ID from a source string of the form
+// "plan-N". Returns 0 if the string does not match the expected format.
+func extractPlanIDFromSource(source string) int {
+	var id int
+	if _, err := fmt.Sscanf(source, "plan-%d", &id); err != nil {
+		return 0
+	}
+	return id
+}
+
+// findPlanByID looks up a plan entry in the manifest by ID.
+func findPlanByID(m *manifest.PlanManifest, id int) (manifest.PlanEntry, bool) {
+	for _, p := range m.Plans {
+		if p.ID == id {
+			return p, true
+		}
+	}
+	return manifest.PlanEntry{}, false
 }
 
 // buildRunDispatcher creates a coding.Dispatcher from the run command flags.
@@ -478,10 +703,30 @@ func buildRunDispatcher(db *store.DB, policy *core.Policy, logger *slog.Logger) 
 		agentBinary = "codex"
 	}
 
+	// Build per-CLI agent map. Defaults from PATH when flags are empty.
+	claudeBin := runClaudeBinary
+	if claudeBin == "" {
+		claudeBin = "claude"
+	}
+	codexBin := runCodexBinary
+	if codexBin == "" {
+		codexBin = "codex"
+	}
+	openCodeBin := runOpenCodeBinary
+	if openCodeBin == "" {
+		openCodeBin = "opencode"
+	}
+	cliAgents := map[string]core.Agent{
+		"claude-code": agent.NewCliAgent(claudeBin),
+		"codex":       agent.NewCliAgent(codexBin),
+		"opencode":    agent.NewCliAgent(openCodeBin),
+	}
+
 	d := &coding.Dispatcher{
 		RoleDir:   roleDir,
 		PromptDir: promptDir,
 		Agent:     agent.NewCliAgent(agentBinary),
+		CLIAgents: cliAgents,
 		DB:        db,
 		Logger:    logger,
 		Policy:    policy,

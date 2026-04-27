@@ -25,9 +25,21 @@ const DefaultMaxRetries = 3
 type Dispatcher struct {
 	RoleDir   string // path to directory containing role YAML files
 	PromptDir string // path to directory containing prompt template files
-	Agent     core.Agent
-	DB        *store.DB
-	Logger    *slog.Logger
+
+	// Agent is the default agent used when a role's CLI field does not match
+	// any entry in CLIAgents, or when CLIAgents is empty. For backwards
+	// compatibility, a Dispatcher with only Agent set routes all roles through
+	// that single agent.
+	Agent core.Agent
+
+	// CLIAgents maps CLI name (e.g. "codex", "claude-code", "opencode") to an
+	// Agent implementation. When non-empty, Orchestrate selects the agent by
+	// matching role.CLI against this map. Falls back to Agent when the role's
+	// CLI is not in the map or the map is nil.
+	CLIAgents map[string]core.Agent
+
+	DB     *store.DB
+	Logger *slog.Logger
 
 	// Supervisor is the optional rule engine. If nil, no contract
 	// checks are performed (equivalent to all-pass).
@@ -50,6 +62,17 @@ type Dispatcher struct {
 	// action matches the requires_human permission list. Optional; no item is
 	// created when nil.
 	AttentionStore *store.AttentionStore
+}
+
+// agentFor returns the Agent to use for the given role. It prefers CLIAgents
+// keyed by role.CLI; falls back to the default Agent field.
+func (d *Dispatcher) agentFor(role *core.Role) core.Agent {
+	if len(d.CLIAgents) > 0 && role.CLI != "" {
+		if a, ok := d.CLIAgents[role.CLI]; ok {
+			return a
+		}
+	}
+	return d.Agent
 }
 
 // DispatchInput contains the inputs for a dispatch operation.
@@ -142,6 +165,9 @@ func (d *Dispatcher) Orchestrate(ctx context.Context, input *DispatchInput) (*Di
 		return nil, fmt.Errorf("render prompt: %w", err)
 	}
 
+	// Select the agent for this role (routes by role.CLI when CLIAgents is set).
+	selectedAgent := d.agentFor(role)
+
 	maxRetries := d.maxRetries()
 	var lastVerdict *core.SupervisorVerdict
 	var lastJobID string
@@ -156,7 +182,7 @@ func (d *Dispatcher) Orchestrate(ctx context.Context, input *DispatchInput) (*Di
 		default:
 		}
 
-		attemptResult, err := d.executeAttempt(ctx, logger, eventStore, jobStore, runID, role, prompt, originalPrompt, attempt, maxRetries)
+		attemptResult, err := d.executeAttempt(ctx, logger, eventStore, jobStore, runID, role, selectedAgent, prompt, originalPrompt, attempt, maxRetries)
 		if err != nil {
 			return nil, err
 		}
@@ -288,6 +314,7 @@ func (d *Dispatcher) executeAttempt(
 	jobStore *store.JobStore,
 	runID string,
 	role *core.Role,
+	roleAgent core.Agent,
 	prompt string,
 	originalPrompt string,
 	attempt int,
@@ -320,7 +347,7 @@ func (d *Dispatcher) executeAttempt(
 	// Permission check: verify that the role is allowed to invoke the agent binary.
 	// We use a BinaryBasename() interface assertion so the check is cleanly
 	// opt-in for non-CLI agent implementations (e.g., test stubs).
-	if binaryAgent, ok := d.Agent.(interface{ BinaryBasename() string }); ok {
+	if binaryAgent, ok := roleAgent.(interface{ BinaryBasename() string }); ok {
 		binaryName := binaryAgent.BinaryBasename()
 		if binaryName != "" {
 			if permErr := d.checkPermission(ctx, logger, runID, role, binaryName); permErr != nil {
@@ -330,7 +357,7 @@ func (d *Dispatcher) executeAttempt(
 		}
 	}
 
-	handle, err := d.Agent.Dispatch(ctx, job, prompt)
+	handle, err := roleAgent.Dispatch(ctx, job, prompt)
 	if err != nil {
 		jobStore.UpdateJobState(ctx, jobID, core.JobStateFailed) //nolint:errcheck
 		return nil, fmt.Errorf("dispatch agent: %w", err)

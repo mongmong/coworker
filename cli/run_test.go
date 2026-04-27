@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -11,6 +12,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/chris/coworker/coding"
+	"github.com/chris/coworker/coding/manifest"
+	"github.com/chris/coworker/coding/workflow"
 	"github.com/chris/coworker/core"
 	"github.com/chris/coworker/store"
 )
@@ -46,6 +50,9 @@ func saveAndRestoreRunFlags(t *testing.T) {
 	origRoleDir := runRoleDir
 	origPromptDir := runPromptDir
 	origCliBinary := runCliBinary
+	origClaudeBinary := runClaudeBinary
+	origCodexBinary := runCodexBinary
+	origOpenCodeBinary := runOpenCodeBinary
 	t.Cleanup(func() {
 		runDBPath = origDBPath
 		runPolicyPath = origPolicyPath
@@ -57,6 +64,9 @@ func saveAndRestoreRunFlags(t *testing.T) {
 		runRoleDir = origRoleDir
 		runPromptDir = origPromptDir
 		runCliBinary = origCliBinary
+		runClaudeBinary = origClaudeBinary
+		runCodexBinary = origCodexBinary
+		runOpenCodeBinary = origOpenCodeBinary
 	})
 }
 
@@ -497,16 +507,14 @@ func TestResumeAfterAttention_ApprovedNoManifest(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error when manifest path cannot be determined, got nil")
 	}
-	if !strings.Contains(err.Error(), "manifest path") {
-		t.Errorf("expected manifest path error, got: %v", err)
+	if !strings.Contains(err.Error(), "manifest_path event") {
+		t.Errorf("expected manifest_path event error, got: %v", err)
 	}
 }
 
 // TestResumeAfterAttention_ApprovedWithManifest tests the happy path:
-// approved checkpoint + valid manifest → enters plan loop.
+// approved spec-approved checkpoint + manifest path in event log → enters plan loop.
 func TestResumeAfterAttention_ApprovedWithManifest(t *testing.T) {
-	saveAndRestoreRunFlags(t)
-
 	dir := t.TempDir()
 	db := openTestDB(t)
 	eventStore := store.NewEventStore(db)
@@ -552,7 +560,20 @@ plans:
 		t.Fatalf("write manifest: %v", err)
 	}
 
-	runManifestPath = manifestFile
+	// Write a job.completed event carrying the manifest_path, as the architect
+	// dispatch would in production. This is how resumeAfterAttention discovers
+	// the manifest on resume (the --manifest flag is forbidden with --resume).
+	manifestEvent := &core.Event{
+		ID:            core.NewID(),
+		RunID:         run.ID,
+		Kind:          core.EventJobCompleted,
+		SchemaVersion: 1,
+		Payload:       `{"manifest_path":"` + manifestFile + `"}`,
+		CreatedAt:     time.Now(),
+	}
+	if err := eventStore.WriteEventThenRow(ctx, manifestEvent, nil); err != nil {
+		t.Fatalf("write manifest event: %v", err)
+	}
 
 	// Use a dedicated output buffer for the plan loop call.
 	planBuf := &bytes.Buffer{}
@@ -798,5 +819,456 @@ func TestLoadRunPolicy_ValidFile(t *testing.T) {
 	}
 	if result.ConcurrencyLimits.MaxParallelPlans != 3 {
 		t.Errorf("expected MaxParallelPlans=3, got %d", result.ConcurrencyLimits.MaxParallelPlans)
+	}
+}
+
+// TestRunCommand_ManifestWithResumeErrors verifies that combining --manifest
+// with --resume-after-attention is rejected immediately (Important #1).
+func TestRunCommand_ManifestWithResumeErrors(t *testing.T) {
+	saveAndRestoreRunFlags(t)
+
+	dir := t.TempDir()
+	prdFile := filepath.Join(dir, "prd.md")
+	if err := os.WriteFile(prdFile, []byte("# PRD\n"), 0o600); err != nil {
+		t.Fatalf("write prd: %v", err)
+	}
+
+	manifestFile := filepath.Join(dir, "manifest.yaml")
+	if err := os.WriteFile(manifestFile, []byte(`spec_path: s.md
+plans:
+  - id: 1
+    title: "T"
+    phases: []
+    blocks_on: []
+`), 0o600); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+
+	runManifestPath = manifestFile
+	runResumeAfterAttention = "some-attn-id"
+	runDBPath = filepath.Join(dir, "state.db")
+
+	cmd := runCmd
+	buf := &bytes.Buffer{}
+	cmd.SetOut(buf)
+	cmd.SetContext(context.Background())
+	t.Cleanup(func() { cmd.SetOut(nil) })
+
+	err := runAutopilot(cmd, prdFile)
+	if err == nil {
+		t.Fatal("expected error when --manifest and --resume-after-attention are both set")
+	}
+	if !strings.Contains(err.Error(), "--manifest") || !strings.Contains(err.Error(), "--resume-after-attention") {
+		t.Errorf("expected error mentioning both flags, got: %v", err)
+	}
+}
+
+// stubWorkflowRunner is a test double for WorkflowRunner.
+type stubWorkflowRunner struct {
+	result *workflow.RunPhasesResult
+	err    error
+	calls  []manifest.PlanEntry
+}
+
+func (s *stubWorkflowRunner) RunPhasesForPlan(_ context.Context, _ string, plan manifest.PlanEntry, _ map[string]string) (*workflow.RunPhasesResult, error) {
+	s.calls = append(s.calls, plan)
+	if s.err != nil {
+		return nil, s.err
+	}
+	if s.result != nil {
+		return s.result, nil
+	}
+	return &workflow.RunPhasesResult{}, nil
+}
+
+// stubPlannerDispatcher is a test double for PlannerDispatcher.
+type stubPlannerDispatcher struct {
+	result *coding.DispatchResult
+	err    error
+	calls  []*coding.DispatchInput
+}
+
+func (s *stubPlannerDispatcher) Orchestrate(_ context.Context, input *coding.DispatchInput) (*coding.DispatchResult, error) {
+	s.calls = append(s.calls, input)
+	if s.err != nil {
+		return nil, s.err
+	}
+	if s.result != nil {
+		return s.result, nil
+	}
+	return &coding.DispatchResult{JobID: "stub-job-id"}, nil
+}
+
+// writeManifestTestEnv creates a temp manifest file and writes a job.completed
+// event carrying its path into the event store, simulating what architect
+// dispatch would do in production.
+func writeManifestTestEnv(t *testing.T, dir string, content string, runID string, eventStore *store.EventStore) string {
+	t.Helper()
+	ctx := context.Background()
+	manifestFile := filepath.Join(dir, "manifest.yaml")
+	if err := os.WriteFile(manifestFile, []byte(content), 0o600); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	evt := &core.Event{
+		ID:            core.NewID(),
+		RunID:         runID,
+		Kind:          core.EventJobCompleted,
+		SchemaVersion: 1,
+		Payload:       fmt.Sprintf(`{"manifest_path":%q}`, manifestFile),
+		CreatedAt:     time.Now(),
+	}
+	if err := eventStore.WriteEventThenRow(ctx, evt, nil); err != nil {
+		t.Fatalf("write manifest event: %v", err)
+	}
+	return manifestFile
+}
+
+// TestRunPlanLoopWithDeps_SpecApproved verifies that resuming after a
+// spec-approved checkpoint creates a plan-approved checkpoint for the first
+// ready plan.
+func TestRunPlanLoopWithDeps_SpecApproved(t *testing.T) {
+	dir := t.TempDir()
+	db := openTestDB(t)
+	eventStore := store.NewEventStore(db)
+	runStore := store.NewRunStore(db, eventStore)
+	attentionStore := store.NewAttentionStore(db)
+
+	ctx := context.Background()
+
+	run := &core.Run{
+		ID:        core.NewID(),
+		Mode:      "autopilot",
+		State:     core.RunStateActive,
+		StartedAt: time.Now(),
+	}
+	if err := runStore.CreateRun(ctx, run); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	manifestContent := `spec_path: docs/specs/001-test.md
+plans:
+  - id: 1
+    title: "Plan One"
+    phases: ["implement"]
+    blocks_on: []
+  - id: 2
+    title: "Plan Two"
+    phases: ["implement"]
+    blocks_on: [1]
+`
+	manifestFile := writeManifestTestEnv(t, dir, manifestContent, run.ID, eventStore)
+
+	// Build a spec-approved attention item.
+	specItem := &core.AttentionItem{
+		ID:         core.NewID(),
+		RunID:      run.ID,
+		Kind:       core.AttentionCheckpoint,
+		Source:     "run-command",
+		Question:   "spec-approved",
+		Answer:     core.AttentionAnswerApprove,
+		AnsweredBy: "human",
+		CreatedAt:  time.Now(),
+	}
+
+	buf := &bytes.Buffer{}
+	cmd := runCmd
+	cmd.SetContext(ctx)
+	cmd.SetOut(buf)
+	t.Cleanup(func() { cmd.SetOut(nil) })
+
+	err := runPlanLoopWithDeps(
+		ctx, cmd, run.ID, manifestFile, specItem,
+		map[int]bool{}, map[int]bool{},
+		db, nil, attentionStore, eventStore, newTestLogger(), nil,
+	)
+	if err != nil {
+		t.Fatalf("runPlanLoopWithDeps: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "Plan 1") {
+		t.Errorf("expected plan-approved checkpoint for Plan 1, got: %q", output)
+	}
+	if !strings.Contains(output, "resume-after-attention") {
+		t.Errorf("expected resume-after-attention in output, got: %q", output)
+	}
+
+	// Verify the plan-approved checkpoint was created.
+	pending, err := attentionStore.ListUnansweredByRun(ctx, run.ID)
+	if err != nil {
+		t.Fatalf("list unanswered: %v", err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("expected 1 pending attention item, got %d", len(pending))
+	}
+	if pending[0].Question != "plan-approved" {
+		t.Errorf("expected question 'plan-approved', got %q", pending[0].Question)
+	}
+	if pending[0].Source != "plan-1" {
+		t.Errorf("expected source 'plan-1', got %q", pending[0].Source)
+	}
+}
+
+// TestRunPlanLoopWithDeps_PlanApproved verifies that resuming after a
+// plan-approved checkpoint dispatches the planner and calls RunPhasesForPlan.
+func TestRunPlanLoopWithDeps_PlanApproved(t *testing.T) {
+	dir := t.TempDir()
+	db := openTestDB(t)
+	eventStore := store.NewEventStore(db)
+	runStore := store.NewRunStore(db, eventStore)
+	attentionStore := store.NewAttentionStore(db)
+
+	ctx := context.Background()
+
+	run := &core.Run{
+		ID:        core.NewID(),
+		Mode:      "autopilot",
+		State:     core.RunStateActive,
+		StartedAt: time.Now(),
+	}
+	if err := runStore.CreateRun(ctx, run); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	manifestContent := `spec_path: docs/specs/001-test.md
+plans:
+  - id: 1
+    title: "Plan One"
+    phases: ["implement"]
+    blocks_on: []
+  - id: 2
+    title: "Plan Two"
+    phases: ["implement"]
+    blocks_on: [1]
+`
+	manifestFile := writeManifestTestEnv(t, dir, manifestContent, run.ID, eventStore)
+
+	planItem := &core.AttentionItem{
+		ID:         core.NewID(),
+		RunID:      run.ID,
+		Kind:       core.AttentionCheckpoint,
+		Source:     "plan-1",
+		Question:   "plan-approved",
+		Answer:     core.AttentionAnswerApprove,
+		AnsweredBy: "human",
+		CreatedAt:  time.Now(),
+	}
+
+	stubRunner := &stubWorkflowRunner{}
+	stubDispatcher := &stubPlannerDispatcher{}
+
+	buf := &bytes.Buffer{}
+	cmd := runCmd
+	cmd.SetContext(ctx)
+	cmd.SetOut(buf)
+	t.Cleanup(func() { cmd.SetOut(nil) })
+
+	err := runPlanLoopWithDeps(
+		ctx, cmd, run.ID, manifestFile, planItem,
+		map[int]bool{}, map[int]bool{1: true},
+		db, nil, attentionStore, eventStore, newTestLogger(),
+		&planLoopDeps{Runner: stubRunner, Dispatcher: stubDispatcher},
+	)
+	if err != nil {
+		t.Fatalf("runPlanLoopWithDeps: %v", err)
+	}
+
+	// Verify planner was dispatched.
+	if len(stubDispatcher.calls) != 1 {
+		t.Fatalf("expected 1 planner dispatch call, got %d", len(stubDispatcher.calls))
+	}
+	if stubDispatcher.calls[0].RoleName != "planner" {
+		t.Errorf("expected role 'planner', got %q", stubDispatcher.calls[0].RoleName)
+	}
+
+	// Verify RunPhasesForPlan was called for plan 1.
+	if len(stubRunner.calls) != 1 {
+		t.Fatalf("expected 1 RunPhasesForPlan call, got %d", len(stubRunner.calls))
+	}
+	if stubRunner.calls[0].ID != 1 {
+		t.Errorf("expected plan ID 1, got %d", stubRunner.calls[0].ID)
+	}
+
+	// After plan 1 completes, a plan-approved checkpoint for plan 2 should be created.
+	output := buf.String()
+	if !strings.Contains(output, "Plan 2") {
+		t.Errorf("expected plan-approved checkpoint for Plan 2, got: %q", output)
+	}
+}
+
+// TestRunPlanLoopWithDeps_AllPlansComplete verifies that when all plans are
+// done the loop prints the success summary instead of creating a checkpoint.
+func TestRunPlanLoopWithDeps_AllPlansComplete(t *testing.T) {
+	dir := t.TempDir()
+	db := openTestDB(t)
+	eventStore := store.NewEventStore(db)
+	runStore := store.NewRunStore(db, eventStore)
+	attentionStore := store.NewAttentionStore(db)
+
+	ctx := context.Background()
+
+	run := &core.Run{
+		ID:        core.NewID(),
+		Mode:      "autopilot",
+		State:     core.RunStateActive,
+		StartedAt: time.Now(),
+	}
+	if err := runStore.CreateRun(ctx, run); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	manifestContent := `spec_path: docs/specs/001-test.md
+plans:
+  - id: 1
+    title: "Plan One"
+    phases: ["implement"]
+    blocks_on: []
+`
+	manifestFile := writeManifestTestEnv(t, dir, manifestContent, run.ID, eventStore)
+
+	planItem := &core.AttentionItem{
+		ID:         core.NewID(),
+		RunID:      run.ID,
+		Kind:       core.AttentionCheckpoint,
+		Source:     "plan-1",
+		Question:   "plan-approved",
+		Answer:     core.AttentionAnswerApprove,
+		AnsweredBy: "human",
+		CreatedAt:  time.Now(),
+	}
+
+	stubRunner := &stubWorkflowRunner{}
+	stubDispatcher := &stubPlannerDispatcher{}
+
+	buf := &bytes.Buffer{}
+	cmd := runCmd
+	cmd.SetContext(ctx)
+	cmd.SetOut(buf)
+	t.Cleanup(func() { cmd.SetOut(nil) })
+
+	// completed = {}, active = {1: true} — plan 1 is active, needs to run.
+	err := runPlanLoopWithDeps(
+		ctx, cmd, run.ID, manifestFile, planItem,
+		map[int]bool{}, map[int]bool{1: true},
+		db, nil, attentionStore, eventStore, newTestLogger(),
+		&planLoopDeps{Runner: stubRunner, Dispatcher: stubDispatcher},
+	)
+	if err != nil {
+		t.Fatalf("runPlanLoopWithDeps: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "All plans complete") {
+		t.Errorf("expected 'All plans complete' in output, got: %q", output)
+	}
+
+	// No pending attention items should remain.
+	pending, err := attentionStore.ListUnansweredByRun(ctx, run.ID)
+	if err != nil {
+		t.Fatalf("list unanswered: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Errorf("expected 0 pending items after all plans complete, got %d", len(pending))
+	}
+}
+
+// TestRunPlanLoopWithDeps_DirtyPhase verifies that a StoppedAtPhaseClean result
+// surfaces an error and exits without creating additional checkpoints.
+func TestRunPlanLoopWithDeps_DirtyPhase(t *testing.T) {
+	dir := t.TempDir()
+	db := openTestDB(t)
+	eventStore := store.NewEventStore(db)
+	runStore := store.NewRunStore(db, eventStore)
+	attentionStore := store.NewAttentionStore(db)
+
+	ctx := context.Background()
+
+	run := &core.Run{
+		ID:        core.NewID(),
+		Mode:      "autopilot",
+		State:     core.RunStateActive,
+		StartedAt: time.Now(),
+	}
+	if err := runStore.CreateRun(ctx, run); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	manifestContent := `spec_path: docs/specs/001-test.md
+plans:
+  - id: 1
+    title: "Plan One"
+    phases: ["implement"]
+    blocks_on: []
+`
+	manifestFile := writeManifestTestEnv(t, dir, manifestContent, run.ID, eventStore)
+
+	planItem := &core.AttentionItem{
+		ID:         core.NewID(),
+		RunID:      run.ID,
+		Kind:       core.AttentionCheckpoint,
+		Source:     "plan-1",
+		Question:   "plan-approved",
+		Answer:     core.AttentionAnswerApprove,
+		AnsweredBy: "human",
+		CreatedAt:  time.Now(),
+	}
+
+	stubRunner := &stubWorkflowRunner{
+		result: &workflow.RunPhasesResult{
+			StoppedAtPhaseClean: true,
+			DirtyPhaseIndex:     0,
+			DirtyPhaseName:      "implement",
+			AttentionItemID:     "attn-dirty-123",
+		},
+	}
+	stubDispatcher := &stubPlannerDispatcher{}
+
+	buf := &bytes.Buffer{}
+	cmd := runCmd
+	cmd.SetContext(ctx)
+	cmd.SetOut(buf)
+	t.Cleanup(func() { cmd.SetOut(nil) })
+
+	err := runPlanLoopWithDeps(
+		ctx, cmd, run.ID, manifestFile, planItem,
+		map[int]bool{}, map[int]bool{1: true},
+		db, nil, attentionStore, eventStore, newTestLogger(),
+		&planLoopDeps{Runner: stubRunner, Dispatcher: stubDispatcher},
+	)
+	if err == nil {
+		t.Fatal("expected error when phase did not converge, got nil")
+	}
+	if !strings.Contains(err.Error(), "dirty phase") {
+		t.Errorf("expected 'dirty phase' in error, got: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "did not converge") {
+		t.Errorf("expected 'did not converge' in output, got: %q", output)
+	}
+	if !strings.Contains(output, "attn-dirty-123") {
+		t.Errorf("expected attention item ID in output, got: %q", output)
+	}
+}
+
+// TestExtractPlanIDFromSource verifies source-string parsing.
+func TestExtractPlanIDFromSource(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		input string
+		want  int
+	}{
+		{"plan-1", 1},
+		{"plan-42", 42},
+		{"plan-0", 0}, // 0 is treated as "not found" by callers
+		{"run-command", 0},
+		{"", 0},
+	}
+	for _, tc := range tests {
+		got := extractPlanIDFromSource(tc.input)
+		if got != tc.want {
+			t.Errorf("extractPlanIDFromSource(%q) = %d, want %d", tc.input, got, tc.want)
+		}
 	}
 }

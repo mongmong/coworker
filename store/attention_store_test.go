@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -208,6 +209,24 @@ func TestAttentionStore_AnswerAttention_AnsweredOnPopulated(t *testing.T) {
 
 // TestAttentionStore_GetUnansweredCheckpointForRun tests the filter logic for
 // GetUnansweredCheckpointForRun across all expected cases.
+// TestAttentionStore_AnswerAttention_NotFound verifies that AnswerAttention
+// returns ErrAttentionNotFound when the target row does not exist (Important #2).
+func TestAttentionStore_AnswerAttention_NotFound(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	db := setupTestDB(t)
+	as := NewAttentionStore(db)
+
+	err := as.AnswerAttention(ctx, "nonexistent-id", "approve", "human")
+	if err == nil {
+		t.Fatal("expected error for nonexistent attention ID, got nil")
+	}
+	if !errors.Is(err, ErrAttentionNotFound) {
+		t.Errorf("expected ErrAttentionNotFound, got: %v", err)
+	}
+}
+
 func TestAttentionStore_GetUnansweredCheckpointForRun(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

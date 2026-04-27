@@ -516,6 +516,64 @@ func TestHandleAnswerAttention_MissingAnswer(t *testing.T) {
 	}
 }
 
+// TestHandleAnswerAttention_UnknownID verifies that answering an unknown
+// attention ID returns HTTP 404 (Important #2).
+func TestHandleAnswerAttention_UnknownID(t *testing.T) {
+	db := openHTTPTestDB(t)
+	s := newHTTPTestStores(t, db)
+
+	bus := eventbus.NewInMemoryBus()
+	ts := httptest.NewServer(buildHTTPMux(bus, s))
+	defer ts.Close()
+
+	body := map[string]string{"answer": "approve", "answered_by": "human"}
+	bodyBytes, _ := json.Marshal(body)
+
+	resp, err := http.Post(
+		ts.URL+"/attention/nonexistent-id/answer",
+		"application/json",
+		bytes.NewReader(bodyBytes),
+	)
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		bodyStr, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 404; body: %s", resp.StatusCode, bodyStr)
+	}
+}
+
+// TestHandleAnswerAttention_InvalidAnswer verifies that an answer other than
+// "approve" or "reject" returns HTTP 400 (Polish: HTTP answer validation).
+func TestHandleAnswerAttention_InvalidAnswer(t *testing.T) {
+	db := openHTTPTestDB(t)
+	s := newHTTPTestStores(t, db)
+
+	bus := eventbus.NewInMemoryBus()
+	ts := httptest.NewServer(buildHTTPMux(bus, s))
+	defer ts.Close()
+
+	body := map[string]string{"answer": "maybe", "answered_by": "human"}
+	bodyBytes, _ := json.Marshal(body)
+
+	resp, err := http.Post(
+		ts.URL+"/attention/some-id/answer",
+		"application/json",
+		bytes.NewReader(bodyBytes),
+	)
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		bodyStr, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 400; body: %s", resp.StatusCode, bodyStr)
+	}
+}
+
 // TestErrGroupMutualCancel verifies context cancel stops the HTTP server.
 // This is a lightweight integration test of the shutdown path using httptest.
 func TestErrGroupMutualCancel(t *testing.T) {

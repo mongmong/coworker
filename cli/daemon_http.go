@@ -2,6 +2,7 @@ package cli
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 
 	"github.com/chris/coworker/coding/eventbus"
@@ -121,11 +122,19 @@ func handleAnswerAttention(as *store.AttentionStore) http.HandlerFunc {
 			http.Error(w, "answer is required", http.StatusBadRequest)
 			return
 		}
+		if req.Answer != core.AttentionAnswerApprove && req.Answer != core.AttentionAnswerReject {
+			http.Error(w, `answer must be "approve" or "reject"`, http.StatusBadRequest)
+			return
+		}
 		if req.AnsweredBy == "" {
 			req.AnsweredBy = "http"
 		}
 
 		if err := as.AnswerAttention(r.Context(), id, req.Answer, req.AnsweredBy); err != nil {
+			if errors.Is(err, store.ErrAttentionNotFound) {
+				http.Error(w, "attention item not found", http.StatusNotFound)
+				return
+			}
 			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
 		}

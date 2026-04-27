@@ -18,16 +18,20 @@ import (
 	"github.com/chris/coworker/agent"
 	"github.com/chris/coworker/coding"
 	"github.com/chris/coworker/coding/eventbus"
+	"github.com/chris/coworker/core"
 	mcpserver "github.com/chris/coworker/mcp"
 	"github.com/chris/coworker/store"
 )
 
 var (
-	daemonDBPath    string
-	daemonHTTPPort  int
-	daemonRoleDir   string
-	daemonPromptDir string
-	daemonCliBinary string
+	daemonDBPath         string
+	daemonHTTPPort       int
+	daemonRoleDir        string
+	daemonPromptDir      string
+	daemonCliBinary      string
+	daemonClaudeBinary   string
+	daemonCodexBinary    string
+	daemonOpenCodeBinary string
 )
 
 var daemonCmd = &cobra.Command{
@@ -63,7 +67,10 @@ func init() {
 	daemonCmd.Flags().IntVar(&daemonHTTPPort, "http-port", 7700, "Port for the HTTP/SSE server")
 	daemonCmd.Flags().StringVar(&daemonRoleDir, "role-dir", "", "Path to the role YAML directory (default: .coworker/roles or coding/roles)")
 	daemonCmd.Flags().StringVar(&daemonPromptDir, "prompt-dir", "", "Path to the prompt template directory (default: .coworker or coding)")
-	daemonCmd.Flags().StringVar(&daemonCliBinary, "cli-binary", "", "Path to the CLI binary (default: codex)")
+	daemonCmd.Flags().StringVar(&daemonCliBinary, "cli-binary", "", "Fallback CLI binary for all roles (default: codex). Overridden by per-CLI flags.")
+	daemonCmd.Flags().StringVar(&daemonClaudeBinary, "claude-binary", "", "Path to the claude-code binary (default: resolved from PATH)")
+	daemonCmd.Flags().StringVar(&daemonCodexBinary, "codex-binary", "", "Path to the codex binary (default: resolved from PATH)")
+	daemonCmd.Flags().StringVar(&daemonOpenCodeBinary, "opencode-binary", "", "Path to the opencode binary (default: resolved from PATH)")
 	rootCmd.AddCommand(daemonCmd)
 }
 
@@ -104,7 +111,7 @@ func runDaemon(cmd *cobra.Command) error {
 	bus := eventbus.NewInMemoryBus()
 
 	// Build the Dispatcher so MCP role invocations drive real jobs.
-	dispatcher, err := buildDaemonDispatcher(db, daemonRoleDir, daemonPromptDir, daemonCliBinary, logger)
+	dispatcher, err := buildDaemonDispatcher(db, daemonRoleDir, daemonPromptDir, daemonCliBinary, daemonClaudeBinary, daemonCodexBinary, daemonOpenCodeBinary, logger)
 	if err != nil {
 		return fmt.Errorf("build dispatcher: %w", err)
 	}
@@ -170,7 +177,11 @@ func runDaemon(cmd *cobra.Command) error {
 // buildDaemonDispatcher constructs a *coding.Dispatcher for the daemon.
 // It resolves role/prompt directories using the same fallback logic as
 // buildRunDispatcher in cli/run.go.
-func buildDaemonDispatcher(db *store.DB, roleDir, promptDir, cliBinary string, logger *slog.Logger) (*coding.Dispatcher, error) {
+//
+// Per-CLI binary flags (claudeBinary, codexBinary, openCodeBinary) populate the
+// CLIAgents map so each role is dispatched to the correct tool. The cliBinary
+// fallback is used as the default Agent when a role's CLI is not in the map.
+func buildDaemonDispatcher(db *store.DB, roleDir, promptDir, cliBinary, claudeBinary, codexBinary, openCodeBinary string, logger *slog.Logger) (*coding.Dispatcher, error) {
 	if roleDir == "" {
 		roleDir = filepath.Join(".coworker", "roles")
 		if _, err := os.Stat(roleDir); os.IsNotExist(err) {
@@ -191,10 +202,26 @@ func buildDaemonDispatcher(db *store.DB, roleDir, promptDir, cliBinary string, l
 		cliBinary = "codex"
 	}
 
+	// Build per-CLI agent map. Defaults from PATH when flags are empty.
+	cliAgents := make(map[string]core.Agent)
+	if claudeBinary == "" {
+		claudeBinary = "claude"
+	}
+	if codexBinary == "" {
+		codexBinary = "codex"
+	}
+	if openCodeBinary == "" {
+		openCodeBinary = "opencode"
+	}
+	cliAgents["claude-code"] = agent.NewCliAgent(claudeBinary)
+	cliAgents["codex"] = agent.NewCliAgent(codexBinary)
+	cliAgents["opencode"] = agent.NewCliAgent(openCodeBinary)
+
 	d := &coding.Dispatcher{
 		RoleDir:   roleDir,
 		PromptDir: promptDir,
 		Agent:     agent.NewCliAgent(cliBinary),
+		CLIAgents: cliAgents,
 		DB:        db,
 		Logger:    logger,
 	}

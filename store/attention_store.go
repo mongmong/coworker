@@ -151,6 +151,7 @@ func (s *AttentionStore) ListAttentionByRun(ctx context.Context, runID string, k
 }
 
 // AnswerAttention marks an attention item as answered.
+// Returns an error wrapping ErrAttentionNotFound when no row matches id.
 func (s *AttentionStore) AnswerAttention(ctx context.Context, id, answer, answeredBy string) error {
 	answeredOnJSON, err := json.Marshal([]string{answeredBy})
 	if err != nil {
@@ -162,12 +163,24 @@ func (s *AttentionStore) AnswerAttention(ctx context.Context, id, answer, answer
 		WHERE id = ?
 	`
 
-	_, err = s.db.ExecContext(ctx, query, answeredBy, answer, string(answeredOnJSON), id)
+	result, err := s.db.ExecContext(ctx, query, answeredBy, answer, string(answeredOnJSON), id)
 	if err != nil {
 		return fmt.Errorf("answer attention: %w", err)
 	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("answer attention rows affected: %w", err)
+	}
+	if n == 0 {
+		return fmt.Errorf("attention item %q not found: %w", id, ErrAttentionNotFound)
+	}
 	return nil
 }
+
+// ErrAttentionNotFound is returned by AnswerAttention when the target row does
+// not exist. Callers can use errors.Is(err, store.ErrAttentionNotFound) to
+// distinguish "not found" from other errors.
+var ErrAttentionNotFound = fmt.Errorf("attention not found")
 
 // ResolveAttention marks an attention item as resolved.
 func (s *AttentionStore) ResolveAttention(ctx context.Context, id string) error {
