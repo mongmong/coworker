@@ -355,10 +355,57 @@ Expected: build clean, all tests PASS, 0 lint issues.
 
 ## Code Review
 
-(To be filled in after implementation by Codex review subagent.)
+### Codex post-implementation review (2026-04-27)
+
+#### Important — Decision 9 entry not committed [FIXED]
+
+`docs/architecture/decisions.md` was modified locally but the changes were not in the `main..HEAD` diff (the file got staged-but-not-committed during phase 3). All seven other checklist items passed source review.
+
+→ Fixed: committed as `a0eea0b` ("Plan 122 Phase 3: decisions.md Decision 9 — Production Workflow Wiring").
+
+### Verification
+
+```text
+$ go build ./...                                    → clean
+$ go test -race ./... -count=1 -timeout 180s        → 30 ok, 0 failed, 0 races
+$ golangci-lint run ./...                           → 0 issues
+```
 
 ---
 
 ## Post-Execution Report
 
-(To be filled in after implementation.)
+### Date
+2026-04-27
+
+### Implementation summary
+
+Three phases, all merged inline.
+
+**Phase 1 — `buildPhaseRunner` helper (cli/run.go)**
+- New helper constructs a fully-wired `*workflow.BuildFromPRDWorkflow`: one Dispatcher (shared with planner), PhaseExecutor with EventStore + AttentionStore + CheckpointWriter + Policy + WorkDir + RoleDir, conditional Shipper (nil when `--no-ship`, else with all five stores + DryRun from `--dry-run`), StageRegistry via `stages.NewStageRegistry(WorkflowBuildFromPRD, DefaultStages, policy)`, PlanStore writer, CheckpointWriter pass-through.
+- The previously-partial struct literal at the resume path now calls `buildPhaseRunner(manifestPath, ...)` — using the local function-scoped `manifestPath`, not the global `runManifestPath`.
+- WorktreeManager left intentionally nil; documented in helper's godoc.
+
+**Phase 2 — Wiring tests (cli/run_test.go)**
+- `TestBuildPhaseRunner_Wiring` — default flags; asserts non-nil PhaseExecutor, Shipper, StageRegistry, PlanWriter, CheckpointWriter, and ManifestPath set.
+- `TestBuildPhaseRunner_NoShipFlag` — `runNoShip = true`; asserts Shipper is nil but PhaseExecutor remains.
+- `TestBuildPhaseRunner_DryRunPropagatesToShipper` — `runDryRun = true`; asserts Shipper.DryRun is true.
+- All three use `saveAndRestoreRunFlags(t)` to prevent cross-test pollution.
+
+**Phase 3 — Decisions + verification**
+- Decision 9 appended to `docs/architecture/decisions.md`.
+- Full suite green; lint clean.
+
+### Verification
+
+```text
+go build ./...                                    → clean
+go test -race ./... -count=1 -timeout 180s        → 30 ok, 0 failed, 0 races
+golangci-lint run ./...                           → 0 issues
+```
+
+### Notes / deviations from plan
+
+- The plan's first draft proposed two test names (`TestRun_PostApproved_DispatchesPhases`, `TestRun_PostApproved_RunsToShip`). Codex pre-impl review flagged that the proposed `TestRun_PostApproved_RunsToShip` would require a custom inlined stub Orchestrator that duplicates `coding/workflow/build_from_prd_test.go`'s pattern with package-private types not visible from `cli/`. Replaced with the lighter three-test wiring suite (`TestBuildPhaseRunner_*`), which gives equivalent confidence (the runner is structurally complete) without the cross-package stub duplication.
+- Codex post-impl review caught one staging error (decisions.md not committed); fixed before merge.
