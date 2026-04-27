@@ -22,7 +22,7 @@
 | --- | --- |
 | `mcp.CallCheckpointAdvance(ctx, as *AttentionStore, attentionID, answeredBy string, writers ...core.CheckpointWriter)` | `mcp/handlers_checkpoint.go:134`. Returns `(map[string]interface{}, error)`. |
 | `mcp.CallCheckpointRollback(ctx, as *AttentionStore, attentionID, answeredBy string, writers ...core.CheckpointWriter)` | `mcp/handlers_checkpoint.go:214`. Same shape. |
-| `*store.AttentionStore.GetUnansweredCheckpointForRun(ctx, runID, source string)` | `store/attention_store.go:227`. Returns `(*core.AttentionItem, error)`. Source is filter; pass empty for "any". |
+| `*store.AttentionStore.GetUnansweredCheckpointForRun(ctx, runID, source string)` | `store/attention_store.go:227`. Source is **exact match**, not a wildcard. Empty string would match only items inserted with `source = ""`. **We need a new method `GetAnyUnansweredCheckpointForRun(ctx, runID)` that omits the source predicate** — added in Phase 0 below. |
 | `*store.AttentionStore.GetAttentionByID(ctx, id)` | Returns `(*core.AttentionItem, error)`. |
 | `session.Manager.CurrentSession()` | Returns the active session including `RunID`. |
 | `openCodeJobHandle` struct | At `agent/opencode_http_agent.go:135-143`. Add a `messageWG sync.WaitGroup` field. |
@@ -58,15 +58,68 @@ Out of scope:
 ## File Structure
 
 **Modify:**
+- `store/attention_store.go` — add `GetAnyUnansweredCheckpointForRun`.
+- `store/attention_store_test.go` — test the new method.
 - `agent/opencode_http_agent.go` — add WaitGroup, await on Cancel.
 - `agent/opencode_http_agent_test.go` — new cancel-waits test.
 - `cli/advance.go` — implement advance logic.
 - `cli/rollback.go` — implement rollback logic.
-- `cli/advance_test.go` — new test file (or extend existing if present).
+- `cli/advance_test.go` — new test file.
 - `cli/rollback_test.go` — new test file.
-- `docs/architecture/decisions.md` — Decision 10.
+- `docs/architecture/decisions.md` — Decisions 10 + 11.
 
 **Create:** `cli/advance_test.go`, `cli/rollback_test.go` if absent.
+
+---
+
+## Phase 0 — New AttentionStore method: `GetAnyUnansweredCheckpointForRun`
+
+**Files:** `store/attention_store.go`, `store/attention_store_test.go`
+
+The existing `GetUnansweredCheckpointForRun(ctx, runID, source)` filters on `source` exact-match. The CLI `advance` command wants any unanswered checkpoint regardless of source — needed because checkpoints come from multiple sources (`shipper`, `phase-loop`, `quality-judge`, `architect`). Add a new method that omits the source predicate, leaving the existing one untouched for any caller that needs the filter.
+
+- [ ] **Step 1 — Add to `store/attention_store.go`** alongside the existing method:
+
+```go
+// GetAnyUnansweredCheckpointForRun returns the most-recently-created
+// unanswered checkpoint attention item for the run, regardless of source.
+// Returns nil (not an error) when no matching item exists.
+func (s *AttentionStore) GetAnyUnansweredCheckpointForRun(ctx context.Context, runID string) (*core.AttentionItem, error) {
+    query := `SELECT id, run_id, kind, source, job_id, question, options,
+    presented_on, answered_on, answered_by, answer, created_at, resolved_at
+    FROM attention
+    WHERE run_id = ? AND kind = 'checkpoint' AND answer IS NULL
+    ORDER BY created_at DESC LIMIT 1`
+
+    row := s.db.QueryRowContext(ctx, query, runID)
+    item, err := scanAttentionItem(row.Scan)
+    if err == sql.ErrNoRows {
+        return nil, nil
+    }
+    if err != nil {
+        return nil, fmt.Errorf("get any unanswered checkpoint: %w", err)
+    }
+    return item, nil
+}
+```
+
+- [ ] **Step 2 — Test:**
+
+```go
+func TestAttentionStore_GetAnyUnansweredCheckpointForRun(t *testing.T) {
+    // Insert checkpoints with different sources; assert the most recent
+    // one is returned regardless of source. Then answer it and assert the
+    // method returns nil.
+}
+```
+
+- [ ] **Step 3 — Commit:**
+
+```bash
+go test ./store -count=1 -run TestAttentionStore_GetAnyUnansweredCheckpointForRun
+git add store/attention_store.go store/attention_store_test.go
+git commit -m "Plan 123 Phase 0: AttentionStore.GetAnyUnansweredCheckpointForRun"
+```
 
 ---
 
@@ -140,9 +193,11 @@ func (h *openCodeJobHandle) Cancel() error {
 
 - [ ] **Step 4 — Test: `TestOpenCodeHTTPAgent_CancelWaitsForMessageGoroutine`:**
 
-Use `httptest.NewServer` that hangs the message POST until the test signals via a channel. Assert:
-- `Cancel()` returns within 6s (5s timeout + a small slack).
-- The hang signal eventually unblocks; verify no goroutine count diff via `runtime.NumGoroutine()` snapshots taken before Dispatch and after Cancel + a brief drain.
+Use `httptest.NewServer` that hangs the message POST until the test signals. Worst-case Cancel total runtime is the existing `abortSession` 10s timeout + the new 5s WaitGroup drain = 15s. The test asserts:
+- `Cancel()` returns within ~16s (15s worst-case + 1s slack).
+- After releasing the hang signal, no goroutine leak — verify via `runtime.NumGoroutine()` snapshot before Dispatch, again after Cancel + brief drain.
+
+To avoid running a 16s test in the default suite, the test points the agent at a server whose `/abort` endpoint returns 200 immediately (so abortSession returns fast), then hangs only `/message`. With a fast abort, total runtime is dominated by the 5s drain + measurement, ~6-7s.
 
 - [ ] **Step 5 — Run + commit:**
 
@@ -374,7 +429,7 @@ Expected: build clean, all tests PASS, 0 lint issues.
 ## Self-Review Checklist
 
 - [ ] `openCodeJobHandle.messageWG` is incremented before launching the message goroutine (no race with Done).
-- [ ] `Cancel()` returns within 6s under all conditions (5s WaitGroup timeout + small slack).
+- [ ] `Cancel()` returns within ~6-7s when the abort endpoint is responsive (5s WaitGroup drain + small slack); within ~16s worst-case if abort itself hangs (existing 10s `abortSession` timeout + 5s drain). Tests pin the fast-abort case for speed.
 - [ ] `advance` no-pending case prints a clear message; doesn't error.
 - [ ] `rollback <id>` propagates not-found / not-a-checkpoint errors with the same messages as the MCP handler.
 - [ ] Both commands honor `--answered-by`.
