@@ -55,7 +55,7 @@ Two separate tables, intentional, paired:
 - `attention` — the **live human-input UI surface**. Created when a checkpoint is opened. Resolved when answered. Already projected via existing `AttentionStore`.
 - `checkpoints` — the **durable record of resolved checkpoints** per spec §Data Model. Inserted at the same time as the attention item; resolved when the attention is answered.
 
-Both are written in lockstep. The pairing is enforced by writing both in the same `WriteEventThenRow` transaction. There is **no backfill** for prior `attention.kind='checkpoint'` rows — coworker has no shipped runs in production yet, so historical attention checkpoints will simply not have matching rows in the new table. A `decisions.md` entry documents this.
+Both are written in lockstep. The pairing is enforced at the call-site (every `AttentionStore.AnswerAttention` for a checkpoint-kind item is immediately followed by `CheckpointWriter.ResolveCheckpoint` with the same ID), not in a single SQL transaction — `AttentionStore` and `CheckpointStore` each manage their own `WriteEventThenRow` transactions. The discipline is enforced by tests on every answer path (HTTP, MCP advance, MCP rollback, CLI resume). Strict transactional pairing across stores is a future refactor if needed. There is **no backfill** for prior `attention.kind='checkpoint'` rows — coworker has no shipped runs in production yet, so historical attention checkpoints will simply not have matching rows in the new table. A `decisions.md` entry documents both decisions.
 
 ---
 
@@ -527,18 +527,50 @@ func (s *PlanStore) UpdatePlanState(ctx context.Context, planID, state string) e
     })
 }
 
+// UpdatePlanBranchAndPR writes a plan.state_changed event (carrying the new
+// branch/pr_url metadata) and updates the plans row in the same transaction.
+// We reuse plan.state_changed as the umbrella plan-update event kind; the
+// payload distinguishes (state vs branch+pr).
 func (s *PlanStore) UpdatePlanBranchAndPR(ctx context.Context, planID, branch, prURL string) error {
-    res, err := s.db.ExecContext(ctx,
-        `UPDATE plans SET branch = ?, pr_url = ? WHERE id = ?`,
-        branch, prURL, planID)
+    var runID string
+    if err := s.db.QueryRowContext(ctx,
+        "SELECT run_id FROM plans WHERE id = ?", planID,
+    ).Scan(&runID); err != nil {
+        if errors.Is(err, sql.ErrNoRows) {
+            return ErrPlanNotFound
+        }
+        return fmt.Errorf("lookup plan run_id: %w", err)
+    }
+    payload, err := json.Marshal(map[string]string{
+        "plan_id": planID,
+        "branch":  branch,
+        "pr_url":  prURL,
+    })
     if err != nil {
-        return fmt.Errorf("update plan branch/pr: %w", err)
+        return fmt.Errorf("marshal plan branch/pr update: %w", err)
     }
-    n, _ := res.RowsAffected()
-    if n == 0 {
-        return ErrPlanNotFound
+    ev := &core.Event{
+        ID:            core.NewID(),
+        RunID:         runID,
+        Kind:          core.EventPlanStateChanged,
+        SchemaVersion: 1,
+        CorrelationID: planID,
+        Payload:       string(payload),
+        CreatedAt:     time.Now(),
     }
-    return nil
+    return s.event.WriteEventThenRow(ctx, ev, func(tx *sql.Tx) error {
+        res, err := tx.ExecContext(ctx,
+            `UPDATE plans SET branch = ?, pr_url = ? WHERE id = ?`,
+            branch, prURL, planID)
+        if err != nil {
+            return fmt.Errorf("update plan branch/pr: %w", err)
+        }
+        n, _ := res.RowsAffected()
+        if n == 0 {
+            return ErrPlanNotFound
+        }
+        return nil
+    })
 }
 
 type PlanRow struct {
@@ -1226,7 +1258,7 @@ if w.PlanWriter != nil {
 
 - [ ] **Step 3 — At lifecycle transitions in `RunPhasesForPlan`, call `UpdatePlanState("running"|"done"|"failed")`. Locate transitions by inspecting current code.**
 
-- [ ] **Step 4 — Where attention checkpoints are created (`cli/run.go`, search for `core.AttentionCheckpoint`):** when creating, also call `CheckpointWriter.CreateCheckpoint`. Use the same ID for both rows so resolution can be paired.
+- [ ] **Step 4 — Where attention checkpoints are created (`cli/run.go`, search for `core.AttentionCheckpoint`):** when creating an attention item of `kind=checkpoint`, also call `CheckpointWriter.CreateCheckpoint` immediately afterward, using the **same ID** for both rows. The two writes are not in the same SQL transaction (attention writes go through `AttentionStore`, checkpoints go through `CheckpointStore.CreateCheckpoint` which has its own `WriteEventThenRow`); instead, the pairing is enforced at the call-site discipline level (always-immediate, always-paired, same-ID), the same way `RunStore.CreateRun` and a downstream attention insert are paired today. The checkpoint write is idempotent on duplicate ID (constraint violation surfaces as an error to the caller), which makes the pairing safe under retry. If the project later wants strict transactional pairing, that is a follow-up plan that touches `AttentionStore`'s API.
 
 - [ ] **Step 5 — In every answer path, resolve matching checkpoint:**
 
@@ -1307,6 +1339,11 @@ func TestReplay_RebuildProjectionsFromEventLog(t *testing.T) {
         Provider: "anthropic", Model: "opus",
         TokensIn: 100, TokensOut: 50, USD: 0.01,
     })
+    // Job completion (drives the canonical "job.completed" event for the
+    // golden fixture).
+    if err := js.UpdateJobState(ctx, "j1", core.JobStateComplete); err != nil {
+        t.Fatal(err)
+    }
 
     // Snapshot the event log to the golden file (gated by COWORKER_REGEN=1).
     if os.Getenv("COWORKER_REGEN") == "1" {
@@ -1330,10 +1367,29 @@ func TestReplay_RebuildProjectionsFromEventLog(t *testing.T) {
     if jobRow.CostUSD != 0.01 {
         t.Errorf("job.cost_usd: got %v, want 0.01", jobRow.CostUSD)
     }
+    // Verify the canonical event sequence emitted (drives the golden file).
+    events, _ := es.ListEvents(ctx, "r1")
+    haveJobCreated, haveJobCompleted, supCount, costCount := false, false, 0, 0
+    for _, e := range events {
+        switch e.Kind {
+        case core.EventJobCreated:
+            haveJobCreated = true
+        case core.EventJobCompleted:
+            haveJobCompleted = true
+        case core.EventSupervisorVerdict:
+            supCount++
+        case core.EventCostDelta:
+            costCount++
+        }
+    }
+    if !haveJobCreated || !haveJobCompleted || supCount != 2 || costCount != 1 {
+        t.Errorf("event log shape: jobCreated=%v jobCompleted=%v sup=%d cost=%d",
+            haveJobCreated, haveJobCompleted, supCount, costCount)
+    }
 }
 ```
 
-Then add a second test that reads the golden file, replays only the events into a fresh DB via `WriteEventThenRow` (from raw events), and asserts that the rebuilt projection state equals the original. This is the actual "replay" assertion.
+Then add a second test that reads the golden JSONL fixture, parses it into `core.Event` records, and replays them into a fresh DB via the raw event-store `WriteEventThenRow` (with no projection apply func — only the events table is populated). After replay, assert that running each `*Store.RecordX`/`Update*` again is idempotent on event content and produces the same final projection state. This is the actual "replay" assertion. (If full re-projection from raw events is not implemented in this plan, the second test instead just asserts the JSONL round-trips back to the same Event slice; full projection-rebuild is deferred to a future plan but the fixture and test scaffold are in place.)
 
 - [ ] **Step 2 — Generate fixture:**
 
