@@ -148,3 +148,16 @@ The helper is then invoked at the post-spec-approved code path in `runPlanLoopWi
 **Decision:** This is best-effort cancellation. Operators with persistent leaks should investigate network configuration (DNS resolution, OpenCode server health) rather than tune the timeout.
 
 **Status:** Introduced in Plan 123.
+
+
+## Decision 12: Supervisor as Role + In-Process (Plan 124)
+
+**Context:** The 2026-04-27 V1 audit (BLOCKER B2) flagged that `coding/roles/supervisor.yaml` and `coding/prompts/supervisor.md` did not exist, even though the spec §Roles catalog lists `supervisor` as one of the canonical roles. The implementation runs supervisor in-process (rules engine for contract rules + Codex LLM judge for quality rules); a YAML role file was never authored.
+
+**Decision:** Ship the supervisor role files as **documentation + dispatchable fallback**. The default V1 production path is unchanged: `coding/supervisor/engine.go` evaluates contract rules in-process, `coding/quality/evaluator.go` invokes Codex via `coding/quality/judge.go` for quality rules. The new files document the supervisor's contract and provide a prompt that a future plan could wire to dispatch the supervisor as a real role (useful for advanced setups that want a different LLM-backed supervisor or per-repo customization).
+
+**Decision:** `cli/init.go::copyInitAssets` already iterates `coding/roles/*.yaml` to scaffold per-repo configs, so the new file is picked up without code changes.
+
+**Decision:** Wiring `Dispatcher.Orchestrate(role: "supervisor", ...)` for production use is **deferred**. The in-process implementation is faster (no LLM round-trip for contract rules) and authoritative for the V1 release.
+
+**Status:** Introduced in Plan 124.
