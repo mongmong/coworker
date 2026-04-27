@@ -1209,6 +1209,26 @@ All 5 Must Fix and 3 Should Fix items from the initial pre-implementation review
 - **I-2 (nil vs empty TesterRoles):** Nil → default; non-nil empty → disabled. `RunPhasesForPlan` assigns directly from `RolesForStage` to preserve distinction. Tests added for all three states.
 - **I-4 (SupervisorEvaluator interface):** `SupervisorEvaluator` interface defined in `coding/dispatch.go`; `Dispatcher.Supervisor` changed to the interface; stub injected in tests without importing `coding/supervisor`.
 
+### Pre-Implementation Re-Review (Codex)
+
+**Finding verdicts:**
+
+| # | Finding | Verdict |
+|---|---------|---------|
+| 1 | I-3 WorkDir wiring | FIXED |
+| 2 | I-3 changes_touch shared | FIXED |
+| 3 | I-4 run state → failed on supervisor error | FIXED |
+| 4 | I-5 status=error in verdict payload | FIXED |
+| 5 | I-10 time.RFC3339 for read+write | FIXED |
+| 6 | I-1 trigger allowlist | FIXED |
+| 7 | I-2 nil vs empty TesterRoles | FIXED |
+| 8 | I-4 SupervisorEvaluator interface | FIXED |
+
+**Notes:** All eight findings are clearly and specifically addressed in the revised plan. WorkDir is traced from `os.Getwd()` through `BuildFromPRDWorkflow.WorkDir`, `RunPhasesForPlan`, `PhaseExecutor.WorkDir`, and `roleShouldDispatch` (`docs/plans/117-correctness-gaps.md:333`, `docs/plans/117-correctness-gaps.md:350`, `docs/plans/117-correctness-gaps.md:364`, `docs/plans/117-correctness-gaps.md:384`). `changes_touch` is extracted into `internal/predicates` and both supervisor and phase-loop dispatch call that shared implementation (`docs/plans/117-correctness-gaps.md:223`, `docs/plans/117-correctness-gaps.md:315`, `docs/plans/117-correctness-gaps.md:427`). Supervisor errors explicitly update both job and run state to failed, with a run-state assertion in the test plan (`docs/plans/117-correctness-gaps.md:549`, `docs/plans/117-correctness-gaps.md:564`, `docs/plans/117-correctness-gaps.md:570`). Verdict events include a `status` field and the judge-error path writes `"error"` (`docs/plans/117-correctness-gaps.md:601`, `docs/plans/117-correctness-gaps.md:638`, `docs/plans/117-correctness-gaps.md:673`). Event timestamps use `time.RFC3339` for both `WriteEventThenRow` and `ListEvents`, with offset timestamp tests (`docs/plans/117-correctness-gaps.md:1043`, `docs/plans/117-correctness-gaps.md:1048`, `docs/plans/117-correctness-gaps.md:1060`, `docs/plans/117-correctness-gaps.md:1078`). The finding trigger uses an allowlist that permits only resolution-field updates and protects `run_id`, `job_id`, and all immutable finding fields (`docs/plans/117-correctness-gaps.md:76`, `docs/plans/117-correctness-gaps.md:83`, `docs/plans/117-correctness-gaps.md:106`). `TesterRoles` explicitly distinguishes nil from empty and preserves the distinction from `RolesForStage("phase-test")` (`docs/plans/117-correctness-gaps.md:131`, `docs/plans/117-correctness-gaps.md:157`, `docs/plans/117-correctness-gaps.md:175`, `docs/plans/117-correctness-gaps.md:189`). `SupervisorEvaluator` is introduced and used as the `Dispatcher.Supervisor` type, enabling stubbed tests (`docs/plans/117-correctness-gaps.md:527`, `docs/plans/117-correctness-gaps.md:538`, `docs/plans/117-correctness-gaps.md:576`).
+
+**Verdict: READY TO IMPLEMENT**
+The revised plan now explicitly covers every prior Must Fix and Should Fix item with implementation steps and tests.
+
 ---
 
 ## Post-Execution Report
