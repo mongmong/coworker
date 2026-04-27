@@ -60,6 +60,19 @@ const (
 	// Checkpoint lifecycle events, paired with attention items of kind=checkpoint.
 	EventCheckpointOpened   EventKind = "checkpoint.opened"
 	EventCheckpointResolved EventKind = "checkpoint.resolved"
+
+	// Supervisor & quality events. Moved here from core/supervisor.go in
+	// Plan 127 (I9) so the EventKind catalog is centralized.
+	EventSupervisorVerdict EventKind = "supervisor.verdict"
+	EventSupervisorRetry   EventKind = "supervisor.retry"
+	EventComplianceBreach  EventKind = "compliance-breach"
+	// EventQualityVerdict is emitted for every quality rule verdict
+	// (advisory or blocking) at checkpoint time.
+	EventQualityVerdict EventKind = "quality.verdict"
+	// EventQualityGate is emitted when blocking quality findings remain
+	// after max retries, escalating to an always-blocking gate. Policy
+	// cannot weaken this checkpoint.
+	EventQualityGate EventKind = "quality-gate"
 )
 
 // Event is a single entry in the append-only event log.
