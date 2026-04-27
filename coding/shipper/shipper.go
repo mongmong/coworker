@@ -49,6 +49,11 @@ type Shipper struct {
 	// DryRun, when true, skips the real gh call and returns a synthetic URL.
 	// Used in tests.
 	DryRun bool
+
+	// GhRunner is the function that invokes `gh pr create`. Tests inject
+	// a stub to exercise success/failure paths without shelling out.
+	// Nil → uses the default ghCreatePR (real gh binary). Plan 128 (I6).
+	GhRunner func(ctx context.Context, branch, title, body string) (string, error)
 }
 
 // ShipResult holds the output of a successful Ship call.
@@ -131,8 +136,12 @@ func (s *Shipper) Ship(
 		prURL = fmt.Sprintf("https://github.com/dry-run/coworker/pull/%d", planEntry.ID)
 		log.Info("shipper: dry-run mode, skipping gh call", "synthetic_url", prURL)
 	} else {
+		runner := s.GhRunner
+		if runner == nil {
+			runner = ghCreatePR
+		}
 		var err error
-		prURL, err = ghCreatePR(ctx, branch, prTitle, prBody)
+		prURL, err = runner(ctx, branch, prTitle, prBody)
 		if err != nil {
 			return nil, fmt.Errorf("shipper: plan %d: %w", planEntry.ID, err)
 		}
