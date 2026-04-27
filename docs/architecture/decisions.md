@@ -68,3 +68,20 @@ Updated whenever a plan introduces or revises a cross-cutting decision.
 **Enforcement:** Store APIs for the new projection tables use `WriteEventThenRow`. Coding package consumers depend on `core.*Writer` sink interfaces. Tests cover event-first rollback, checkpoint answer pairing, and supervisor/cost replay shape.
 
 **Status:** Introduced in Plan 119.
+
+
+## Decision 7: Test Layers (Plan 120)
+
+**Context:** The runtime spec calls for four test layers (unit, integration with mocks, replay, live E2E) to cover correctness, integration, regression against recorded transcripts, and provider compatibility against real CLIs. Plan 120 introduces the missing replay and live scaffolding.
+
+**Decision:** Replay tests live under `tests/replay/<scenario>/` and use a `ReplayAgent` (`agent/replay_agent.go`) that satisfies `core.Agent` by streaming a recorded JSONL transcript through the same `streamMessage` schema as the live `CliAgent`. Replay tests are gated by `COWORKER_REPLAY=1`.
+
+**Decision:** Per-role transcripts are named `<role-with-dots-replaced-by-underscores>.jsonl` (matching the role-file convention: `reviewer.arch` → `reviewer_arch.jsonl`). Each scenario directory also contains `inputs/` (placeholder template inputs) and `expected.json` (per-role assertions: `exit_code`, `findings_count`, `fingerprints`).
+
+**Decision:** Live tests live under `tests/live/` with build tag `live` AND env var `COWORKER_LIVE=1`. Default `go test ./...` does not see them. The smoke tests assert the CLI exits 0 and emits at least one stream-json line on stdout. Cost is documented but **not yet enforced** (Dispatcher has no `core.CostWriter` wiring; deferred to Plan 121).
+
+**Decision:** CI runs replay tests on every push (`make test-replay` step in `ci.yml`); live tests run on a manual `workflow_dispatch` trigger in a separate `live-tests.yml` workflow.
+
+**Enforcement:** `var _ core.Agent = (*ReplayAgent)(nil)` compile-time assertion. Three smoke tests (claude, codex, opencode) exercise each CLI binary independently. `docs/architecture/testing.md` documents the four layers, when to use each, and how to add fixtures.
+
+**Status:** Introduced in Plan 120.
