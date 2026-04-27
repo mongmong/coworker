@@ -2,6 +2,9 @@ package quality
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -386,6 +389,136 @@ func TestEvaluateAtCheckpoint_DefaultMaxRetries(t *testing.T) {
 	}
 	if !result.QualityGateEscalated {
 		t.Error("expected escalation at default max retries")
+	}
+}
+
+// errorJudge is a Judge that always returns an error.
+type errorJudge struct{ err error }
+
+func (j *errorJudge) Evaluate(_ context.Context, _ *Rule, _ string, _ string) (*Verdict, error) {
+	return nil, j.err
+}
+
+func TestEvaluateAtCheckpoint_JudgeError_AdvisoryCategory_EmitsErrorEvent(t *testing.T) {
+	db := openTestDB(t)
+	mustCreateRun(t, db, "run-judge-err-1")
+	evtStore := store.NewEventStore(db)
+
+	rules := []*Rule{
+		{Name: "spec_adherence", Category: "spec_adherence", Prompt: "p", Severity: "advisory"},
+	}
+
+	ev := &Evaluator{
+		Judge:      &errorJudge{err: fmt.Errorf("llm timeout")},
+		Rules:      rules,
+		EventStore: evtStore,
+	}
+
+	cpCtx := &CheckpointContext{RunID: "run-judge-err-1", JobID: "job-je-1"}
+	result, err := ev.EvaluateAtCheckpoint(context.Background(), cpCtx, "diff", "ctx")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Advisory judge error: result should still pass (no blocking).
+	if !result.Pass {
+		t.Error("expected result to pass for advisory judge error")
+	}
+	if len(result.AdvisoryFindings) != 1 {
+		t.Fatalf("expected 1 advisory finding, got %d", len(result.AdvisoryFindings))
+	}
+	if !strings.Contains(result.AdvisoryFindings[0].Findings[0], "judge error") {
+		t.Errorf("expected advisory finding to mention 'judge error', got %q", result.AdvisoryFindings[0].Findings[0])
+	}
+	if len(result.AttentionItemIDs) != 0 {
+		t.Errorf("expected 0 attention items for advisory judge error, got %d", len(result.AttentionItemIDs))
+	}
+
+	// Verify verdict event was written with status=error.
+	events, listErr := evtStore.ListEvents(context.Background(), "run-judge-err-1")
+	if listErr != nil {
+		t.Fatalf("ListEvents: %v", listErr)
+	}
+	if len(events) == 0 {
+		t.Fatal("expected at least one event for judge error, got 0")
+	}
+	var found bool
+	for _, e := range events {
+		if e.Kind != core.EventQualityVerdict {
+			continue
+		}
+		var payload map[string]interface{}
+		if jsonErr := json.Unmarshal([]byte(e.Payload), &payload); jsonErr != nil {
+			t.Fatalf("unmarshal payload: %v", jsonErr)
+		}
+		if payload["status"] == "error" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected a quality.verdict event with status=error, none found")
+	}
+}
+
+func TestEvaluateAtCheckpoint_JudgeError_BlockCapable_EmitsErrorEventAndAttentionItem(t *testing.T) {
+	db := openTestDB(t)
+	mustCreateRun(t, db, "run-judge-err-2")
+	attStore := store.NewAttentionStore(db)
+	evtStore := store.NewEventStore(db)
+
+	rules := []*Rule{
+		{Name: "missing_tests", Category: CategoryMissingTests, Prompt: "p", Severity: "block"},
+	}
+
+	ev := &Evaluator{
+		Judge:          &errorJudge{err: fmt.Errorf("service unavailable")},
+		Rules:          rules,
+		AttentionStore: attStore,
+		EventStore:     evtStore,
+	}
+
+	cpCtx := &CheckpointContext{RunID: "run-judge-err-2", JobID: "job-je-2"}
+	result, err := ev.EvaluateAtCheckpoint(context.Background(), cpCtx, "diff", "ctx")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Block-capable judge error: result must fail.
+	if result.Pass {
+		t.Error("expected result to fail for block-capable judge error")
+	}
+	if len(result.BlockingFindings) != 1 {
+		t.Fatalf("expected 1 blocking finding for block-capable judge error, got %d", len(result.BlockingFindings))
+	}
+	if !strings.Contains(result.BlockingFindings[0].Findings[0], "judge error") {
+		t.Errorf("expected blocking finding to mention 'judge error', got %q", result.BlockingFindings[0].Findings[0])
+	}
+
+	// Attention item must be created for block-capable judge errors.
+	if len(result.AttentionItemIDs) != 1 {
+		t.Errorf("expected 1 attention item for block-capable judge error, got %d", len(result.AttentionItemIDs))
+	}
+
+	// Verify verdict event was written with status=error.
+	events, listErr := evtStore.ListEvents(context.Background(), "run-judge-err-2")
+	if listErr != nil {
+		t.Fatalf("ListEvents: %v", listErr)
+	}
+	var found bool
+	for _, e := range events {
+		if e.Kind != core.EventQualityVerdict {
+			continue
+		}
+		var payload map[string]interface{}
+		if jsonErr := json.Unmarshal([]byte(e.Payload), &payload); jsonErr != nil {
+			t.Fatalf("unmarshal payload: %v", jsonErr)
+		}
+		if payload["status"] == "error" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected a quality.verdict event with status=error, none found")
 	}
 }
 

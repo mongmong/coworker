@@ -12,10 +12,11 @@ import (
 
 // cliJobHandle wraps an exec.Cmd to implement core.JobHandle.
 type cliJobHandle struct {
-	cmd    *exec.Cmd
-	stdout io.ReadCloser
-	stderr io.ReadCloser
-	job    *core.Job
+	cmd         *exec.Cmd
+	stdout      io.ReadCloser
+	stderr      io.ReadCloser
+	job         *core.Job
+	coworkerDir string
 }
 
 // streamMessage represents one line of the stream-JSON output from a CLI agent.
@@ -33,8 +34,18 @@ type streamMessage struct {
 func (h *cliJobHandle) Wait(ctx context.Context) (*core.JobResult, error) {
 	result := &core.JobResult{}
 
+	// Open the per-job JSONL log file and tee every byte read from stdout into it.
+	logFile, logErr := OpenJobLog(h.coworkerDir, h.job.RunID, h.job.ID)
+	if logErr != nil {
+		// Non-fatal: log the error and proceed without persistence.
+		_ = logErr
+		logFile = nopCloser{io.Discard}
+	}
+	defer logFile.Close()
+
 	// Parse stream-JSON from stdout using json.Decoder.
-	decoder := json.NewDecoder(h.stdout)
+	// io.TeeReader ensures raw bytes are also written to the log file.
+	decoder := json.NewDecoder(io.TeeReader(h.stdout, logFile))
 	for decoder.More() {
 		var msg streamMessage
 		if err := decoder.Decode(&msg); err != nil {

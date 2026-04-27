@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"time"
 
 	"github.com/chris/coworker/core"
 )
@@ -57,7 +58,7 @@ func (s *EventStore) WriteEventThenRow(ctx context.Context, event *core.Event, a
 		nullableString(event.CausationID),
 		nullableString(event.CorrelationID),
 		event.Payload,
-		event.CreatedAt.Format("2006-01-02T15:04:05Z"),
+		event.CreatedAt.UTC().Format(time.RFC3339),
 	)
 	if err != nil {
 		return fmt.Errorf("insert event: %w", err)
@@ -135,6 +136,11 @@ func (s *EventStore) ListEvents(ctx context.Context, runID string) ([]core.Event
 			return nil, fmt.Errorf("scan event: %w", err)
 		}
 		e.Kind = core.EventKind(kindStr)
+		ts, parseErr := time.Parse(time.RFC3339, createdAtStr)
+		if parseErr != nil {
+			return nil, fmt.Errorf("parse event created_at %q: %w", createdAtStr, parseErr)
+		}
+		e.CreatedAt = ts
 		events = append(events, e)
 	}
 	return events, rows.Err()

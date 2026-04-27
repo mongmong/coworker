@@ -12,6 +12,7 @@ import (
 	"github.com/chris/coworker/coding/roles"
 	"github.com/chris/coworker/coding/supervisor"
 	"github.com/chris/coworker/core"
+	"github.com/chris/coworker/internal/executil"
 	"github.com/chris/coworker/store"
 )
 
@@ -371,7 +372,11 @@ func (d *Dispatcher) executeAttempt(
 		}
 	}
 
-	handle, err := roleAgent.Dispatch(ctx, job, prompt)
+	// Apply the role's wall-clock budget as a subprocess deadline.
+	subCtx, subCancel := executil.BudgetTimeout(ctx, role.Budget.MaxWallclockMinutes)
+	defer subCancel()
+
+	handle, err := roleAgent.Dispatch(subCtx, job, prompt)
 	if err != nil {
 		jobStore.UpdateJobState(ctx, jobID, core.JobStateFailed) //nolint:errcheck
 		return nil, fmt.Errorf("dispatch agent: %w", err)

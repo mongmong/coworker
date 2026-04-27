@@ -32,9 +32,17 @@ type gitResult struct {
 	err    error
 }
 
+// humanEditGitTimeout is the deadline applied to each git subprocess in the
+// human-edit recorder. git show / git log are fast; 30 seconds is generous.
+const humanEditGitTimeout = 30 * time.Second
+
 func runGitCommand(ctx context.Context, repoPath string, args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, "git", args...)
+	gitCtx, cancel := context.WithTimeout(ctx, humanEditGitTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(gitCtx, "git", args...)
 	cmd.Dir = repoPath
+	cmd.WaitDelay = 5 * time.Second
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("git %q: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))

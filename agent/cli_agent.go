@@ -17,6 +17,10 @@ type CliAgent struct {
 	BinaryPath string
 	// Args are additional arguments passed to the CLI.
 	Args []string
+	// CoworkerDir is the path to the .coworker directory used for per-job JSONL
+	// log files (.coworker/runs/<runID>/jobs/<jobID>.jsonl).
+	// When empty, raw stdout is not persisted to disk.
+	CoworkerDir string
 }
 
 // NewCliAgent creates a CliAgent for the given binary path.
@@ -62,10 +66,11 @@ func (a *CliAgent) Dispatch(ctx context.Context, job *core.Job, prompt string) (
 	}
 
 	handle := &cliJobHandle{
-		cmd:    cmd,
-		stdout: stdout,
-		stderr: stderr,
-		job:    job,
+		cmd:         cmd,
+		stdout:      stdout,
+		stderr:      stderr,
+		job:         job,
+		coworkerDir: a.CoworkerDir,
 	}
 
 	return handle, nil

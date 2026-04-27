@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // WorktreeManager creates and removes git worktrees for parallel plan execution.
@@ -114,11 +115,21 @@ func (m *WorktreeManager) Remove(ctx context.Context, planID int, title string) 
 	return nil
 }
 
+// gitTimeout is the deadline applied to each individual git subprocess.
+// Git operations (worktree add/remove, branch delete) should complete quickly.
+const gitTimeout = 60 * time.Second
+
 // git runs a git command with the given args, rooted at m.RepoRoot.
 // stderr is captured and returned in the error on non-zero exit.
+// A fixed gitTimeout deadline is applied so a hung git process cannot block
+// the runtime indefinitely.
 func (m *WorktreeManager) git(ctx context.Context, args ...string) error {
-	cmd := exec.CommandContext(ctx, "git", args...)
+	gitCtx, cancel := context.WithTimeout(ctx, gitTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(gitCtx, "git", args...)
 	cmd.Dir = m.RepoRoot
+	cmd.WaitDelay = 5 * time.Second
 
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr

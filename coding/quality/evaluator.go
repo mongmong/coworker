@@ -87,14 +87,46 @@ func (e *Evaluator) EvaluateAtCheckpoint(
 	for _, rule := range e.Rules {
 		verdict, err := e.Judge.Evaluate(ctx, rule, diff, jobContext)
 		if err != nil {
-			// Judge error: log and treat as advisory pass so we don't
-			// incorrectly block for engine failures.
+			// Judge error: emit a verdict event with status=error so the failure
+			// is durable, then handle per category (block-capable vs advisory).
 			logger.Error("quality judge error", "rule", rule.Name, "error", err)
+			errorVerdict := &Verdict{
+				Pass:     false,
+				Category: string(rule.Category),
+				Findings: []string{fmt.Sprintf("judge error: %v", err)},
+			}
+			e.writeVerdictEvent(ctx, cpCtx.RunID, cpCtx.JobID, rule, errorVerdict, "error")
+
+			errorFinding := Finding{
+				RuleName:   rule.Name,
+				Category:   rule.Category,
+				Findings:   errorVerdict.Findings,
+				Confidence: 0,
+				IsBlocking: IsBlockCapable(rule.Category),
+			}
+
+			if errorFinding.IsBlocking {
+				// Block-capable judge errors must not silently pass.
+				itemID, attErr := e.createAttentionItem(ctx, cpCtx, rule, errorVerdict)
+				if attErr != nil {
+					logger.Error("failed to create attention item for judge error", "rule", rule.Name, "error", attErr)
+				} else if itemID != "" {
+					result.AttentionItemIDs = append(result.AttentionItemIDs, itemID)
+				}
+				result.BlockingFindings = append(result.BlockingFindings, errorFinding)
+				result.Pass = false
+			} else {
+				result.AdvisoryFindings = append(result.AdvisoryFindings, errorFinding)
+			}
 			continue
 		}
 
 		// Write a quality.verdict event for every rule regardless of outcome.
-		e.writeVerdictEvent(ctx, cpCtx.RunID, cpCtx.JobID, rule, verdict)
+		status := "pass"
+		if !verdict.Pass {
+			status = "fail"
+		}
+		e.writeVerdictEvent(ctx, cpCtx.RunID, cpCtx.JobID, rule, verdict, status)
 
 		if verdict.Pass {
 			logger.Debug("quality rule passed", "rule", rule.Name, "confidence", verdict.Confidence)
@@ -177,12 +209,14 @@ func (e *Evaluator) createAttentionItem(
 }
 
 // writeVerdictEvent writes a quality.verdict event for a single rule verdict.
+// status is "pass", "fail", or "error" and is included in the event payload.
 func (e *Evaluator) writeVerdictEvent(
 	ctx context.Context,
 	runID string,
 	jobID string,
 	rule *Rule,
 	verdict *Verdict,
+	status string,
 ) {
 	if e.EventStore == nil {
 		return
@@ -195,6 +229,7 @@ func (e *Evaluator) writeVerdictEvent(
 		"pass":       verdict.Pass,
 		"findings":   verdict.Findings,
 		"confidence": verdict.Confidence,
+		"status":     status,
 	})
 
 	event := &core.Event{

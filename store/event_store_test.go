@@ -383,3 +383,62 @@ func TestListEvents_EmptyRun(t *testing.T) {
 		t.Errorf("expected 0 events, got %d", len(events))
 	}
 }
+
+func TestListEvents_CreatedAtParsedCorrectly(t *testing.T) {
+	db := setupTestDB(t)
+	insertTestRun(t, db, "run-ts-1")
+	es := NewEventStore(db)
+	ctx := context.Background()
+
+	// Use a known timestamp with UTC offset to verify round-trip.
+	knownTime := time.Date(2026, 4, 26, 15, 30, 0, 0, time.UTC)
+	event := &core.Event{
+		ID:            "evt-ts-1",
+		RunID:         "run-ts-1",
+		Kind:          core.EventRunCreated,
+		SchemaVersion: 1,
+		Payload:       `{}`,
+		CreatedAt:     knownTime,
+	}
+
+	if err := es.WriteEventThenRow(ctx, event, nil); err != nil {
+		t.Fatalf("WriteEventThenRow: %v", err)
+	}
+
+	events, err := es.ListEvents(ctx, "run-ts-1")
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+
+	got := events[0].CreatedAt
+	if got.IsZero() {
+		t.Error("expected non-zero CreatedAt, got zero")
+	}
+	if !got.Equal(knownTime) {
+		t.Errorf("CreatedAt = %v, want %v", got, knownTime)
+	}
+}
+
+func TestListEvents_MalformedTimestamp_ReturnsError(t *testing.T) {
+	db := setupTestDB(t)
+	insertTestRun(t, db, "run-ts-bad")
+	es := NewEventStore(db)
+	ctx := context.Background()
+
+	// Insert a row with a deliberately malformed timestamp via raw SQL.
+	_, execErr := db.ExecContext(ctx,
+		`INSERT INTO events (id, run_id, sequence, kind, schema_version, payload, created_at)
+		 VALUES ('evt-ts-bad', 'run-ts-bad', 1, 'run.created', 1, '{}', 'not-a-timestamp')`,
+	)
+	if execErr != nil {
+		t.Fatalf("insert malformed event: %v", execErr)
+	}
+
+	_, err := es.ListEvents(ctx, "run-ts-bad")
+	if err == nil {
+		t.Error("expected error for malformed timestamp, got nil")
+	}
+}

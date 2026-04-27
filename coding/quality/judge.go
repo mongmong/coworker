@@ -8,6 +8,9 @@ import (
 	"log/slog"
 	"os/exec"
 	"strings"
+	"time"
+
+	"github.com/chris/coworker/internal/executil"
 )
 
 // Judge evaluates a single quality rule against a diff and context.
@@ -18,6 +21,10 @@ type Judge interface {
 	// Returns a structured verdict or an error if the judge could not run.
 	Evaluate(ctx context.Context, rule *Rule, diff string, jobContext string) (*Verdict, error)
 }
+
+// defaultJudgeMaxWallclockMinutes is the default subprocess deadline for
+// CLIJudge when MaxWallclockMinutes is zero.
+const defaultJudgeMaxWallclockMinutes = 5
 
 // CLIJudge shells out to a Codex-compatible CLI binary to evaluate
 // quality rules. It expects the binary to accept a prompt on stdin and
@@ -33,6 +40,11 @@ type CLIJudge struct {
 	// BinaryPath is the path to the Codex (or compatible) binary.
 	// If empty, "codex" is used (looked up on PATH).
 	BinaryPath string
+
+	// MaxWallclockMinutes is the subprocess deadline in minutes.
+	// Zero uses the defaultJudgeMaxWallclockMinutes (5 minutes).
+	// Negative disables the deadline.
+	MaxWallclockMinutes int
 
 	// Logger is used for debug and error logging. If nil, slog.Default() is used.
 	Logger *slog.Logger
@@ -52,7 +64,15 @@ func (j *CLIJudge) Evaluate(ctx context.Context, rule *Rule, diff string, jobCon
 
 	prompt := renderJudgePrompt(rule, diff, jobContext)
 
-	cmd := exec.CommandContext(ctx, binary, "exec", "--json")
+	maxMinutes := j.MaxWallclockMinutes
+	if maxMinutes == 0 {
+		maxMinutes = defaultJudgeMaxWallclockMinutes
+	}
+	judgeCtx, judgeCancel := executil.BudgetTimeout(ctx, maxMinutes)
+	defer judgeCancel()
+
+	cmd := exec.CommandContext(judgeCtx, binary, "exec", "--json")
+	cmd.WaitDelay = 5 * time.Second
 	cmd.Stdin = strings.NewReader(prompt)
 
 	var stdout, stderr bytes.Buffer
