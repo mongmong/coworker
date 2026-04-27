@@ -144,7 +144,40 @@ Update the package doc comment to mention `OpenCodeHTTPAgent` as the first HTTP-
 
 ## Code Review
 
-_To be filled by post-implementation review._
+### Review 1
+
+**Date:** 2026-04-20
+**Reviewer:** Claude Code (post-implementation self-review)
+
+#### Blocker #1: Dispatch blocks on synchronous POST [FIXED]
+
+`agent/opencode_http_agent.go` — `Dispatch()` previously blocked waiting for the `sendMessage` goroutine to return before returning the `JobHandle`. This meant `Cancel()` could not interrupt an in-flight run.
+
+→ Fixed: `sendMessage` is now fire-and-forget inside a goroutine that uses `sseCtx`. `Dispatch` returns the `JobHandle` immediately after starting the SSE goroutine and the message goroutine. `Wait()` still blocks on `resultCh`; `Cancel()` can now interrupt because both goroutines respect the shared `sseCtx`.
+
+#### Blocker #2: message.part.updated accepted all text parts regardless of role [FIXED]
+
+`agent/opencode_http_agent.go` — `processSSEEvent` previously accepted every `message.part.updated` event with `type:"text"`, including the user's own prompt text (which also arrives as a `message.part.updated` event). This could contaminate the assistant's output with the prompt.
+
+→ Fixed: Added `message.updated` event handling that registers assistant message IDs (from events with `role:"assistant"`) into a `map[string]struct{}`. `message.part.updated` events are now only collected when `part.messageID` is in the assistant ID set. The map is threaded through `sseLoop` → `sseStream` → `processSSEEvent` and is shared across reconnects. New type `openCodeMessageUpdatedProps` added. Tests updated with `messageUpdatedAssistantEvent` helper and new unit tests for the filter.
+
+#### Blocker #3: --opencode-server flag default was empty string [FIXED]
+
+`cli/daemon.go` and `cli/run.go` — flag default was `""`, which meant the dispatcher fell back to `CliAgent` by default instead of using `OpenCodeHTTPAgent`.
+
+→ Fixed: Default changed to `agent.DefaultOpenCodeServerURL` (`"http://127.0.0.1:7777"`) in both flag registrations. The dispatcher will now use `OpenCodeHTTPAgent` by default; passing `--opencode-server ""` opts out to the CLI binary fallback.
+
+#### Important #1: sendMessage response body drain [WONTFIX]
+
+`sendMessage` drains and discards the POST response body. A "fallback parse if SSE didn't deliver findings" was noted as a nice-to-have.
+
+→ No change: SSE is the authoritative findings source. The drain is documented with a comment in the code. Adding a fallback parse would complicate the code with little benefit since SSE is reliable per the spike.
+
+#### Important #2: Cancel() races SSE cleanup with abort POST [FIXED]
+
+`Cancel()` previously called `h.cancel()` first, which could cause the SSE goroutine to run its DELETE cleanup before the abort POST was sent.
+
+→ Fixed: `Cancel()` now POSTs `/abort` first (best-effort, using `context.Background` so it is not cancelled by `h.cancel()`), then calls `h.cancel()`. Error from abort is silently discarded — the session may already be complete.
 
 ---
 

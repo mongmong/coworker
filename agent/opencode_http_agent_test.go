@@ -148,13 +148,31 @@ func sessionIdleEvent(sessionID string) string {
 	})
 }
 
-// messagePartUpdatedEvent returns a message.part.updated JSON payload for a text part.
+// testAssistantMsgID is the message ID used for assistant messages in tests.
+const testAssistantMsgID = "msg_test_assistant"
+
+// messageUpdatedAssistantEvent returns a message.updated JSON payload for an
+// assistant message. This must be sent before messagePartUpdatedEvent so the
+// SSE handler knows which message IDs belong to the assistant.
+func messageUpdatedAssistantEvent(sessionID string) string {
+	return buildSSEEvent("message.updated", map[string]interface{}{
+		"sessionID": sessionID,
+		"info": map[string]interface{}{
+			"id":   testAssistantMsgID,
+			"role": "assistant",
+		},
+	})
+}
+
+// messagePartUpdatedEvent returns a message.part.updated JSON payload for a
+// text part attributed to the assistant message (testAssistantMsgID).
 func messagePartUpdatedEvent(sessionID, text string) string {
 	return buildSSEEvent("message.part.updated", map[string]interface{}{
 		"sessionID": sessionID,
 		"part": map[string]interface{}{
-			"type": "text",
-			"text": text,
+			"type":      "text",
+			"text":      text,
+			"messageID": testAssistantMsgID,
 		},
 	})
 }
@@ -183,6 +201,9 @@ func TestOpenCodeHTTPAgent_HappyPath(t *testing.T) {
 	state := &mockOpenCodeServer{
 		sseEvents: []string{
 			buildSSEEvent("session.created", map[string]interface{}{"sessionID": testSessionID}),
+			// message.updated (role:assistant) must precede message.part.updated so
+			// the SSE handler registers the message ID as belonging to the assistant.
+			messageUpdatedAssistantEvent(testSessionID),
 			messagePartUpdatedEvent(testSessionID, assistantText),
 			sessionIdleEvent(testSessionID),
 		},
@@ -363,6 +384,8 @@ func TestOpenCodeHTTPAgent_SSEReconnect(t *testing.T) {
 		sseEvents: []string{
 			buildSSEEvent("session.created", map[string]interface{}{"sessionID": testSessionID}),
 			// These are only sent on the second connection (dropAfter resets for conn > 1).
+			// message.updated (role:assistant) must precede message.part.updated.
+			messageUpdatedAssistantEvent(testSessionID),
 			messagePartUpdatedEvent(testSessionID, assistantText),
 			sessionIdleEvent(testSessionID),
 		},
@@ -535,6 +558,8 @@ func TestOpenCodeHTTPAgent_NonJSONLOutput(t *testing.T) {
 	state := &mockOpenCodeServer{
 		sseEvents: []string{
 			buildSSEEvent("session.created", map[string]interface{}{"sessionID": testSessionID}),
+			// message.updated (role:assistant) must precede message.part.updated.
+			messageUpdatedAssistantEvent(testSessionID),
 			messagePartUpdatedEvent(testSessionID, assistantText),
 			sessionIdleEvent(testSessionID),
 		},
@@ -575,14 +600,40 @@ func TestOpenCodeHTTPAgent_NonJSONLOutput(t *testing.T) {
 }
 
 // TestOpenCodeHTTPAgent_MessageSendError verifies that a server error on
-// POST /session/{id}/message causes Dispatch to return an error.
+// POST /session/{id}/message does not block Dispatch (fire-and-forget POST),
+// but the SSE goroutine will time out without receiving session.idle. Wait
+// returns ctx.Err when the deadline is reached.
 func TestOpenCodeHTTPAgent_MessageSendError(t *testing.T) {
-	state := &mockOpenCodeServer{
-		messageResponseCode: http.StatusInternalServerError,
-		sseEvents:           []string{},
-	}
+	// SSE never sends session.idle — the message was rejected.
+	mux := http.NewServeMux()
+	var messageSent int32
+	mux.HandleFunc("POST /session", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(openCodeSessionResponse{ID: testSessionID}) //nolint:errcheck
+	})
+	mux.HandleFunc("POST /session/{sessionID}/message", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&messageSent, 1)
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintln(w, "internal server error")
+	})
+	mux.HandleFunc("DELETE /session/{sessionID}", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("POST /session/{sessionID}/abort", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("GET /event", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		// Block until the context is cancelled (simulates a server that never
+		// sends session.idle because the message was rejected).
+		<-r.Context().Done()
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
 
-	srv := newMockServer(t, state)
 	ag := &OpenCodeHTTPAgent{
 		ServerURL:  srv.URL,
 		HTTPClient: srv.Client(),
@@ -595,15 +646,28 @@ func TestOpenCodeHTTPAgent_MessageSendError(t *testing.T) {
 		CLI:   "opencode",
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// Dispatch returns immediately (fire-and-forget POST).
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 
-	_, err := ag.Dispatch(ctx, job, "cause an error")
-	if err == nil {
-		t.Fatal("expected error from Dispatch when message send fails, got nil")
+	handle, err := ag.Dispatch(ctx, job, "cause an error")
+	if err != nil {
+		t.Fatalf("Dispatch: %v (should not block on message send failure)", err)
 	}
-	if !strings.Contains(err.Error(), "send message") {
-		t.Errorf("error = %q; want to contain 'send message'", err.Error())
+
+	// Wait should return with the context deadline error.
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer waitCancel()
+	_, waitErr := handle.Wait(waitCtx)
+	if waitErr == nil {
+		t.Log("Wait returned nil err (SSE goroutine exited cleanly on context cancellation)")
+	} else {
+		t.Logf("Wait returned expected error: %v", waitErr)
+	}
+
+	// The message POST should have been attempted.
+	if got := atomic.LoadInt32(&messageSent); got < 1 {
+		t.Errorf("POST /session/{id}/message called %d times, want >= 1", got)
 	}
 }
 
@@ -653,7 +717,8 @@ func TestParseAssistantText_Empty(t *testing.T) {
 // TestProcessSSEEvent_SessionIdle verifies session.idle detection.
 func TestProcessSSEEvent_SessionIdle(t *testing.T) {
 	raw := buildSSEEvent("session.idle", map[string]interface{}{"sessionID": testSessionID})
-	done, text, errMsg := processSSEEvent(raw, testSessionID)
+	ids := make(map[string]struct{})
+	done, text, errMsg := processSSEEvent(raw, testSessionID, ids)
 	if !done {
 		t.Error("expected done=true for session.idle")
 	}
@@ -665,7 +730,8 @@ func TestProcessSSEEvent_SessionIdle(t *testing.T) {
 // TestProcessSSEEvent_OtherSession verifies that events for other sessions are ignored.
 func TestProcessSSEEvent_OtherSession(t *testing.T) {
 	raw := buildSSEEvent("session.idle", map[string]interface{}{"sessionID": "ses_other"})
-	done, text, errMsg := processSSEEvent(raw, testSessionID)
+	ids := make(map[string]struct{})
+	done, text, errMsg := processSSEEvent(raw, testSessionID, ids)
 	if done {
 		t.Error("expected done=false for session.idle from other session")
 	}
@@ -674,10 +740,13 @@ func TestProcessSSEEvent_OtherSession(t *testing.T) {
 	}
 }
 
-// TestProcessSSEEvent_MessagePartUpdated verifies text extraction.
+// TestProcessSSEEvent_MessagePartUpdated verifies text extraction when the
+// assistant message ID is known.
 func TestProcessSSEEvent_MessagePartUpdated(t *testing.T) {
+	// Pre-populate the assistant message ID set so the part is accepted.
+	ids := map[string]struct{}{testAssistantMsgID: {}}
 	raw := messagePartUpdatedEvent(testSessionID, "hello world")
-	done, text, errMsg := processSSEEvent(raw, testSessionID)
+	done, text, errMsg := processSSEEvent(raw, testSessionID, ids)
 	if done {
 		t.Error("expected done=false for message.part.updated")
 	}
@@ -689,10 +758,45 @@ func TestProcessSSEEvent_MessagePartUpdated(t *testing.T) {
 	}
 }
 
+// TestProcessSSEEvent_MessagePartUpdated_UserRole verifies that text parts
+// for unknown (user) message IDs are filtered out.
+func TestProcessSSEEvent_MessagePartUpdated_UserRole(t *testing.T) {
+	// Empty set — no assistant messages registered yet.
+	ids := make(map[string]struct{})
+	// This part has the test assistant message ID but it's not registered,
+	// simulating a user message part arriving before the assistant message.updated.
+	raw := messagePartUpdatedEvent(testSessionID, "user prompt text")
+	done, text, errMsg := processSSEEvent(raw, testSessionID, ids)
+	if done {
+		t.Error("expected done=false")
+	}
+	if text != "" {
+		t.Errorf("text = %q, want empty (user message parts must be filtered)", text)
+	}
+	if errMsg != "" {
+		t.Errorf("errMsg = %q, want empty", errMsg)
+	}
+}
+
+// TestProcessSSEEvent_MessageUpdatedRegistersAssistant verifies that a
+// message.updated event with role "assistant" adds the message ID to the set.
+func TestProcessSSEEvent_MessageUpdatedRegistersAssistant(t *testing.T) {
+	ids := make(map[string]struct{})
+	raw := messageUpdatedAssistantEvent(testSessionID)
+	done, text, errMsg := processSSEEvent(raw, testSessionID, ids)
+	if done || text != "" || errMsg != "" {
+		t.Errorf("unexpected result: done=%v text=%q errMsg=%q", done, text, errMsg)
+	}
+	if _, ok := ids[testAssistantMsgID]; !ok {
+		t.Errorf("assistant message ID %q not registered in ids map", testAssistantMsgID)
+	}
+}
+
 // TestProcessSSEEvent_SessionError verifies error extraction.
 func TestProcessSSEEvent_SessionError(t *testing.T) {
 	raw := sessionErrorEvent(testSessionID, "MessageAbortedError", "Aborted")
-	done, text, errMsg := processSSEEvent(raw, testSessionID)
+	ids := make(map[string]struct{})
+	done, text, errMsg := processSSEEvent(raw, testSessionID, ids)
 	if done {
 		t.Error("expected done=false for session.error")
 	}

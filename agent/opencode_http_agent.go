@@ -111,12 +111,23 @@ type openCodeSessionErrorProps struct {
 	} `json:"error"`
 }
 
+// openCodeMessageUpdatedProps is the shape of message.updated properties.
+// Used to track which message IDs belong to the assistant role.
+type openCodeMessageUpdatedProps struct {
+	SessionID string `json:"sessionID"`
+	Info      struct {
+		ID   string `json:"id"`
+		Role string `json:"role"`
+	} `json:"info"`
+}
+
 // openCodeMessagePartUpdatedProps is the shape of message.part.updated properties.
 type openCodeMessagePartUpdatedProps struct {
 	SessionID string `json:"sessionID"`
 	Part      struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
+		Type      string `json:"type"`
+		Text      string `json:"text"`
+		MessageID string `json:"messageID"`
 	} `json:"part"`
 }
 
@@ -162,25 +173,14 @@ func (a *OpenCodeHTTPAgent) Dispatch(ctx context.Context, job *core.Job, prompt 
 		resultCh <- result
 	}()
 
-	// 3. Post the message. This blocks until OpenCode finishes responding.
-	//    We send it in a goroutine so context cancellation can interrupt it.
-	msgErrCh := make(chan error, 1)
+	// 3. Fire the message POST in a goroutine so Dispatch returns immediately.
+	//    Findings come from the SSE stream; the POST response body is drained and
+	//    discarded. If the POST itself fails (non-2xx), the SSE goroutine will
+	//    eventually time out or see a session.error event — the caller should
+	//    always use a deadline on the Wait context.
 	go func() {
-		msgErrCh <- a.sendMessage(ctx, client, base, sessionID, prompt)
+		_ = a.sendMessage(sseCtx, client, base, sessionID, prompt)
 	}()
-
-	// Wait for the message to be sent (or context to be cancelled). We return
-	// the handle immediately; the SSE goroutine will signal completion.
-	select {
-	case msgErr := <-msgErrCh:
-		if msgErr != nil {
-			sseCancel()
-			return nil, fmt.Errorf("opencode: send message: %w", msgErr)
-		}
-	case <-ctx.Done():
-		sseCancel()
-		return nil, ctx.Err()
-	}
 
 	handle := &openCodeJobHandle{
 		sessionID: sessionID,
@@ -201,15 +201,19 @@ func (h *openCodeJobHandle) Wait(ctx context.Context) (*core.JobResult, error) {
 	}
 }
 
-// Cancel aborts the running session by cancelling the SSE goroutine context
-// and posting to /session/{id}/abort.
+// Cancel aborts the running session. It posts /session/{id}/abort first
+// (best-effort, may fail if the session is already done) and then cancels the
+// SSE goroutine context. Aborting before cancelling avoids a race where the
+// SSE goroutine runs its DELETE cleanup before the abort request arrives.
 func (h *openCodeJobHandle) Cancel() error {
-	h.cancel()
-
 	abortCtx, abortCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer abortCancel()
+	// Best-effort abort; error is intentionally ignored — the session may
+	// already be complete, and the SSE goroutine will clean up regardless.
+	_ = h.agent.abortSession(abortCtx, h.agent.httpClient(), h.agent.serverURL(), h.sessionID)
 
-	return h.agent.abortSession(abortCtx, h.agent.httpClient(), h.agent.serverURL(), h.sessionID)
+	h.cancel()
+	return nil
 }
 
 // createSession posts to /session and returns the new session ID.
@@ -313,14 +317,20 @@ func (a *OpenCodeHTTPAgent) deleteSession(ctx context.Context, client *http.Clie
 // sseLoop subscribes to /event and processes events until session.idle is
 // received for the target session or ctx is cancelled. It returns the
 // accumulated JobResult. On transient disconnects it reconnects with backoff.
+//
+// assistantMsgIDs is carried across reconnects so that text parts collected
+// before a disconnect are correctly attributed on reconnect.
 func (a *OpenCodeHTTPAgent) sseLoop(ctx context.Context, client *http.Client, base, sessionID string) *core.JobResult {
 	var assistantParts []string
 	var sessionErrMsg string
-	reconnects := 0
+	// assistantMsgIDs tracks message IDs seen in message.updated events with
+	// role "assistant". Parts are only collected for these message IDs, which
+	// prevents the user's prompt text from being mistaken for assistant output.
+	assistantMsgIDs := make(map[string]struct{})
 	backoff := 250 * time.Millisecond
 
 	for ctx.Err() == nil {
-		complete, newParts, newErrMsg, streamErr := a.sseStream(ctx, client, base, sessionID)
+		complete, newParts, newErrMsg, streamErr := a.sseStream(ctx, client, base, sessionID, assistantMsgIDs)
 		// Merge accumulated text.
 		assistantParts = append(assistantParts, newParts...)
 		if newErrMsg != "" {
@@ -337,7 +347,6 @@ func (a *OpenCodeHTTPAgent) sseLoop(ctx context.Context, client *http.Client, ba
 		}
 
 		// Transient error — reconnect with backoff.
-		reconnects++
 		timer := time.NewTimer(backoff)
 		select {
 		case <-ctx.Done():
@@ -363,11 +372,15 @@ func (a *OpenCodeHTTPAgent) sseLoop(ctx context.Context, client *http.Client, ba
 //   - the SSE connection is closed or errors → complete=false, streamErr set
 //   - ctx is cancelled → complete=false
 //
+// assistantMsgIDs is updated in-place as message.updated events with
+// role:"assistant" are observed. It is shared across reconnects.
+//
 // Returns the text parts accumulated in this connection and any session error.
 func (a *OpenCodeHTTPAgent) sseStream(
 	ctx context.Context,
 	client *http.Client,
 	base, sessionID string,
+	assistantMsgIDs map[string]struct{},
 ) (complete bool, parts []string, sessionErrMsg string, streamErr error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/event", nil)
 	if err != nil {
@@ -400,7 +413,7 @@ func (a *OpenCodeHTTPAgent) sseStream(
 			}
 			if len(dataLines) > 0 {
 				// Process the last accumulated event before returning.
-				isDone, textPart, errMsg := processSSEEvent(strings.Join(dataLines, "\n"), sessionID)
+				isDone, textPart, errMsg := processSSEEvent(strings.Join(dataLines, "\n"), sessionID, assistantMsgIDs)
 				if textPart != "" {
 					parts = append(parts, textPart)
 				}
@@ -421,7 +434,7 @@ func (a *OpenCodeHTTPAgent) sseStream(
 			if len(dataLines) == 0 {
 				continue
 			}
-			isDone, textPart, errMsg := processSSEEvent(strings.Join(dataLines, "\n"), sessionID)
+			isDone, textPart, errMsg := processSSEEvent(strings.Join(dataLines, "\n"), sessionID, assistantMsgIDs)
 			dataLines = dataLines[:0]
 			if textPart != "" {
 				parts = append(parts, textPart)
@@ -448,9 +461,15 @@ func (a *OpenCodeHTTPAgent) sseStream(
 
 // processSSEEvent decodes one SSE data payload and returns:
 //   - done: true when session.idle is received for the target session
-//   - textPart: assistant text accumulated from message.part.updated
+//   - textPart: assistant text accumulated from message.part.updated (assistant only)
 //   - sessionErrMsg: error text from session.error
-func processSSEEvent(raw, sessionID string) (done bool, textPart, sessionErrMsg string) {
+//
+// assistantMsgIDs is updated in-place: when a message.updated event with
+// role:"assistant" is seen for the target session, its message ID is added to
+// the set. Only message.part.updated events whose messageID is in this set are
+// collected as assistant output. This prevents the user's prompt text (which
+// also flows through message.part.updated) from contaminating the result.
+func processSSEEvent(raw, sessionID string, assistantMsgIDs map[string]struct{}) (done bool, textPart, sessionErrMsg string) {
 	var env openCodeSSEEvent
 	if err := json.Unmarshal([]byte(raw), &env); err != nil {
 		return false, "", ""
@@ -465,11 +484,25 @@ func processSSEEvent(raw, sessionID string) (done bool, textPart, sessionErrMsg 
 			}
 		}
 
+	case "message.updated":
+		// Track assistant message IDs so we can filter message.part.updated.
+		var props openCodeMessageUpdatedProps
+		if err := json.Unmarshal(env.Properties, &props); err == nil {
+			if props.SessionID == sessionID && props.Info.Role == "assistant" && props.Info.ID != "" {
+				assistantMsgIDs[props.Info.ID] = struct{}{}
+			}
+		}
+
 	case "message.part.updated":
 		var props openCodeMessagePartUpdatedProps
 		if err := json.Unmarshal(env.Properties, &props); err == nil {
+			// Only collect text parts that belong to a known assistant message.
+			// This filters out the user's own prompt text which also arrives as
+			// a message.part.updated event with type:"text".
 			if props.SessionID == sessionID && props.Part.Type == "text" && props.Part.Text != "" {
-				return false, props.Part.Text, ""
+				if _, isAssistant := assistantMsgIDs[props.Part.MessageID]; isAssistant {
+					return false, props.Part.Text, ""
+				}
 			}
 		}
 

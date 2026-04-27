@@ -80,7 +80,7 @@ func init() {
 	runCmd.Flags().StringVar(&runClaudeBinary, "claude-binary", "", "Path to the claude-code binary (default: resolved from PATH)")
 	runCmd.Flags().StringVar(&runCodexBinary, "codex-binary", "", "Path to the codex binary (default: resolved from PATH)")
 	runCmd.Flags().StringVar(&runOpenCodeBinary, "opencode-binary", "", "Path to the opencode binary (default: resolved from PATH)")
-	runCmd.Flags().StringVar(&runOpenCodeServer, "opencode-server", "", "OpenCode HTTP server URL for HTTP-primary dispatch (e.g. http://127.0.0.1:7777). When set, uses OpenCodeHTTPAgent instead of CliAgent for opencode roles.")
+	runCmd.Flags().StringVar(&runOpenCodeServer, "opencode-server", agent.DefaultOpenCodeServerURL, "OpenCode HTTP server URL for HTTP-primary dispatch. When non-empty, uses OpenCodeHTTPAgent instead of CliAgent for opencode roles. Set to empty string to fall back to the CLI binary.")
 	rootCmd.AddCommand(runCmd)
 }
 
