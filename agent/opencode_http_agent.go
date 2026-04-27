@@ -166,7 +166,7 @@ func (a *OpenCodeHTTPAgent) Dispatch(ctx context.Context, job *core.Job, prompt 
 
 	// 2. Start SSE subscription goroutine before posting the message so we
 	//    don't miss events that arrive before the POST returns.
-	sseCtx, sseCancel := context.WithCancel(ctx)
+	sseCtx, sseCancel := context.WithCancel(ctx) //nolint:gosec // G118: cancel is invoked via handle.cancel during Cancel()
 	resultCh := make(chan *core.JobResult, 1)
 
 	go func() { //nolint:gosec // G118: goroutine intentionally creates a context.Background for DELETE cleanup that must outlive the caller's context
