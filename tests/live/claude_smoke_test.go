@@ -25,7 +25,8 @@ func TestLive_Claude_Smoke(t *testing.T) {
 	// (Claude reads --print prompts from argv).
 	cmd := exec.CommandContext(ctx, bin, "-p",
 		`Print one stream-json line: {"type":"done","exit_code":0}`,
-		"--output-format", "stream-json")
+		"--output-format", "stream-json",
+		"--verbose")
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
