@@ -26,6 +26,7 @@ import (
 var (
 	daemonDBPath         string
 	daemonHTTPPort       int
+	daemonHTTPBind       string
 	daemonRoleDir        string
 	daemonPromptDir      string
 	daemonCliBinary      string
@@ -44,7 +45,7 @@ The daemon runs the job scheduler, event bus, and MCP server. CLI workers
 (Claude Code, Codex, OpenCode) connect to the MCP server via stdio transport
 to receive dispatches and report results.
 
-An HTTP/SSE server is also started (default port 7700) providing:
+An HTTP/SSE server is also started (default 127.0.0.1:7700) providing:
   GET  /events                — SSE event stream
   GET  /runs                  — list runs
   GET  /runs/{id}             — run details
@@ -52,12 +53,17 @@ An HTTP/SSE server is also started (default port 7700) providing:
   GET  /attention             — list pending attention items
   POST /attention/{id}/answer — answer an attention item
 
+The HTTP server binds to loopback (127.0.0.1) by default. Pass
+--http-bind 0.0.0.0 to expose on all interfaces (intended for
+trusted-LAN scenarios; the endpoints are unauthenticated in V1).
+
 The daemon blocks until interrupted (SIGINT / SIGTERM).
 
 Example:
   coworker daemon
   coworker daemon --db /path/to/state.db
-  coworker daemon --http-port 8080`,
+  coworker daemon --http-port 8080
+  coworker daemon --http-bind 0.0.0.0  # all interfaces (LAN-trusted only)`,
 	RunE: func(cmd *cobra.Command, _ []string) error {
 		return runDaemon(cmd)
 	},
@@ -66,6 +72,7 @@ Example:
 func init() {
 	daemonCmd.Flags().StringVar(&daemonDBPath, "db", "", "Path to SQLite database (default: .coworker/state.db)")
 	daemonCmd.Flags().IntVar(&daemonHTTPPort, "http-port", 7700, "Port for the HTTP/SSE server")
+	daemonCmd.Flags().StringVar(&daemonHTTPBind, "http-bind", "127.0.0.1", "Address to bind the HTTP/SSE server to. Defaults to loopback only; pass 0.0.0.0 to expose on all interfaces.")
 	daemonCmd.Flags().StringVar(&daemonRoleDir, "role-dir", "", "Path to the role YAML directory (default: .coworker/roles or coding/roles)")
 	daemonCmd.Flags().StringVar(&daemonPromptDir, "prompt-dir", "", "Path to the prompt template directory (default: .coworker or coding)")
 	daemonCmd.Flags().StringVar(&daemonCliBinary, "cli-binary", "", "Fallback CLI binary for all roles (default: codex). Overridden by per-CLI flags.")
@@ -137,7 +144,9 @@ func runDaemon(cmd *cobra.Command) error {
 		checkpoint: store.NewCheckpointStore(db, es),
 	})
 
-	logger.Info("coworker daemon starting", "db", dbPath, "http_port", daemonHTTPPort)
+	logger.Info("coworker daemon starting",
+		"db", dbPath,
+		"http_addr", fmt.Sprintf("%s:%d", daemonHTTPBind, daemonHTTPPort))
 
 	// Run MCP stdio server and HTTP server concurrently with mutual cancellation.
 	// Whichever goroutine exits first calls cancel(), shutting down the other.
@@ -154,7 +163,7 @@ func runDaemon(cmd *cobra.Command) error {
 	g.Go(func() error {
 		defer cancel() // HTTP exit cancels MCP peer
 		httpSrv := &http.Server{
-			Addr:              fmt.Sprintf(":%d", daemonHTTPPort),
+			Addr:              fmt.Sprintf("%s:%d", daemonHTTPBind, daemonHTTPPort),
 			Handler:           mux,
 			ReadHeaderTimeout: 10 * time.Second, // mitigate Slowloris (gosec G112)
 		}

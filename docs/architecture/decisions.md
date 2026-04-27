@@ -178,3 +178,12 @@ The helper is then invoked at the post-spec-approved code path in `runPlanLoopWi
 **Decision:** `phaseloop.PhaseExecutor.Execute` injects `plan_id` and `phase_index` into the `inputs` map before dispatching. The dispatcher reads them out of `DispatchInput.Inputs` to populate finding fields. This keeps the wiring narrow (one-line injection at the executor entry; one-line read at the dispatcher's persistence loop) without growing every Dispatch* struct.
 
 **Status:** Introduced in Plan 125.
+
+
+## Decision 14: HTTP Daemon Binds Loopback by Default (Plan 127, I4)
+
+**Context:** The 2026-04-27 V1 audit (IMPORTANT I4) flagged that the daemon's HTTP/SSE server bound to all interfaces (`:7700`) without authentication. On a developer machine the surface was OK; in CI or trusted-LAN setups, anyone with port access could approve checkpoints.
+
+**Decision:** The HTTP server now binds to `127.0.0.1:7700` by default. Users who need LAN access pass `--http-bind 0.0.0.0` (documented in the daemon's long help with a "trusted-LAN only" caveat). Authenticated endpoints remain a V2 deferral, but the loopback default narrows the V1 surface significantly.
+
+**Status:** Introduced in Plan 127.
