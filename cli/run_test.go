@@ -1277,3 +1277,80 @@ func TestExtractPlanIDFromSource(t *testing.T) {
 		}
 	}
 }
+
+// TestBuildPhaseRunner_Wiring verifies the production helper returns a
+// fully-wired BuildFromPRDWorkflow. Plan 122 (B1).
+func TestBuildPhaseRunner_Wiring(t *testing.T) {
+	saveAndRestoreRunFlags(t)
+	db := openTestDB(t)
+	es := store.NewEventStore(db)
+	as := store.NewAttentionStore(db)
+	cs := store.NewCheckpointStore(db, es)
+
+	runner, err := buildPhaseRunner("test-manifest.yaml", db, nil, as, cs, es, newTestLogger())
+	if err != nil {
+		t.Fatalf("buildPhaseRunner: %v", err)
+	}
+	if runner.PhaseExecutor == nil {
+		t.Error("PhaseExecutor is nil")
+	}
+	if runner.Shipper == nil {
+		t.Error("Shipper is nil; expected non-nil with runNoShip=false (default)")
+	}
+	if runner.StageRegistry == nil {
+		t.Error("StageRegistry is nil")
+	}
+	if runner.PlanWriter == nil {
+		t.Error("PlanWriter is nil")
+	}
+	if runner.CheckpointWriter == nil {
+		t.Error("CheckpointWriter is nil")
+	}
+	if runner.ManifestPath != "test-manifest.yaml" {
+		t.Errorf("ManifestPath = %q, want %q", runner.ManifestPath, "test-manifest.yaml")
+	}
+}
+
+// TestBuildPhaseRunner_NoShipFlag asserts Shipper is nil when --no-ship
+// is set; PhaseExecutor remains wired.
+func TestBuildPhaseRunner_NoShipFlag(t *testing.T) {
+	saveAndRestoreRunFlags(t)
+	runNoShip = true
+	db := openTestDB(t)
+	es := store.NewEventStore(db)
+	as := store.NewAttentionStore(db)
+	cs := store.NewCheckpointStore(db, es)
+
+	runner, err := buildPhaseRunner("m.yaml", db, nil, as, cs, es, newTestLogger())
+	if err != nil {
+		t.Fatalf("buildPhaseRunner: %v", err)
+	}
+	if runner.Shipper != nil {
+		t.Error("Shipper expected nil when runNoShip=true")
+	}
+	if runner.PhaseExecutor == nil {
+		t.Error("PhaseExecutor must remain wired with --no-ship")
+	}
+}
+
+// TestBuildPhaseRunner_DryRunPropagatesToShipper asserts --dry-run flips
+// Shipper.DryRun.
+func TestBuildPhaseRunner_DryRunPropagatesToShipper(t *testing.T) {
+	saveAndRestoreRunFlags(t)
+	runDryRun = true
+	db := openTestDB(t)
+	es := store.NewEventStore(db)
+	as := store.NewAttentionStore(db)
+	cs := store.NewCheckpointStore(db, es)
+
+	runner, err := buildPhaseRunner("m.yaml", db, nil, as, cs, es, newTestLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runner.Shipper == nil {
+		t.Fatal("Shipper unexpectedly nil")
+	}
+	if !runner.Shipper.DryRun {
+		t.Error("Shipper.DryRun = false, want true (runDryRun was set)")
+	}
+}

@@ -15,6 +15,9 @@ import (
 	"github.com/chris/coworker/agent"
 	"github.com/chris/coworker/coding"
 	"github.com/chris/coworker/coding/manifest"
+	"github.com/chris/coworker/coding/phaseloop"
+	"github.com/chris/coworker/coding/shipper"
+	"github.com/chris/coworker/coding/stages"
 	"github.com/chris/coworker/coding/workflow"
 	"github.com/chris/coworker/core"
 	"github.com/chris/coworker/store"
@@ -491,24 +494,13 @@ func runPlanLoopWithDeps(
 		if deps != nil && deps.Runner != nil {
 			runner = deps.Runner
 		} else {
-			cwd, _ := os.Getwd()
-			// Resolve the effective role directory (same logic as buildRunDispatcher).
-			effectiveRoleDir := runRoleDir
-			if effectiveRoleDir == "" {
-				effectiveRoleDir = filepath.Join(".coworker", "roles")
-				if _, statErr := os.Stat(effectiveRoleDir); os.IsNotExist(statErr) {
-					effectiveRoleDir = filepath.Join("coding", "roles")
-				}
+			r, runnerErr := buildPhaseRunner(
+				manifestPath, db, policy, attentionStore, checkpointWriter, eventStore, logger,
+			)
+			if runnerErr != nil {
+				return fmt.Errorf("build phase runner: %w", runnerErr)
 			}
-			runner = &workflow.BuildFromPRDWorkflow{
-				ManifestPath:     manifestPath,
-				Policy:           policy,
-				Logger:           logger,
-				WorkDir:          cwd,
-				RoleDir:          effectiveRoleDir,
-				PlanWriter:       store.NewPlanStore(db, eventStore),
-				CheckpointWriter: checkpointWriter,
-			}
+			runner = r
 		}
 
 		// Build or use the provided dispatcher for the planner role.
@@ -781,6 +773,79 @@ func buildRunDispatcher(db *store.DB, policy *core.Policy, logger *slog.Logger) 
 		CostWriter:       store.NewCostEventStore(db, store.NewEventStore(db)),
 	}
 	return d, nil
+}
+
+// buildPhaseRunner constructs a fully-wired BuildFromPRDWorkflow ready to
+// execute plan phases end-to-end. It is the production complement to the
+// test-only PhaseExecutor wiring in coding/workflow/build_from_prd_test.go.
+//
+// Resolution: planner and phase pipelines share role-dir resolution, so a
+// single Dispatcher handles both. Shipper is omitted when --no-ship is set
+// and otherwise inherits --dry-run. WorktreeManager is left nil; parallel
+// plan execution (max_parallel_plans > 1) is not yet supported on this
+// path.
+func buildPhaseRunner(
+	manifestPath string,
+	db *store.DB,
+	policy *core.Policy,
+	attentionStore *store.AttentionStore,
+	checkpointWriter core.CheckpointWriter,
+	eventStore *store.EventStore,
+	logger *slog.Logger,
+) (*workflow.BuildFromPRDWorkflow, error) {
+	cwd, _ := os.Getwd()
+	roleDir := runRoleDir
+	if roleDir == "" {
+		roleDir = filepath.Join(".coworker", "roles")
+		if _, statErr := os.Stat(roleDir); os.IsNotExist(statErr) {
+			roleDir = filepath.Join("coding", "roles")
+		}
+	}
+
+	dispatcher, err := buildRunDispatcher(db, policy, logger)
+	if err != nil {
+		return nil, fmt.Errorf("build phase dispatcher: %w", err)
+	}
+
+	phaseExec := &phaseloop.PhaseExecutor{
+		Dispatcher:       dispatcher,
+		EventStore:       eventStore,
+		AttentionStore:   attentionStore,
+		CheckpointWriter: checkpointWriter,
+		Policy:           policy,
+		WorkDir:          cwd,
+		RoleDir:          roleDir,
+		Logger:           logger,
+	}
+
+	var ship *shipper.Shipper
+	if !runNoShip {
+		ship = &shipper.Shipper{
+			AttentionStore:   attentionStore,
+			CheckpointWriter: checkpointWriter,
+			EventStore:       eventStore,
+			ArtifactStore:    store.NewArtifactStore(db, eventStore),
+			JobStore:         store.NewJobStore(db, eventStore),
+			Logger:           logger,
+			DryRun:           runDryRun,
+		}
+	}
+
+	registry := stages.NewStageRegistry(stages.WorkflowBuildFromPRD, stages.DefaultStages, policy)
+
+	runner := &workflow.BuildFromPRDWorkflow{
+		ManifestPath:     manifestPath,
+		Policy:           policy,
+		Logger:           logger,
+		WorkDir:          cwd,
+		RoleDir:          roleDir,
+		PhaseExecutor:    phaseExec,
+		Shipper:          ship,
+		StageRegistry:    registry,
+		PlanWriter:       store.NewPlanStore(db, eventStore),
+		CheckpointWriter: checkpointWriter,
+	}
+	return runner, nil
 }
 
 // insertRunCheckpoint inserts a checkpoint attention item and paired checkpoint row, returning its ID.
