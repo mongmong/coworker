@@ -227,6 +227,73 @@ func TestAttentionStore_AnswerAttention_NotFound(t *testing.T) {
 	}
 }
 
+// TestAttentionStore_GetAnyUnansweredCheckpointForRun verifies the no-source-
+// filter variant returns the most-recent unanswered checkpoint regardless of
+// source. Plan 123.
+func TestAttentionStore_GetAnyUnansweredCheckpointForRun(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db := setupTestDB(t)
+	runID := "run_any_checkpoint"
+	mustCreateRunForAttention(t, db, ctx, runID)
+	as := NewAttentionStore(db)
+
+	// No items: nil.
+	got, err := as.GetAnyUnansweredCheckpointForRun(ctx, runID)
+	if err != nil {
+		t.Fatalf("nil run: %v", err)
+	}
+	if got != nil {
+		t.Errorf("got %+v, want nil for empty run", got)
+	}
+
+	// Insert two checkpoints with different sources.
+	// created_at is stored at second precision; sleep > 1s to ensure ORDER BY
+	// produces deterministic results.
+	first := &core.AttentionItem{RunID: runID, Kind: core.AttentionCheckpoint, Source: "shipper"}
+	if err := as.InsertAttention(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(1100 * time.Millisecond)
+	second := &core.AttentionItem{RunID: runID, Kind: core.AttentionCheckpoint, Source: "phase-loop"}
+	if err := as.InsertAttention(ctx, second); err != nil {
+		t.Fatal(err)
+	}
+
+	// Most recent (second) should be returned regardless of source.
+	got, err = as.GetAnyUnansweredCheckpointForRun(ctx, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.ID != second.ID {
+		t.Errorf("got %+v, want second checkpoint id %q", got, second.ID)
+	}
+
+	// Answer the second; should now return the first.
+	if err := as.AnswerAttention(ctx, second.ID, core.AttentionAnswerApprove, "test"); err != nil {
+		t.Fatal(err)
+	}
+	got, err = as.GetAnyUnansweredCheckpointForRun(ctx, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.ID != first.ID {
+		t.Errorf("got %+v, want first checkpoint id %q after second answered", got, first.ID)
+	}
+
+	// Answer the first; method now returns nil.
+	if err := as.AnswerAttention(ctx, first.ID, core.AttentionAnswerApprove, "test"); err != nil {
+		t.Fatal(err)
+	}
+	got, err = as.GetAnyUnansweredCheckpointForRun(ctx, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != nil {
+		t.Errorf("got %+v, want nil after both answered", got)
+	}
+}
+
 func TestAttentionStore_GetUnansweredCheckpointForRun(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
