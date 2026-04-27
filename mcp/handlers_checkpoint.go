@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -112,7 +113,11 @@ func handleCheckpointAdvance(
 			_ = err
 		}
 		if cw != nil {
-			if err := cw.ResolveCheckpoint(ctx, in.AttentionID, core.AttentionAnswerApprove, answeredBy, in.Notes); err != nil {
+			// Best-effort: a missing checkpoint row is tolerated (legacy
+			// attention items, items created before Plan 119 wired the paired
+			// write). Other errors still surface.
+			if err := cw.ResolveCheckpoint(ctx, in.AttentionID, core.AttentionAnswerApprove, answeredBy, in.Notes); err != nil &&
+				!errors.Is(err, store.ErrCheckpointNotFound) {
 				return nil, checkpointActionOutput{}, fmt.Errorf("resolve checkpoint: %w", err)
 			}
 		}
@@ -190,7 +195,9 @@ func handleCheckpointRollback(
 			_ = err
 		}
 		if cw != nil {
-			if err := cw.ResolveCheckpoint(ctx, in.AttentionID, core.AttentionAnswerReject, answeredBy, in.Notes); err != nil {
+			// Best-effort: tolerate ErrCheckpointNotFound for legacy items.
+			if err := cw.ResolveCheckpoint(ctx, in.AttentionID, core.AttentionAnswerReject, answeredBy, in.Notes); err != nil &&
+				!errors.Is(err, store.ErrCheckpointNotFound) {
 				return nil, checkpointActionOutput{}, fmt.Errorf("resolve checkpoint: %w", err)
 			}
 		}

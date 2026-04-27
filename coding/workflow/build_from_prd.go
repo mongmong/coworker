@@ -249,6 +249,15 @@ func (w *BuildFromPRDWorkflow) RunPhasesForPlan(
 		w.PhaseExecutor.RoleDir = w.RoleDir
 	}
 
+	// Propagate CheckpointWriter so phase-clean attention items are paired
+	// with checkpoints rows. Same pattern for the shipper.
+	if w.CheckpointWriter != nil {
+		w.PhaseExecutor.CheckpointWriter = w.CheckpointWriter
+		if w.Shipper != nil {
+			w.Shipper.CheckpointWriter = w.CheckpointWriter
+		}
+	}
+
 	log := w.logger()
 	log.Info("running phases for plan",
 		"plan_id", plan.ID,

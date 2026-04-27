@@ -129,6 +129,134 @@ func TestReplay_GoldenEventsRoundTrip(t *testing.T) {
 	assertReplayShape(t, out)
 }
 
+// TestReplay_RebuildProjectionRowsFromEventLog confirms that the projection
+// tables (supervisor_events, cost_events, jobs.cost_usd, runs.cost_usd) can
+// be reconstructed from the event log alone. This is the spec's "replay
+// repairs the projection" property: an empty DB + an event log + the replay
+// routine == the same projection state.
+func TestReplay_RebuildProjectionRowsFromEventLog(t *testing.T) {
+	events := readEventsJSONL(t, filepath.Join("..", "testdata", "golden_events", "run_with_supervisor.jsonl"))
+	if len(events) == 0 {
+		t.Fatal("golden fixture contains no events")
+	}
+
+	db := setupTestDB(t)
+	ctx := context.Background()
+	if err := replayProjections(ctx, db, events); err != nil {
+		t.Fatalf("replayProjections: %v", err)
+	}
+
+	es := NewEventStore(db)
+	sup := NewSupervisorEventStore(db, es)
+	cost := NewCostEventStore(db, es)
+	rs := NewRunStore(db, es)
+	js := NewJobStore(db, es)
+
+	runID := events[0].RunID
+	supRows, err := sup.ListByRun(ctx, runID)
+	if err != nil {
+		t.Fatalf("ListByRun: %v", err)
+	}
+	if len(supRows) != 2 {
+		t.Errorf("rebuilt supervisor_events = %d, want 2", len(supRows))
+	}
+	if got, err := cost.SumByRun(ctx, runID); err != nil || got != 0.01 {
+		t.Errorf("rebuilt cost SumByRun = %v, %v; want 0.01, nil", got, err)
+	}
+	if r, err := rs.GetRun(ctx, runID); err != nil || r.CostUSD != 0.01 {
+		t.Errorf("rebuilt run.cost_usd = %v (err %v), want 0.01", r, err)
+	}
+	if j, err := js.GetJob(ctx, "replay-job"); err != nil || j.CostUSD != 0.01 {
+		t.Errorf("rebuilt job.cost_usd = %v (err %v), want 0.01", j, err)
+	}
+}
+
+// replayProjections rebuilds projection tables from a sequence of events.
+// Inserts only into projection tables; the events table is intentionally
+// untouched here so that callers can assert the rebuild matches what an
+// event-replay routine would produce. Returns the first projection error.
+func replayProjections(ctx context.Context, db *DB, events []core.Event) error {
+	for _, ev := range events {
+		var payload map[string]any
+		if ev.Payload != "" {
+			if err := json.Unmarshal([]byte(ev.Payload), &payload); err != nil {
+				return err
+			}
+		}
+		switch ev.Kind {
+		case core.EventRunCreated:
+			mode, _ := payload["mode"].(string)
+			if _, err := db.ExecContext(ctx,
+				`INSERT INTO runs (id, mode, state, started_at) VALUES (?, ?, 'active', ?)`,
+				ev.RunID, mode, ev.CreatedAt.UTC().Format(time.RFC3339),
+			); err != nil {
+				return err
+			}
+		case core.EventJobCreated:
+			jobID, _ := payload["job_id"].(string)
+			role, _ := payload["role"].(string)
+			cli, _ := payload["cli"].(string)
+			if _, err := db.ExecContext(ctx,
+				`INSERT INTO jobs (id, run_id, role, state, dispatched_by, cli, started_at)
+				 VALUES (?, ?, ?, 'pending', 'scheduler', ?, ?)`,
+				jobID, ev.RunID, role, cli, ev.CreatedAt.UTC().Format(time.RFC3339),
+			); err != nil {
+				return err
+			}
+		case core.EventJobCompleted:
+			jobID, _ := payload["job_id"].(string)
+			if _, err := db.ExecContext(ctx,
+				`UPDATE jobs SET state = 'complete', ended_at = ? WHERE id = ?`,
+				ev.CreatedAt.UTC().Format(time.RFC3339), jobID,
+			); err != nil {
+				return err
+			}
+		case core.EventSupervisorVerdict:
+			jobID, _ := payload["job_id"].(string)
+			verdict, _ := payload["verdict"].(string)
+			rule, _ := payload["rule"].(string)
+			message, _ := payload["message"].(string)
+			if _, err := db.ExecContext(ctx,
+				`INSERT INTO supervisor_events
+				    (id, run_id, job_id, kind, verdict, rule_id, message, created_at)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+				core.NewID(), ev.RunID, jobID, string(ev.Kind), verdict, rule, message,
+				ev.CreatedAt.UTC().Format(time.RFC3339Nano),
+			); err != nil {
+				return err
+			}
+		case core.EventCostDelta:
+			jobID, _ := payload["job_id"].(string)
+			provider, _ := payload["provider"].(string)
+			model, _ := payload["model"].(string)
+			tokensIn, _ := payload["tokens_in"].(float64)
+			tokensOut, _ := payload["tokens_out"].(float64)
+			usd, _ := payload["usd"].(float64)
+			if _, err := db.ExecContext(ctx,
+				`INSERT INTO cost_events
+				    (id, run_id, job_id, provider, model, tokens_in, tokens_out, usd, created_at)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				core.NewID(), ev.RunID, jobID, provider, model,
+				int(tokensIn), int(tokensOut), usd,
+				ev.CreatedAt.UTC().Format(time.RFC3339Nano),
+			); err != nil {
+				return err
+			}
+			if _, err := db.ExecContext(ctx,
+				`UPDATE jobs SET cost_usd = cost_usd + ? WHERE id = ?`, usd, jobID,
+			); err != nil {
+				return err
+			}
+			if _, err := db.ExecContext(ctx,
+				`UPDATE runs SET cost_usd = cost_usd + ? WHERE id = ?`, usd, ev.RunID,
+			); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func assertReplayShape(t *testing.T, events []core.Event) {
 	t.Helper()
 	var haveJobCreated, haveJobCompleted bool

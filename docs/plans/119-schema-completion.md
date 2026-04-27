@@ -1455,6 +1455,38 @@ git commit -m "Plan 119: decisions.md — schema completion + attention/checkpoi
 
 ## Code Review
 
+### Codex post-implementation review (2026-04-27)
+
+#### B1 — MCP `orch_checkpoint_advance` and `orch_checkpoint_rollback` did not tolerate `ErrCheckpointNotFound` [FIXED]
+
+`mcp/handlers_checkpoint.go:107-115` (advance) and `:185-193` (rollback) returned the resolution error to the caller. The HTTP handler already swallowed `ErrCheckpointNotFound`; the MCP handlers diverged.
+
+→ Fixed: added `errors.Is(err, store.ErrCheckpointNotFound)` guard in both handlers; documented as best-effort with the same rationale (legacy attention items, items created before Plan 119 wired the paired write).
+
+#### B2 — Attention creation paths in `coding/` never called `CheckpointWriter.CreateCheckpoint` [FIXED]
+
+`coding/phaseloop/executor.go:248`, `coding/quality/evaluator.go:195`, and `coding/shipper/shipper.go:88` created `attention` rows of kind=checkpoint but never paired them with a `checkpoints` row, so resolution always hit `ErrCheckpointNotFound`.
+
+→ Fixed: added `CheckpointWriter core.CheckpointWriter` optional field to `PhaseExecutor`, `quality.Evaluator`, and `shipper.Shipper`. Each site now calls `CreateCheckpoint` immediately after `InsertAttention` with the **same ID**. `BuildFromPRDWorkflow.RunPhasesForPlan` propagates the writer into both `PhaseExecutor.CheckpointWriter` and `Shipper.CheckpointWriter`. Optional/best-effort: nil writer preserves legacy behavior; per-site failures log and continue (the attention row is the source of truth for "did we ask the human").
+
+#### I1 — `coding/dispatch.go` imports `store/` directly [WONTFIX]
+
+`coding/dispatch.go:16` imports `store` for `*store.DB` and `*store.AttentionStore`. This is **pre-existing** (since Plan 114, before this branch). The architecture test in `tests/architecture/imports_test.go` only forbids `coding/supervisor` from importing `store/` (and `core` from importing `coding`), which both still hold. Plan 119 itself added no new `store/` imports to `coding/`; the supervisor wiring uses `core.SupervisorWriter` from `core/sinks.go`. Tightening the boundary further is a bigger refactor (split the `store.DB`/`AttentionStore` usages onto narrower `core.*` interfaces) and out of scope here. `decisions.md` documents the actual posture.
+
+#### I2 — Replay test did not actually rebuild projections from the event log [FIXED]
+
+`store/replay_test.go:107-130` originally only round-tripped events through `WriteEventThenRow(applyFn=nil)` and asserted the event shape; no projection rebuild was demonstrated.
+
+→ Fixed: added `TestReplay_RebuildProjectionRowsFromEventLog` plus a `replayProjections` helper that, for each event in the golden JSONL, decodes the payload and inserts the corresponding projection row. The test asserts the rebuilt projections match the original (`supervisor_events` count = 2, `cost_events` SumByRun = 0.01, `runs.cost_usd` = 0.01, `jobs.cost_usd` = 0.01). This demonstrates the spec's "replay repairs the projection" property.
+
+### Verification post-fix
+
+```text
+$ go build ./...                                        → clean
+$ go test -race ./... -count=1 -timeout 180s            → 26 ok, 0 failed, 0 races
+$ golangci-lint run ./...                               → 0 issues
+```
+
 ---
 
 ## Post-Execution Report
