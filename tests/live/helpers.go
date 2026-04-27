@@ -7,10 +7,13 @@ import (
 	"encoding/json"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/chris/coworker/store"
 )
 
 // requireLiveEnv skips the test unless COWORKER_LIVE=1.
@@ -50,6 +53,46 @@ func budgetUSD() float64 {
 func withTimeout(t *testing.T, d time.Duration) (context.Context, context.CancelFunc) {
 	t.Helper()
 	return context.WithTimeout(context.Background(), d)
+}
+
+// repoRootFromTest returns the absolute path of the repo root, computed
+// from tests/live/<file>_test.go (two levels up).
+func repoRootFromTest(t *testing.T) string {
+	t.Helper()
+	abs, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return abs
+}
+
+// verifyCostUnderBudget queries cost_events for the run and fails the
+// test if (a) row count < requireRows, or (b) SUM(usd) > budgetUSD().
+// requireRows=1 catches a broken parser silently writing zero rows;
+// requireRows=0 tolerates zero rows (Codex/OpenCode have no USD wired).
+func verifyCostUnderBudget(t *testing.T, db *store.DB, runID string, requireRows int) {
+	t.Helper()
+	es := store.NewEventStore(db)
+	ce := store.NewCostEventStore(db, es)
+
+	rows, err := ce.ListByRun(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("cost ListByRun: %v", err)
+	}
+	if len(rows) < requireRows {
+		t.Fatalf("cost rows = %d, want >= %d (parser may have skipped events)",
+			len(rows), requireRows)
+	}
+	sum, err := ce.SumByRun(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("cost SumByRun: %v", err)
+	}
+	budget := budgetUSD()
+	if sum > budget {
+		t.Fatalf("test cost = $%.4f exceeded budget $%.2f (rows=%d)",
+			sum, budget, len(rows))
+	}
+	t.Logf("test cost = $%.4f (rows=%d, budget $%.2f)", sum, len(rows), budget)
 }
 
 // hasJSONLine returns true if any line in s parses as a JSON object that

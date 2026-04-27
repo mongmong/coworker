@@ -13,6 +13,10 @@ import (
 // completes within the budget timeout and emits at least one stream-json
 // line on stdout. Skipped unless COWORKER_LIVE=1 and the opencode binary
 // is on PATH.
+//
+// FUTURE: budget enforcement via cost_events is not active for opencode —
+// the SSE stream this codebase consumes does not surface token or cost
+// data. See Plan 121 §Out of Scope.
 func TestLive_OpenCode_Smoke(t *testing.T) {
 	requireLiveEnv(t)
 	bin := requireBinary(t, "opencode")

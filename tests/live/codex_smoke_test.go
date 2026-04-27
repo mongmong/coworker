@@ -13,6 +13,11 @@ import (
 // within the budget timeout and emits at least one stream-json line on
 // stdout. Skipped unless COWORKER_LIVE=1 and the codex binary is on
 // PATH.
+//
+// FUTURE: budget enforcement via cost_events is not active for codex —
+// turn.completed.usage emits tokens but no USD figure. See Plan 121
+// §Out of Scope. A follow-up plan will add a per-model price table to
+// convert tokens → USD so verifyCostUnderBudget can be applied here.
 func TestLive_Codex_Smoke(t *testing.T) {
 	requireLiveEnv(t)
 	bin := requireBinary(t, "codex")

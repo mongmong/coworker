@@ -142,4 +142,39 @@ func (s *CostEventStore) ListByJob(ctx context.Context, jobID string) ([]*CostEv
 	return out, nil
 }
 
+// ListByRun lists cost events for a run, ordered chronologically.
+func (s *CostEventStore) ListByRun(ctx context.Context, runID string) ([]*CostEventRow, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, run_id, job_id, provider, model, tokens_in, tokens_out, usd, created_at
+		FROM cost_events WHERE run_id = ?
+		ORDER BY created_at ASC, id ASC`, runID)
+	if err != nil {
+		return nil, fmt.Errorf("query cost_events by run: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*CostEventRow
+	for rows.Next() {
+		e := &CostEventRow{}
+		var createdAt string
+		if err := rows.Scan(&e.ID, &e.RunID, &e.JobID, &e.Provider, &e.Model,
+			&e.TokensIn, &e.TokensOut, &e.USD, &createdAt); err != nil {
+			return nil, fmt.Errorf("scan cost_event: %w", err)
+		}
+		t, err := time.Parse(time.RFC3339Nano, createdAt)
+		if err != nil {
+			return nil, fmt.Errorf("parse cost_event.created_at: %w", err)
+		}
+		e.CreatedAt = t
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("cost_event rows error: %w", err)
+	}
+	if out == nil {
+		out = []*CostEventRow{}
+	}
+	return out, nil
+}
+
 var _ core.CostWriter = (*CostEventStore)(nil)
