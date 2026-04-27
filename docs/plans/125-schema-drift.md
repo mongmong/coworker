@@ -31,7 +31,8 @@
 | `FindingStore.ListFindings` | At `store/finding_store.go:118`. SELECT needs the three new columns + Scan into struct. |
 | `DispatchStore.EnqueueDispatch` | At `store/dispatch_store.go:26`. INSERT needs `mode` column. |
 | Existing finding-write call sites | `coding/dispatch.go::Orchestrate` at finding-persistence loop; `coding/phaseloop/fanin.go` for fan-in dedup; tests. Each must pass through PlanID/PhaseIndex/ReviewerHandle when known. |
-| Spec line 770-772 says `mode: persistent | ephemeral | in-process`. | Implementation: `EnqueueDispatch` is for the pull queue (persistent). Direct `agent.Dispatch` invocations (ephemeral) don't go through the dispatches table today. So writing `mode` only in `EnqueueDispatch` covers the persistent path; ephemeral dispatch happens entirely in-process and is recorded only via the `jobs` table + events, not `dispatches`. **Confirm this matches the spec's intent.** |
+| Spec line 770-772 says `mode: persistent | ephemeral | in-process`. | Two paths reach `EnqueueDispatch`: (a) the **DispatchRouter** at `coding/router.go:107-124` for ephemeral dispatches that go through the queue, and (b) `coding/router.go:128-146` for persistent worker handles. Mode must be set **at the router** based on which branch fires: `enqueueEphemeral` → `Mode = "ephemeral"`, `enqueue` (worker handles) → `Mode = "persistent"`. Direct `Dispatcher.Orchestrate` invocations (synchronous in-process spawn) do **not** go through `dispatches` and do not get a row — that's by design and acceptable for V1. |
+| `phaseloop.PhaseExecutor.Execute(runID, planID string, phaseIndex int, ..., inputs map[string]string)` | Fields exist (`coding/phaseloop/executor.go:129-148`) but are NOT injected into `DispatchInput.Inputs` today — they're used only for logging. Plan must inject before each dispatch call. |
 
 ---
 
@@ -47,6 +48,8 @@ In scope:
    - Indexes: `idx_findings_plan_id`, `idx_findings_run_plan` (run_id, plan_id), `idx_dispatches_mode`.
 2. `core/finding.go` — three new fields with sensible defaults; existing code that constructs `Finding{...}` without setting them continues to compile because Go zero-values them.
 3. `core/dispatch.go` — `Mode` field; constants `DispatchModePersistent`, `DispatchModeEphemeral`, `DispatchModeInProcess`.
+
+   **Phase index ambiguity:** Use `*int` (nil = unknown) for `Finding.PhaseIndex`, NOT `int`. The migration column stays `INTEGER NOT NULL DEFAULT 0` for backward compat, but the Go side distinguishes "unset" from "phase 0". On store reads: NULL/0 → nil only when both `phase_index = 0` AND `plan_id = ''` (the unknown case); otherwise → `&value`. Simpler: introduce a separate `HasPhaseIndex bool` field, OR use the existing convention of "PhaseIndex = -1 means unknown" and document. **Decision: use `*int` for the Go field; on insert, nil → 0, non-nil → value; on read, if `plan_id` is empty assume unknown and leave PhaseIndex nil.**
 4. `store/finding_store.go` — INSERT + SELECT cover the new columns. Scan into the new struct fields.
 5. `store/dispatch_store.go` — INSERT writes `mode` (default `"persistent"` if empty). Scan covers it.
 6. `coding/dispatch.go::Orchestrate` finding-persistence loop — pass `f.PlanID = ...` if plan context is available; otherwise leave empty (so existing tests still pass). The dispatcher receives plan context via `DispatchInput.Inputs["plan_id"]` / `["phase_index"]` for some roles; thread it through.
@@ -144,9 +147,10 @@ type Finding struct {
     // (interactive ad-hoc dispatch). Plan 125.
     PlanID string
 
-    // PhaseIndex is the 0-based phase index within the plan when the finding
-    // was created. Plan 125.
-    PhaseIndex int
+    // PhaseIndex is the 0-based phase index within the plan when the
+    // finding was created. Pointer because phase 0 is a real phase index;
+    // nil distinguishes "unknown / outside a plan" from phase 0. Plan 125.
+    PhaseIndex *int
 
     // ReviewerHandle identifies which reviewer role produced the finding
     // (e.g., "reviewer.arch", "reviewer.frontend"). Empty when the finding
@@ -155,6 +159,8 @@ type Finding struct {
     ReviewerHandle string
 }
 ```
+
+The DB column stays `INTEGER NOT NULL DEFAULT 0` for backward compat. On insert, `nil → 0`. On read, `phase_index = 0 AND plan_id = ''` → nil (unknown); otherwise `&value`.
 
 - [ ] **Step 2 — Extend `core.Dispatch`:**
 
@@ -243,13 +249,48 @@ git commit -m "Plan 125 Phase 3: store INSERT/SELECT for new finding + dispatch 
 
 ---
 
-## Phase 4 — Wire fields through dispatcher + phase loop
+## Phase 4 — Wire fields through dispatcher, router, phase loop
 
-**Files:** `coding/dispatch.go`, `coding/phaseloop/fanin.go`, related tests.
+**Files:** `coding/dispatch.go`, `coding/router.go`, `coding/phaseloop/executor.go`, `coding/phaseloop/fanin.go`, related tests.
 
-- [ ] **Step 1 — In `coding/dispatch.go::Orchestrate` finding-persistence loop, populate the new fields when known:**
+- [ ] **Step 1 — In `coding/router.go`, set `Mode` at the two enqueue sites:**
 
-The `DispatchInput.Inputs` map may contain `"plan_id"` and `"phase_index"` strings (the workflow passes them in for plan-driven dispatches). The dispatcher's role name is `role.Name` — that maps to `ReviewerHandle` for reviewer roles.
+```go
+// enqueueEphemeral
+ephemeral := &core.Dispatch{
+    ID:     core.NewID(),
+    RunID:  template.RunID,
+    Role:   template.Role,
+    JobID:  template.JobID,
+    Prompt: template.Prompt,
+    Inputs: template.Inputs,
+    Mode:   core.DispatchModeEphemeral,
+}
+
+// enqueue (per-worker)
+d := &core.Dispatch{
+    ID:           core.NewID(),
+    // ...
+    WorkerHandle: w.Handle,
+    Mode:         core.DispatchModePersistent,
+}
+```
+
+- [ ] **Step 2 — In `coding/phaseloop/executor.go`, inject plan_id and phase_index into `inputs` before passing to dispatcher:**
+
+In `Execute`, after `devInputs := copyInputs(inputs)`:
+
+```go
+// Inject plan/phase context so finding rows can be attributed
+// to a specific (plan, phase) — closes BLOCKER B3 from the
+// 2026-04-27 audit. Plan 125.
+devInputs["plan_id"] = strconv.Itoa(planID)
+devInputs["phase_index"] = strconv.Itoa(phaseIndex)
+```
+
+Same in `runLoop`'s reviewer/tester `inputs` propagation — the original `inputs` map is shared across roles; mutate it once at the top of `Execute`.
+
+- [ ] **Step 3 — In `coding/dispatch.go::Orchestrate` finding-persistence loop, populate the new fields when present in inputs:**
 
 ```go
 for i := range lastResult.Findings {
@@ -259,15 +300,13 @@ for i := range lastResult.Findings {
     if f.ID == "" {
         f.ID = core.NewID()
     }
-    // Populate new spec fields from dispatch context. Best-effort —
-    // missing inputs leave the fields empty (acceptable per migration
-    // defaults). Plan 125.
+    // Populate spec fields from dispatch context. Plan 125.
     if v, ok := input.Inputs["plan_id"]; ok {
         f.PlanID = v
     }
     if v, ok := input.Inputs["phase_index"]; ok {
         if n, err := strconv.Atoi(v); err == nil {
-            f.PhaseIndex = n
+            f.PhaseIndex = &n
         }
     }
     if strings.HasPrefix(role.Name, "reviewer.") {
@@ -277,24 +316,24 @@ for i := range lastResult.Findings {
 }
 ```
 
-- [ ] **Step 2 — In `coding/phaseloop/fanin.go`, ensure deduplication preserves the new fields.** Re-read fanin.go before editing to verify the existing dedup loop preserves all `Finding` fields (likely it copies the whole struct, so no change needed). If it constructs a new struct from scratch, propagate.
+- [ ] **Step 4 — `coding/phaseloop/fanin.go`** preserves all Finding fields automatically (it copies the struct); verify by reading the file. No change expected.
 
-- [ ] **Step 3 — Existing tests should still pass.** New test in `coding/dispatch_test.go`:
+- [ ] **Step 5 — Tests:**
 
-```go
-func TestOrchestrate_PopulatesPlanFieldsOnFindings(t *testing.T) {
-    // Reuse the makeMockDispatcher pattern. Pass plan_id/phase_index/spec_path
-    // in DispatchInput.Inputs. After Orchestrate, query the findings store
-    // and assert the new fields are populated.
-}
-```
+`coding/dispatch_test.go`:
+- `TestOrchestrate_PopulatesPlanFieldsOnFindings` — pass `plan_id="100"`, `phase_index="2"` in inputs; assert findings have those fields.
+- `TestOrchestrate_ReviewerHandleSetForReviewerRoles` — dispatch reviewer.arch; assert `f.ReviewerHandle == "reviewer.arch"`.
 
-- [ ] **Step 4 — Commit:**
+`coding/router_test.go`:
+- `TestRouter_EphemeralSetsMode` — enqueue via `enqueueEphemeral`; query the dispatches row; assert Mode=`ephemeral`.
+- `TestRouter_PersistentSetsMode` — enqueue with workers; assert each row Mode=`persistent`.
+
+- [ ] **Step 6 — Commit:**
 
 ```bash
 go test -race ./coding -count=1
-git add coding/dispatch.go coding/dispatch_test.go coding/phaseloop/
-git commit -m "Plan 125 Phase 4: populate finding plan_id/phase_index/reviewer_handle"
+git add coding/dispatch.go coding/dispatch_test.go coding/router.go coding/router_test.go coding/phaseloop/
+git commit -m "Plan 125 Phase 4: inject plan/phase into inputs; set dispatch.Mode at router"
 ```
 
 ---
