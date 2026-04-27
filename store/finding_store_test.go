@@ -291,3 +291,70 @@ func TestListFindings_Empty(t *testing.T) {
 		t.Errorf("expected 0 findings, got %d", len(findings))
 	}
 }
+
+// TestFindingStore_NewSpecFieldsRoundTrip verifies plan_id/phase_index/
+// reviewer_handle round-trip through Insert + List. Plan 125 (B3).
+func TestFindingStore_NewSpecFieldsRoundTrip(t *testing.T) {
+	_, _, _, _, fs := setupFindingTestDB(t)
+	ctx := context.Background()
+	pi := 2
+	finding := &core.Finding{
+		ID:             "find_drift_1",
+		RunID:          "run_f1",
+		JobID:          "job_f1",
+		Path:           "main.go",
+		Line:           42,
+		Severity:       core.SeverityImportant,
+		Body:           "test",
+		PlanID:         "100",
+		PhaseIndex:     &pi,
+		ReviewerHandle: "reviewer.arch",
+	}
+	if err := fs.InsertFinding(ctx, finding); err != nil {
+		t.Fatalf("InsertFinding: %v", err)
+	}
+	got, err := fs.ListFindings(ctx, "run_f1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d findings, want 1", len(got))
+	}
+	if got[0].PlanID != "100" {
+		t.Errorf("PlanID = %q, want 100", got[0].PlanID)
+	}
+	if got[0].PhaseIndex == nil || *got[0].PhaseIndex != 2 {
+		t.Errorf("PhaseIndex = %v, want 2", got[0].PhaseIndex)
+	}
+	if got[0].ReviewerHandle != "reviewer.arch" {
+		t.Errorf("ReviewerHandle = %q, want reviewer.arch", got[0].ReviewerHandle)
+	}
+}
+
+// TestFindingStore_UnknownPhaseIndexStaysNil verifies that a finding
+// inserted without plan/phase context is read back with PhaseIndex=nil
+// (so phase 0 vs unknown is unambiguous). Plan 125 (B3).
+func TestFindingStore_UnknownPhaseIndexStaysNil(t *testing.T) {
+	_, _, _, _, fs := setupFindingTestDB(t)
+	ctx := context.Background()
+	finding := &core.Finding{
+		ID:       "find_unknown",
+		RunID:    "run_f1",
+		JobID:    "job_f1",
+		Path:     "x.go",
+		Line:     1,
+		Severity: core.SeverityMinor,
+		Body:     "x",
+		// No PlanID, no PhaseIndex set.
+	}
+	if err := fs.InsertFinding(ctx, finding); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := fs.ListFindings(ctx, "run_f1")
+	if got[0].PhaseIndex != nil {
+		t.Errorf("PhaseIndex = %v, want nil for unknown-phase finding", *got[0].PhaseIndex)
+	}
+	if got[0].PlanID != "" {
+		t.Errorf("PlanID = %q, want empty", got[0].PlanID)
+	}
+}

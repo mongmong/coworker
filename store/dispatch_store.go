@@ -57,11 +57,16 @@ func (s *DispatchStore) EnqueueDispatch(ctx context.Context, d *core.Dispatch) e
 		CreatedAt:     d.CreatedAt,
 	}
 
+	mode := d.Mode
+	if mode == "" {
+		mode = core.DispatchModePersistent
+	}
+
 	return s.event.WriteEventThenRow(ctx, event, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx,
 			`INSERT INTO dispatches
-				(id, run_id, role, job_id, prompt, inputs, state, worker_handle, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				(id, run_id, role, job_id, prompt, inputs, state, worker_handle, created_at, mode)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			d.ID, d.RunID, d.Role,
 			nullableString(d.JobID),
 			nullableString(d.Prompt),
@@ -69,6 +74,7 @@ func (s *DispatchStore) EnqueueDispatch(ctx context.Context, d *core.Dispatch) e
 			string(d.State),
 			nullableString(d.WorkerHandle),
 			d.CreatedAt.UTC().Format("2006-01-02T15:04:05Z"),
+			mode,
 		)
 		return err
 	})
@@ -114,7 +120,7 @@ func (s *DispatchStore) ClaimNextDispatch(ctx context.Context, role, handle stri
 	if handle != "" {
 		// Registered worker: eligible for dispatches targeted to it OR NULL-handle ones.
 		scanErr = tx.QueryRowContext(ctx,
-			`SELECT id, run_id, role, job_id, prompt, inputs, state, worker_handle, created_at
+			`SELECT id, run_id, role, job_id, prompt, inputs, state, worker_handle, created_at, mode
 			FROM dispatches
 			WHERE state = 'pending' AND role = ?
 			  AND (worker_handle = ? OR worker_handle IS NULL)
@@ -124,12 +130,12 @@ func (s *DispatchStore) ClaimNextDispatch(ctx context.Context, role, handle stri
 		).Scan(
 			&d.ID, &d.RunID, &d.Role, &jobID, &prompt,
 			&inputsJSON, &d.State, &workerHandle,
-			&createdAtStr,
+			&createdAtStr, &d.Mode,
 		)
 	} else {
 		// Ephemeral caller: only eligible for NULL-handle dispatches.
 		scanErr = tx.QueryRowContext(ctx,
-			`SELECT id, run_id, role, job_id, prompt, inputs, state, worker_handle, created_at
+			`SELECT id, run_id, role, job_id, prompt, inputs, state, worker_handle, created_at, mode
 			FROM dispatches
 			WHERE state = 'pending' AND role = ?
 			  AND worker_handle IS NULL
@@ -139,7 +145,7 @@ func (s *DispatchStore) ClaimNextDispatch(ctx context.Context, role, handle stri
 		).Scan(
 			&d.ID, &d.RunID, &d.Role, &jobID, &prompt,
 			&inputsJSON, &d.State, &workerHandle,
-			&createdAtStr,
+			&createdAtStr, &d.Mode,
 		)
 	}
 
@@ -464,13 +470,13 @@ func (s *DispatchStore) GetDispatch(ctx context.Context, id string) (*core.Dispa
 
 	err := s.db.QueryRowContext(ctx,
 		`SELECT id, run_id, role, job_id, prompt, inputs, state, worker_handle,
-			leased_at, completed_at, created_at
+			leased_at, completed_at, created_at, mode
 		FROM dispatches WHERE id = ?`,
 		id,
 	).Scan(
 		&d.ID, &d.RunID, &d.Role, &jobID, &prompt,
 		&inputsJSON, &d.State, &workerHandle,
-		&leasedAt, &completedAt, &createdAtStr,
+		&leasedAt, &completedAt, &createdAtStr, &d.Mode,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil

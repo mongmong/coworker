@@ -454,3 +454,52 @@ func TestFullLeaseCycle(t *testing.T) {
 		t.Errorf("final state = %q, want completed", final.State)
 	}
 }
+
+// TestDispatchStore_ModeDefaultPersistent verifies that a Dispatch
+// inserted without an explicit Mode is read back with Mode="persistent"
+// (the default for the pull queue). Plan 125 (B4).
+func TestDispatchStore_ModeDefaultPersistent(t *testing.T) {
+	db := setupTestDB(t)
+	es := NewEventStore(db)
+	rs := NewRunStore(db, es)
+	ds := NewDispatchStore(db, es)
+	ctx := context.Background()
+	createTestRun(t, rs, ctx, "run_dm1")
+
+	d := newTestDispatch("run_dm1", "developer")
+	// Mode intentionally left empty.
+	if err := ds.EnqueueDispatch(ctx, d); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ds.GetDispatch(ctx, d.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Mode != core.DispatchModePersistent {
+		t.Errorf("Mode = %q, want %q", got.Mode, core.DispatchModePersistent)
+	}
+}
+
+// TestDispatchStore_ModeRoundTripEphemeral verifies that an explicit
+// ephemeral Mode round-trips. Plan 125 (B4).
+func TestDispatchStore_ModeRoundTripEphemeral(t *testing.T) {
+	db := setupTestDB(t)
+	es := NewEventStore(db)
+	rs := NewRunStore(db, es)
+	ds := NewDispatchStore(db, es)
+	ctx := context.Background()
+	createTestRun(t, rs, ctx, "run_dm2")
+
+	d := newTestDispatch("run_dm2", "developer")
+	d.Mode = core.DispatchModeEphemeral
+	if err := ds.EnqueueDispatch(ctx, d); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ds.GetDispatch(ctx, d.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Mode != core.DispatchModeEphemeral {
+		t.Errorf("Mode = %q, want %q", got.Mode, core.DispatchModeEphemeral)
+	}
+}

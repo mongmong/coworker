@@ -305,6 +305,62 @@ func TestDispatchRouter_EphemeralDispatchNullHandle(t *testing.T) {
 	}
 }
 
+// TestDispatchRouter_EphemeralSetsModeEphemeral verifies that ephemeral
+// router enqueues record dispatches.mode = "ephemeral". Plan 125 (B4).
+func TestDispatchRouter_EphemeralSetsModeEphemeral(t *testing.T) {
+	db := openRouterTestDB(t)
+	_, rs, ws, ds := newRouterStores(t, db)
+	createRouterRun(t, rs, "run_r_em")
+	router := newRouter(ws, ds)
+	tmpl := newTemplateDispatch("run_r_em", "coder.impl")
+
+	result, err := router.Route(context.Background(), tmpl, "single")
+	if err != nil {
+		t.Fatalf("Route: %v", err)
+	}
+	d, err := ds.GetDispatch(context.Background(), result.DispatchIDs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Mode != core.DispatchModeEphemeral {
+		t.Errorf("Mode = %q, want %q", d.Mode, core.DispatchModeEphemeral)
+	}
+}
+
+// TestDispatchRouter_PersistentSetsModePersistent verifies that worker-
+// targeted router enqueues record dispatches.mode = "persistent".
+// Plan 125 (B4).
+func TestDispatchRouter_PersistentSetsModePersistent(t *testing.T) {
+	db := openRouterTestDB(t)
+	_, rs, ws, ds := newRouterStores(t, db)
+	createRouterRun(t, rs, "run_r_pm")
+
+	// Register one live worker for the role.
+	if err := ws.Register(context.Background(), &core.Worker{
+		Handle: "coder-1", Role: "coder.impl", CLI: "claude-code", State: core.WorkerStateLive,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	router := newRouter(ws, ds)
+	tmpl := newTemplateDispatch("run_r_pm", "coder.impl")
+
+	result, err := router.Route(context.Background(), tmpl, "single")
+	if err != nil {
+		t.Fatalf("Route: %v", err)
+	}
+	if result.Mode != coding.RouteModeWorker {
+		t.Fatalf("RouteMode = %q, want worker", result.Mode)
+	}
+	d, err := ds.GetDispatch(context.Background(), result.DispatchIDs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Mode != core.DispatchModePersistent {
+		t.Errorf("Mode = %q, want %q", d.Mode, core.DispatchModePersistent)
+	}
+}
+
 // ---- unknown concurrency ------------------------------------------------------
 
 func TestDispatchRouter_UnknownConcurrency_ReturnsError(t *testing.T) {

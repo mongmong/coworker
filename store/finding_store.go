@@ -52,13 +52,21 @@ func (s *FindingStore) InsertFinding(ctx context.Context, finding *core.Finding)
 		CreatedAt:     time.Now(),
 	}
 
+	phaseIdx := 0
+	if finding.PhaseIndex != nil {
+		phaseIdx = *finding.PhaseIndex
+	}
+
 	return s.event.WriteEventThenRow(ctx, event, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx,
-			`INSERT INTO findings (id, run_id, job_id, path, line, severity, body, fingerprint)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			`INSERT INTO findings
+				(id, run_id, job_id, path, line, severity, body, fingerprint,
+				 plan_id, phase_index, reviewer_handle)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			finding.ID, finding.RunID, finding.JobID,
 			finding.Path, finding.Line, string(finding.Severity),
 			finding.Body, finding.Fingerprint,
+			finding.PlanID, phaseIdx, finding.ReviewerHandle,
 		)
 		return err
 	})
@@ -118,7 +126,8 @@ func (s *FindingStore) ResolveFinding(ctx context.Context, findingID, resolvedBy
 func (s *FindingStore) ListFindings(ctx context.Context, runID string) ([]core.Finding, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, run_id, job_id, path, line, severity, body, fingerprint,
-			COALESCE(resolved_by_job_id, ''), resolved_at
+			COALESCE(resolved_by_job_id, ''), resolved_at,
+			plan_id, phase_index, reviewer_handle
 		FROM findings WHERE run_id = ? ORDER BY path, line`,
 		runID,
 	)
@@ -132,10 +141,12 @@ func (s *FindingStore) ListFindings(ctx context.Context, runID string) ([]core.F
 		var f core.Finding
 		var severityStr string
 		var resolvedAtStr sql.NullString
+		var phaseIdx int
 		err := rows.Scan(
 			&f.ID, &f.RunID, &f.JobID, &f.Path, &f.Line,
 			&severityStr, &f.Body, &f.Fingerprint,
 			&f.ResolvedByJobID, &resolvedAtStr,
+			&f.PlanID, &phaseIdx, &f.ReviewerHandle,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("scan finding: %w", err)
@@ -144,6 +155,12 @@ func (s *FindingStore) ListFindings(ctx context.Context, runID string) ([]core.F
 		if resolvedAtStr.Valid {
 			t, _ := time.Parse("2006-01-02T15:04:05Z", resolvedAtStr.String)
 			f.ResolvedAt = &t
+		}
+		// PhaseIndex is *int: nil for "unknown" rows (no plan_id either),
+		// pointer-to-value when the plan/phase context was recorded.
+		if f.PlanID != "" || phaseIdx != 0 {
+			pi := phaseIdx
+			f.PhaseIndex = &pi
 		}
 		findings = append(findings, f)
 	}
