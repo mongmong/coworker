@@ -761,13 +761,14 @@ func buildRunDispatcher(db *store.DB, policy *core.Policy, logger *slog.Logger) 
 	}
 
 	d := &coding.Dispatcher{
-		RoleDir:   roleDir,
-		PromptDir: promptDir,
-		Agent:     newAgentWithDir(agentBinary),
-		CLIAgents: cliAgents,
-		DB:        db,
-		Logger:    logger,
-		Policy:    policy,
+		RoleDir:          roleDir,
+		PromptDir:        promptDir,
+		Agent:            newAgentWithDir(agentBinary),
+		CLIAgents:        cliAgents,
+		DB:               db,
+		Logger:           logger,
+		Policy:           policy,
+		SupervisorWriter: store.NewSupervisorEventStore(db, store.NewEventStore(db)),
 	}
 	return d, nil
 }

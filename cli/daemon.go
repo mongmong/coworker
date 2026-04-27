@@ -247,12 +247,13 @@ func buildDaemonDispatcher(db *store.DB, roleDir, promptDir, cliBinary, claudeBi
 	}
 
 	d := &coding.Dispatcher{
-		RoleDir:   roleDir,
-		PromptDir: promptDir,
-		Agent:     newAgentWithDir(cliBinary),
-		CLIAgents: cliAgents,
-		DB:        db,
-		Logger:    logger,
+		RoleDir:          roleDir,
+		PromptDir:        promptDir,
+		Agent:            newAgentWithDir(cliBinary),
+		CLIAgents:        cliAgents,
+		DB:               db,
+		Logger:           logger,
+		SupervisorWriter: store.NewSupervisorEventStore(db, store.NewEventStore(db)),
 	}
 	return d, nil
 }
