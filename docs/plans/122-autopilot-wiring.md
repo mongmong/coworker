@@ -5,12 +5,13 @@
 **Goal:** Make `coworker run <prd.md>` actually execute plan phases end-to-end. Today the post-spec-approved code path (`cli/run.go:503-511`) constructs `BuildFromPRDWorkflow` without `PhaseExecutor`, `Shipper`, or `StageRegistry`, so `RunPhasesForPlan` errors immediately at `coding/workflow/build_from_prd.go:223`. This is the V1 ship-readiness audit's only `[BLOCKER]` flagged by both audit lanes.
 
 **Architecture:**
-- Add a single helper `buildPhaseRunner(ctx, runID, db, policy, attentionStore, checkpointWriter, eventStore, logger)` in `cli/run.go` that returns a fully-wired `*workflow.BuildFromPRDWorkflow`.
-- The helper constructs: a phase-execution Dispatcher (separate from the planner Dispatcher to avoid reusing one Dispatcher across roles with different role dirs), a `PhaseExecutor` wired to that Dispatcher + EventStore + AttentionStore + CheckpointWriter, a `Shipper` wired to AttentionStore + EventStore + ArtifactStore + JobStore + CheckpointWriter, and a default `StageRegistry`.
+- Add a single helper `buildPhaseRunner(manifestPath, db, policy, attentionStore, checkpointWriter, eventStore, logger)` in `cli/run.go` that returns a fully-wired `*workflow.BuildFromPRDWorkflow`.
+- The helper constructs: ONE phase-execution Dispatcher (the planner and phase paths can share one — the role dir resolution is identical, so a separate dispatcher would be wasteful), a `PhaseExecutor` wired to that Dispatcher + EventStore + AttentionStore + CheckpointWriter, a `Shipper` (only when `--no-ship` is NOT set) wired to AttentionStore + EventStore + ArtifactStore + JobStore + CheckpointWriter, and a `StageRegistry` constructed via `stages.NewStageRegistry(stages.WorkflowBuildFromPRD, stages.DefaultStages, policy)` so policy.workflow_overrides are honored at construction time.
+- The helper takes `manifestPath` as a parameter (resume paths reconstruct it from events at `cli/run.go:375-386`; the global `runManifestPath` is only set when `--manifest` bypass is used).
 - Replace the partially-wired struct literal at line 503-511 with a call to the new helper.
-- Two integration tests:
-  1. `TestRun_PostApproved_DispatchesPhases` — given an approved spec + plan, the runner reaches `RunPhasesForPlan` without the "PhaseExecutor is required" error.
-  2. `TestRun_PostApproved_RunsToShip` — full happy path with stub agents; phases complete clean; shipper runs in dry-run; PR URL recorded.
+- Two tests:
+  1. `TestBuildPhaseRunner_Wiring` — calls `buildPhaseRunner` with in-memory stores; asserts non-nil PhaseExecutor, Shipper (when `runNoShip=false`), nil Shipper (when `runNoShip=true`), StageRegistry, PlanWriter, CheckpointWriter.
+  2. `TestRun_PostApproved_RunsToShip` — full happy path via `deps.Runner` injection (existing test pattern from `cli/run_test.go:1071`); custom Runner uses an inlined stubOrchestrator-backed PhaseExecutor + `Shipper{DryRun: true}`; asserts phases complete + ShipResult.PRURL non-empty.
 
 **Tech Stack:** No new dependencies. Reuses existing types from `coding/`, `coding/phaseloop`, `coding/shipper`, `coding/stages`, `store/`.
 
@@ -25,7 +26,10 @@
 | `phaseloop.PhaseExecutor` fields | `Dispatcher Orchestrator`, `EventStore *store.EventStore`, `AttentionStore *store.AttentionStore`, `CheckpointWriter core.CheckpointWriter`, `Policy *core.Policy`, `ReviewerRoles []string`, `TesterRoles []string`, `WorkDir`, `RoleDir`, `Logger` (`coding/phaseloop/executor.go:39-87`). |
 | `phaseloop.Orchestrator` interface | `Orchestrate(ctx context.Context, input *coding.DispatchInput) (*coding.DispatchResult, error)` — satisfied by `*coding.Dispatcher`. |
 | `shipper.Shipper` fields | `AttentionStore`, `CheckpointWriter`, `EventStore`, `ArtifactStore`, `JobStore`, `Logger`, `DryRun` (`coding/shipper/shipper.go:24-47`). |
-| `stages.StageRegistry` constructor | Check `coding/stages/registry.go` for the production constructor; defaults are pulled from `coding/stages/defaults.go`. |
+| `stages.StageRegistry` constructor | `func NewStageRegistry(workflow string, defaults map[string][]string, policy *core.Policy) *StageRegistry` (`coding/stages/registry.go:37`). Overrides applied INSIDE the constructor — there is no separate `ApplyOverrides` method. Use `stages.WorkflowBuildFromPRD` and `stages.DefaultStages` from `coding/stages/defaults.go`. |
+| `--no-ship` and `--dry-run` flags | Already exist as `runNoShip` and `runDryRun` package globals at `cli/run.go:27-28`. Bound to `--no-ship` and `--dry-run` flags at `cli/run.go:73`. **Do not add a new `--shipper-dry-run` flag.** |
+| `runManifestPath` global | Set only by `--manifest` bypass at `cli/run.go:75`. Resume paths derive `manifestPath` from events at `cli/run.go:375-386` and pass it as a function argument. The helper must take `manifestPath` as a parameter and use it. |
+| `saveAndRestoreRunFlags` | At `cli/run_test.go:38-70`. Already covers all run flags. No changes needed if we don't add new flags. |
 | `manifest.WorktreeManager` | Optional; required only when `max_parallel_plans > 1`. V1 stays sequential, so nil is fine for now. |
 | `buildRunDispatcher(db, policy, logger)` returns `*coding.Dispatcher` | Already wires Agent + CLIAgents + DB + Logger + Policy + SupervisorWriter + CostWriter (`cli/run.go:760-783`). |
 
@@ -77,15 +81,12 @@ Out of scope:
 
 ```go
 // buildPhaseRunner constructs a fully-wired BuildFromPRDWorkflow ready to
-// execute plan phases. The runner has its own phase-execution Dispatcher
-// (not the planner Dispatcher) so role/prompt directories, agent maps,
-// and supervisor wiring stay independent.
-//
-// Returns the runner and any error from sub-component construction. Callers
-// must close any owned subprocess resources via run termination.
+// execute plan phases. Reuses one Dispatcher (the planner and phase
+// pipelines share role dir resolution; a separate dispatcher would be
+// wasteful). Shipper is omitted when --no-ship is set; otherwise it is
+// constructed with --dry-run honored.
 func buildPhaseRunner(
-	ctx context.Context,
-	runID string,
+	manifestPath string,
 	db *store.DB,
 	policy *core.Policy,
 	attentionStore *store.AttentionStore,
@@ -102,16 +103,13 @@ func buildPhaseRunner(
 		}
 	}
 
-	// Phase-execution dispatcher — separate from the planner dispatcher so
-	// the two can have independent role configs (planner runs alone; phase
-	// dispatcher routes developer/reviewer/tester roles via CLIAgents map).
-	phaseDispatcher, err := buildRunDispatcher(db, policy, logger)
+	dispatcher, err := buildRunDispatcher(db, policy, logger)
 	if err != nil {
 		return nil, fmt.Errorf("build phase dispatcher: %w", err)
 	}
 
 	phaseExec := &phaseloop.PhaseExecutor{
-		Dispatcher:       phaseDispatcher,
+		Dispatcher:       dispatcher,
 		EventStore:       eventStore,
 		AttentionStore:   attentionStore,
 		CheckpointWriter: checkpointWriter,
@@ -121,25 +119,21 @@ func buildPhaseRunner(
 		Logger:           logger,
 	}
 
-	jobStore := store.NewJobStore(db, eventStore)
-	artifactStore := store.NewArtifactStore(db, eventStore)
-
-	ship := &shipper.Shipper{
-		AttentionStore:   attentionStore,
-		CheckpointWriter: checkpointWriter,
-		EventStore:       eventStore,
-		ArtifactStore:    artifactStore,
-		JobStore:         jobStore,
-		Logger:           logger,
-		DryRun:           runShipperDryRun, // see flag wiring below
+	var ship *shipper.Shipper
+	if !runNoShip {
+		ship = &shipper.Shipper{
+			AttentionStore:   attentionStore,
+			CheckpointWriter: checkpointWriter,
+			EventStore:       eventStore,
+			ArtifactStore:    store.NewArtifactStore(db, eventStore),
+			JobStore:         store.NewJobStore(db, eventStore),
+			Logger:           logger,
+			DryRun:           runDryRun,
+		}
 	}
 
-	registry := stages.NewStageRegistry()
-	if policy != nil {
-		registry.ApplyOverrides(policy)
-	}
+	registry := stages.NewStageRegistry(stages.WorkflowBuildFromPRD, stages.DefaultStages, policy)
 
-	manifestPath := runManifestPath
 	runner := &workflow.BuildFromPRDWorkflow{
 		ManifestPath:     manifestPath,
 		Policy:           policy,
@@ -156,32 +150,31 @@ func buildPhaseRunner(
 }
 ```
 
-- [ ] **Step 3 — Resolve any unknown identifiers** (`stages.NewStageRegistry`, `registry.ApplyOverrides`, `runShipperDryRun`, `runManifestPath`):
-  - **`stages.NewStageRegistry`** — read `coding/stages/registry.go` to confirm exact constructor name. If named differently, adapt.
-  - **`registry.ApplyOverrides`** — verify this method exists; if it has a different name, adapt or use the exact API.
-  - **`runShipperDryRun`** — add a top-level `var runShipperDryRun bool` and a flag binding `runCmd.Flags().BoolVar(&runShipperDryRun, "shipper-dry-run", false, "skip real gh pr create; record a dry-run URL")`. Default false (production uses real gh).
-  - **`runManifestPath`** — already exists or available as a function-scoped variable; keep the parameter shape close to the existing wiring at line 503-511.
+Note on `WorktreeManager`: deliberately left nil. Per `coding/workflow/build_from_prd.go:131-149`, the manager is only consulted when `max_parallel_plans > 1`. The post-resume loop currently serializes plans (`ready[0]`-style). Parallel plan execution + worktree creation is a separate plan when needed.
 
-- [ ] **Step 4 — Replace the partially-wired struct at `cli/run.go:503-511`:**
+- [ ] **Step 3 — Replace the partially-wired struct at `cli/run.go:503-511` with a call to the helper:**
 
 ```go
-runner, err := buildPhaseRunner(
-    ctx, runID, db, policy, attentionStore, checkpointWriter, eventStore, logger,
+runnerImpl, runnerErr := buildPhaseRunner(
+    manifestPath, db, policy, attentionStore, checkpointWriter, eventStore, logger,
 )
-if err != nil {
-    return fmt.Errorf("build phase runner: %w", err)
+if runnerErr != nil {
+    return fmt.Errorf("build phase runner: %w", runnerErr)
 }
+runner = runnerImpl
 ```
 
-- [ ] **Step 5 — Verify build:**
+(Note: `manifestPath` here is the LOCAL function-scoped argument that was already in scope at line 503 — derived from events on resume paths; passed in directly elsewhere. Do NOT use the global `runManifestPath`.)
+
+- [ ] **Step 4 — Verify build:**
 
 ```bash
 go build ./...
 ```
 
-Expected: clean. If `stages.NewStageRegistry` or `registry.ApplyOverrides` don't exist with those names, fix the snippet to match reality.
+Expected: clean.
 
-- [ ] **Step 6 — Run existing tests:**
+- [ ] **Step 5 — Run existing tests:**
 
 ```bash
 go test -race ./cli ./coding/workflow ./coding/phaseloop -count=1 -timeout 60s
@@ -189,7 +182,7 @@ go test -race ./cli ./coding/workflow ./coding/phaseloop -count=1 -timeout 60s
 
 Expected: PASS — the existing tests use stubs and don't touch the production wiring.
 
-- [ ] **Step 7 — Commit:**
+- [ ] **Step 6 — Commit:**
 
 ```bash
 git add cli/run.go
@@ -205,37 +198,85 @@ git commit -m "Plan 122 Phase 1: buildPhaseRunner — fully-wired BuildFromPRDWo
 
 - [ ] **Step 1 — Read existing `cli/run_test.go`** to find similar tests and reuse helpers (e.g., test DB, policy, dispatcher stubs).
 
-- [ ] **Step 2 — Add `TestRun_PostApproved_DispatchesPhases`:**
-
-This test verifies that the post-spec-approved attention path constructs a runner that can call `RunPhasesForPlan` without the "PhaseExecutor is required" error. Since the audit's BLOCKER claim is about this specific assertion, the simplest test is:
+- [ ] **Step 2 — Add `TestBuildPhaseRunner_Wiring`:**
 
 ```go
-func TestRun_PostApproved_BuildsRunnerWithPhaseExecutor(t *testing.T) {
-    // ... wire up an in-memory DB, EventStore, AttentionStore, CheckpointWriter ...
-    runner, err := buildPhaseRunner(
-        context.Background(),
-        "test-run-1",
-        db,
-        nil, // policy — nil OK for default behavior
-        attentionStore,
-        checkpointStore,
-        eventStore,
-        slog.Default(),
-    )
+func TestBuildPhaseRunner_Wiring(t *testing.T) {
+    saveAndRestoreRunFlags(t)
+    db, err := store.Open(":memory:")
+    if err != nil {
+        t.Fatal(err)
+    }
+    defer db.Close()
+    es := store.NewEventStore(db)
+    as := store.NewAttentionStore(db, es)
+    cs := store.NewCheckpointStore(db, es)
+
+    // With Shipper enabled (default).
+    runner, err := buildPhaseRunner("test-manifest.yaml", db, nil, as, cs, es, slog.Default())
     if err != nil {
         t.Fatalf("buildPhaseRunner: %v", err)
     }
     if runner.PhaseExecutor == nil {
-        t.Fatal("PhaseExecutor is nil; runner not fully wired")
+        t.Error("PhaseExecutor is nil")
     }
     if runner.Shipper == nil {
-        t.Fatal("Shipper is nil; runner not fully wired")
+        t.Error("Shipper is nil; expected non-nil with runNoShip=false")
     }
     if runner.StageRegistry == nil {
-        t.Fatal("StageRegistry is nil; runner not fully wired")
+        t.Error("StageRegistry is nil")
     }
-    // RunPhasesForPlan still requires real role files / Agent, so we don't
-    // call it here — the structural wiring is what this test guards.
+    if runner.PlanWriter == nil || runner.CheckpointWriter == nil {
+        t.Error("PlanWriter or CheckpointWriter is nil")
+    }
+    if runner.ManifestPath != "test-manifest.yaml" {
+        t.Errorf("ManifestPath = %q, want %q", runner.ManifestPath, "test-manifest.yaml")
+    }
+}
+
+func TestBuildPhaseRunner_NoShipFlag(t *testing.T) {
+    saveAndRestoreRunFlags(t)
+    runNoShip = true
+    db, err := store.Open(":memory:")
+    if err != nil {
+        t.Fatal(err)
+    }
+    defer db.Close()
+    es := store.NewEventStore(db)
+    as := store.NewAttentionStore(db, es)
+    cs := store.NewCheckpointStore(db, es)
+
+    runner, err := buildPhaseRunner("m.yaml", db, nil, as, cs, es, slog.Default())
+    if err != nil {
+        t.Fatalf("buildPhaseRunner: %v", err)
+    }
+    if runner.Shipper != nil {
+        t.Error("Shipper expected nil when runNoShip=true")
+    }
+    if runner.PhaseExecutor == nil {
+        t.Error("PhaseExecutor must still be wired even with --no-ship")
+    }
+}
+
+func TestBuildPhaseRunner_DryRunPropagatesToShipper(t *testing.T) {
+    saveAndRestoreRunFlags(t)
+    runDryRun = true
+    db, err := store.Open(":memory:")
+    if err != nil {
+        t.Fatal(err)
+    }
+    defer db.Close()
+    es := store.NewEventStore(db)
+    as := store.NewAttentionStore(db, es)
+    cs := store.NewCheckpointStore(db, es)
+
+    runner, err := buildPhaseRunner("m.yaml", db, nil, as, cs, es, slog.Default())
+    if err != nil {
+        t.Fatal(err)
+    }
+    if runner.Shipper == nil || !runner.Shipper.DryRun {
+        t.Errorf("Shipper.DryRun = %v, want true (runDryRun was set)", runner.Shipper)
+    }
 }
 ```
 
