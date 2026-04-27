@@ -2,12 +2,12 @@
 
 > **For agentic workers:** Implemented inline phase-by-phase, commit each phase, run the full suite before merging.
 
-**Goal:** Wire token/cost capture into the dispatch pipeline so a `cost_events` row is written for every job that produces cost-bearing output. Use the captured rows to enforce per-test budgets in live smoke tests. Scope is intentionally narrow: Claude Code's stream-json `result` event provides `total_cost_usd` directly; Codex emits tokens-only (`turn.completed.usage`) and OpenCode HTTP currently exposes no cost — both are deferred to a follow-up plan with explicit `[FUTURE]` markers in the code.
+**Goal:** Wire token/cost capture into the dispatch pipeline so a `cost_events` row is written for **every attempt** of a job that produces cost-bearing output (retries are recorded separately so total run cost is accurate). Use the captured rows to enforce per-test budgets in live smoke tests. Scope is intentionally narrow: Claude Code's stream-json `result` event provides `total_cost_usd` directly; Codex emits tokens-only (`turn.completed.usage`, cumulative-per-session — last-event-wins) and OpenCode HTTP currently exposes no cost — both have explicit `[FUTURE]` markers and `tests/live/{codex,opencode}_smoke_test.go` documents that budget enforcement is not active for them.
 
 **Architecture:**
-- Extend `core.JobResult` with an optional `Cost *core.CostSample`. `CliAgent.Wait` parses the additional event kinds (`result` for Claude; `turn.completed` for Codex) and populates the field when cost data is present. `ReplayAgent.Wait` decodes the same event shapes from transcripts.
-- `Dispatcher.Orchestrate` gains an optional `CostWriter core.CostWriter` field. After the last attempt completes, if `lastResult.Cost != nil`, the dispatcher calls `CostWriter.RecordCost(ctx, runID, jobID, *lastResult.Cost)` — preserving the event-first invariant via the existing `CostEventStore.RecordCost` that wraps `WriteEventThenRow`.
-- Live tests query `cost_events` after each smoke run. If `SUM(usd) > budgetUSD()`, the test fails with a clear message. The budget guard becomes real.
+- Extend `core.JobResult` with an optional `Cost *core.CostSample`. `CliAgent.Wait` parses the additional event kinds (`result` for Claude — fired exactly once at the end; `turn.completed` for Codex — cumulative session usage, take the last one). `ReplayAgent.Wait` decodes the same event shapes from transcripts via a shared `populateCost(streamMessage, *core.JobResult)` helper.
+- `Dispatcher` gains an optional `CostWriter core.CostWriter` field. **Persistence happens per-attempt** — at the end of `executeAttempt` (alongside the existing supervisor-result recording), if `attemptResult.result.Cost != nil`, the dispatcher calls `CostWriter.RecordCost(ctx, runID, jobID, *cost)`. This produces one `cost_events` row per retry, so total run spend reflects the real API cost across retries (matching the cost ledger semantics in the spec). Failure to persist is logged but does not fail the attempt.
+- Live tests for Claude run a small dispatch through `coding.Dispatcher` and assert at least one `cost_events` row is written and that `SUM(usd) ≤ budgetUSD()`. The existing `exec.CommandContext`-based smoke tests stay (they verify the binary works at all) — the new `TestLive_Claude_BudgetGuard` test exercises the dispatcher path. Codex and OpenCode smoke tests retain the existing exec-based shape; their files gain a comment noting that budget enforcement is not active for them.
 - No new tables; no schema changes. Reuses Plan 119's `cost_events`.
 
 **Tech Stack:** Go, `core.JobResult`, `core.CostSample`, `core.CostWriter`, existing `CostEventStore`, build-tag-gated live tests.
@@ -35,48 +35,58 @@
 
 In scope:
 
-1. Extend `agent/cli_handle.go::streamMessage` with optional cost fields:
-   - `TotalCostUSD float64 \`json:"total_cost_usd,omitempty"\`` (Claude `result` event)
-   - `Usage *streamUsage` for tokens (`input_tokens`, `output_tokens`, `cached_input_tokens`/`cache_read_input_tokens`)
-   - `Model string \`json:"model,omitempty"\`` (Claude `result` event has it under `modelUsage` keys; Codex via prior `assistant`'s `model` field — extracted as best-effort)
-2. Extend `core.JobResult` with `Cost *core.CostSample`. Populated by `CliAgent.Wait` and `ReplayAgent.Wait` when a recognized cost-bearing event appears.
-3. `Dispatcher.CostWriter core.CostWriter` field. After `lastResult` is finalized, if `Cost != nil`, persist via `CostWriter.RecordCost`. Failure to persist is logged but does not fail dispatch (best-effort, same pattern as `SupervisorWriter`).
-4. Wire `CostEventStore` into the production dispatcher in `cli/daemon.go` and `cli/run.go`.
-5. Update `tests/live/helpers.go` with a `verifyCostUnderBudget(t, db, runID)` helper that queries `cost_events` and fails if `SUM(usd) > budgetUSD()`.
-6. Update one live test (`tests/live/claude_smoke_test.go`) to use this helper. Codex and OpenCode tests stay budget-unenforced for now (with a comment pointing at this plan).
-7. Unit tests: `CliAgent` parser populates `Cost` from a Claude-shaped `result` event; from a Codex-shaped `turn.completed` event (USD=0, tokens populated); skips when neither appears. Unchanged behavior for transcripts without those events.
-8. Replay test scenario fixture extended with a Claude-shaped `result` line on developer's transcript; replay test asserts `cost_events` is populated.
-9. `docs/architecture/decisions.md` Decision 8: cost capture is per-CLI; only Claude provides USD directly; Codex/OpenCode deferred to a future plan with the explicit reason (need a price table for Codex; OpenCode SSE doesn't expose tokens).
+1. Extend `agent/cli_handle.go::streamMessage` with optional cost fields shared across Claude `result` and Codex `turn.completed`:
+   - `TotalCostUSD float64 \`json:"total_cost_usd,omitempty"\``
+   - `Usage *streamUsage` (tokens — `input_tokens`, `output_tokens`, `cache_read_input_tokens`, `cached_input_tokens`)
+   - `ModelUsage map[string]modelUsageRow \`json:"modelUsage,omitempty"\`` (Claude only)
+2. Extract a shared helper `populateCost(msg streamMessage, result *core.JobResult)` (in `agent/` package, exported for `replay_agent.go` reuse) so `CliAgent` and `ReplayAgent` use identical semantics. The helper handles `result` and `turn.completed`. **For `turn.completed` (Codex), it overwrites — Codex's `usage` field is cumulative per session, so the latest event has the final number.** For `result` (Claude), it sets the cost (only one `result` per run). Both events from one transcript: `result` wins (Claude is unambiguous about USD).
+3. Model selection: from Claude's `modelUsage`, sort the keys lexicographically and take the first. This keeps the captured model deterministic across runs even when nondeterministic map iteration would otherwise be a flake risk.
+4. Extend `core.JobResult` with `Cost *core.CostSample`. Nil when neither cost-bearing event was seen.
+5. `Dispatcher.CostWriter core.CostWriter` optional field. **Persistence happens per attempt** inside `executeAttempt` (after `agent.Wait()` returns and the supervisor result is recorded). Each retry produces its own `cost_events` row tied to the retry's `jobID`. Failure logs and continues — does not fail dispatch.
+6. Wire `CostEventStore` into the production dispatcher in `cli/daemon.go` and `cli/run.go`.
+7. Add `tests/live/helpers.go::verifyCostUnderBudget(t, db, runID, requireRows int)` that:
+   - queries `cost_events` rows for the run.
+   - if `requireRows > 0` and the row count is below it, fails the test (catches a broken parser silently passing).
+   - if `SUM(usd) > budgetUSD()`, fails the test.
+8. New live test `tests/live/claude_smoke_test.go::TestLive_Claude_BudgetGuard` that constructs a fresh `coding.Dispatcher` with `Agent: agent.NewCliAgent("claude", "-p", "<trivial-prompt>", "--output-format", "stream-json", "--verbose")`, dispatches a minimal `smoke` role (see Step 9 below), and asserts cost. The existing exec-based `TestLive_Claude_Smoke` is kept unchanged.
+9. **Minimal smoke role:** add a `tests/live/testdata/roles/smoke.yaml` (or reuse a small role from `coding/roles/`) that takes no required inputs and uses a 1-line prompt template — so the smoke test does not invoke the heavyweight `developer` role.
+10. Unit tests: `CliAgent` parser populates `Cost` from a Claude-shaped `result` event; from a Codex-shaped `turn.completed` event (USD=0, tokens populated); skips when neither appears. Multiple `turn.completed` events: last-one-wins. Tests live in `agent/cli_handle_test.go` (create — does not yet exist).
+11. Replay test scenario fixture extended with a Claude-shaped `result` line on developer's transcript; replay test asserts both `SumByRun` matches the expected USD AND `ListByJob` returns at least one row.
+12. `docs/architecture/decisions.md` Decision 8: cost capture per-CLI; only Claude provides USD directly; Codex tokens captured at USD=0; OpenCode deferred. Documents the cumulative vs per-turn semantics and why per-attempt persistence matters for retry accuracy.
 
-Out of scope:
+Out of scope (with explicit reasons; documented in code where relevant):
 
-- Codex USD computation from tokens (needs a price table).
-- OpenCode cost (no data available).
-- Cumulative `runs.cost_usd` enforcement / budget cutoff during a run (this plan only enforces per-live-test cost; runtime budget enforcement is a future plan).
-- Per-attempt cost rows (only the final attempt's cost is recorded, matching how findings are persisted).
-- Transcript recording machinery beyond what already exists (`.coworker/runs/<runID>/jobs/<jobID>.jsonl` is already written by Plan 117).
+- **Codex USD computation from tokens** — requires a per-model price table; tracked as a future plan. Until then, `cost_events.usd` is 0 for Codex jobs (a comment in `populateCost` says so).
+- **OpenCode cost** — no data available in the SSE stream we consume; `tests/live/opencode_smoke_test.go` has a `// FUTURE: budget enforcement` comment pointing at this plan.
+- **Runtime budget enforcement** — `runs.budget_usd` is still recorded but not enforced during a run. A future plan will compare cumulative cost to budget on every cost write and surface a `cost.budget_exceeded` checkpoint. This plan only enforces per-live-test caps.
+- **TUI / HTTP / MCP cost projection updates** — `tui/model.go:69` expects `input_tok`/`output_tok`/`cost_usd`/`cumulative_usd` while the events emit `tokens_in`/`tokens_out`/`usd`. A separate plan will reconcile event payload shapes across consumers. This plan does not modify TUI, HTTP, or MCP.
+- **Transcript recording machinery beyond what already exists** — `.coworker/runs/<runID>/jobs/<jobID>.jsonl` is already written by Plan 117. Documenting the manual extraction recipe lives in `docs/architecture/testing.md`; no new code in this plan.
 
 ---
 
 ## File Structure
 
-**Modify:**
-- `agent/cli_handle.go` (extend `streamMessage` parser)
-- `agent/cli_handle_test.go` (new tests — create if absent)
-- `agent/replay_agent.go` (parse same cost events from transcripts)
-- `agent/replay_agent_test.go` (new test for cost in replay)
-- `core/job.go` (add `Cost *core.CostSample` to `JobResult`)
-- `coding/dispatch.go` (add `CostWriter` field; persist cost after lastResult)
-- `coding/dispatch_test.go` (new tests: writer called when Cost != nil; nil writer is no-op; writer error is non-fatal)
-- `cli/daemon.go`, `cli/run.go` (construct `CostEventStore`; wire to dispatcher)
-- `tests/live/helpers.go` (add `verifyCostUnderBudget` helper)
-- `tests/live/claude_smoke_test.go` (use the helper)
-- `tests/replay/developer_then_reviewer/transcripts/developer.jsonl` (add a Claude-shaped result line)
-- `tests/replay/developer_then_reviewer/expected.json` (assert cost present)
-- `tests/replay/developer_then_reviewer/replay_test.go` (assert `cost_events` row written)
-- `docs/architecture/decisions.md` (Decision 8)
+**Create:**
+- `agent/cli_handle_test.go` (does not yet exist — covers the new parser cases)
+- `agent/cost_helpers.go` (the shared `populateCost(msg, *core.JobResult)` helper, used by both `CliAgent.Wait` and `ReplayAgent.Wait`)
+- `tests/live/testdata/roles/smoke.yaml` (a minimal role for the budget-guard live test)
+- `tests/live/testdata/prompts/smoke.md` (the matching trivial prompt template)
 
-**Create:** none.
+**Modify:**
+- `agent/cli_handle.go` (extend `streamMessage`; call `populateCost`)
+- `agent/replay_agent.go` (call `populateCost` in the same switch)
+- `agent/replay_agent_test.go` (new test: cost in replay)
+- `core/job.go` (add `Cost *core.CostSample` to `JobResult`)
+- `coding/dispatch.go` (add `CostWriter` field; persist cost **per attempt** inside `executeAttempt`)
+- `coding/dispatch_test.go` (new tests; see Phase 3)
+- `cli/daemon.go`, `cli/run.go` (construct `CostEventStore`; wire to dispatcher)
+- `tests/live/helpers.go` (add `verifyCostUnderBudget(t, db, runID, requireRows int)`)
+- `tests/live/claude_smoke_test.go` (add `TestLive_Claude_BudgetGuard` alongside the existing exec-based smoke)
+- `tests/live/codex_smoke_test.go`, `tests/live/opencode_smoke_test.go` (FUTURE comment)
+- `tests/replay/developer_then_reviewer/transcripts/developer.jsonl` (add a Claude-shaped `result` line)
+- `tests/replay/developer_then_reviewer/expected.json` (`expect_cost_usd` field)
+- `tests/replay/developer_then_reviewer/replay_test.go` (assert `cost_events` row written + sum)
+- `docs/architecture/decisions.md` (Decision 8)
 
 ---
 
@@ -135,30 +145,57 @@ type modelUsageRow struct {
 }
 ```
 
-In the decode loop, add a case for `"result"` and `"turn.completed"` that calls a helper to populate `result.Cost`:
+Extract a shared helper into `agent/cost_helpers.go`. Both `CliAgent.Wait` and `ReplayAgent.Wait` call it for every decoded `streamMessage`:
 
 ```go
-case "result":
-    // Claude headless emits {"type":"result", "total_cost_usd":..., "modelUsage":{<model>:{...}}}
-    if msg.TotalCostUSD > 0 || msg.Usage != nil {
+// agent/cost_helpers.go
+package agent
+
+import (
+    "sort"
+
+    "github.com/chris/coworker/core"
+)
+
+// populateCost inspects msg and updates result.Cost when the message is a
+// recognized cost-bearing event. Idempotent: later calls overwrite Cost
+// only when the new event is a recognized type.
+//
+// Claude: "result" event fires once at end-of-run; we set Cost from
+// total_cost_usd, usage, and the lexicographically-first modelUsage key.
+//
+// Codex: "turn.completed" emits the usage struct cumulatively per session;
+// we overwrite Cost on every turn.completed so the LAST one wins (which is
+// the final cumulative usage). USD stays at 0 — Codex provides no USD
+// figure; per-model price-table conversion is deferred to a future plan.
+func populateCost(msg streamMessage, result *core.JobResult) {
+    switch msg.Type {
+    case "result":
+        if msg.TotalCostUSD <= 0 && msg.Usage == nil && msg.ModelUsage == nil {
+            return
+        }
         cs := &core.CostSample{
             Provider: "anthropic",
             USD:      msg.TotalCostUSD,
         }
         if msg.Usage != nil {
-            cs.TokensIn = msg.Usage.InputTokens
+            cs.TokensIn = msg.Usage.InputTokens + msg.Usage.CacheReadInputTokens
             cs.TokensOut = msg.Usage.OutputTokens
         }
-        // Pick the first model key as the model identifier.
-        for model := range msg.ModelUsage {
-            cs.Model = model
-            break
+        // Sort modelUsage keys to make selection deterministic across runs.
+        if len(msg.ModelUsage) > 0 {
+            keys := make([]string, 0, len(msg.ModelUsage))
+            for k := range msg.ModelUsage {
+                keys = append(keys, k)
+            }
+            sort.Strings(keys)
+            cs.Model = keys[0]
         }
         result.Cost = cs
-    }
-case "turn.completed":
-    // Codex emits {"type":"turn.completed", "usage":{...}}. No USD figure.
-    if msg.Usage != nil {
+    case "turn.completed":
+        if msg.Usage == nil {
+            return
+        }
         result.Cost = &core.CostSample{
             Provider:  "openai",
             TokensIn:  msg.Usage.InputTokens + msg.Usage.CachedInputTokens,
@@ -166,7 +203,10 @@ case "turn.completed":
             // USD: 0 — see Plan 121 §Out of scope (price table is future work).
         }
     }
+}
 ```
+
+In `cli_handle.go::Wait`, after the existing finding/done switch, call `populateCost(msg, result)` for every decoded message (not in a switch — `populateCost` has its own no-op for non-cost types).
 
 - [ ] **Step 3 — Tests:**
 
@@ -224,17 +264,21 @@ type Dispatcher struct {
 }
 ```
 
-- [ ] **Step 2 — Persist in `Orchestrate` right after the finding loop:**
+- [ ] **Step 2 — Persist per-attempt** inside `executeAttempt` (NOT in `Orchestrate` after the loop). Findings persist from the LAST attempt only because earlier attempts' findings are subsumed by the retry; cost is the OPPOSITE — every retry consumes real API tokens, so each attempt produces its own row.
+
+Read `coding/dispatch.go::executeAttempt` first; locate where `agent.Wait()` returns and the `dispatchAttemptResult` is assembled. Add this block right after the wait succeeds, alongside any existing supervisor-result write:
 
 ```go
-// After: for i := range lastResult.Findings { ... }
-if d.CostWriter != nil && lastResult.Cost != nil {
-    if err := d.CostWriter.RecordCost(ctx, runID, lastJobID, *lastResult.Cost); err != nil {
+// In executeAttempt, after agent.Wait() returns result:
+if d.CostWriter != nil && result.Cost != nil {
+    if err := d.CostWriter.RecordCost(ctx, runID, jobID, *result.Cost); err != nil {
         logger.Error("failed to persist cost sample",
-            "run_id", runID, "job_id", lastJobID, "error", err)
+            "run_id", runID, "job_id", jobID, "attempt", attempt, "error", err)
     }
 }
 ```
+
+Each retry has a distinct `jobID` (verified by the existing dispatcher tests at `coding/dispatch.go:342-348`) — so this produces N rows for N attempts, all keyed off the same `runID` but different `jobID`s. `runs.cost_usd` accumulates correctly because `CostEventStore.RecordCost` bumps it inside the same transaction (Plan 119 wiring).
 
 - [ ] **Step 3 — Wire in `cli/daemon.go` and `cli/run.go`:**
 
@@ -292,20 +336,33 @@ git commit -m "Plan 121 Phase 3: dispatcher persists cost samples via CostWriter
 }
 ```
 
-- [ ] **Step 3 — In `replay_test.go`, after the developer dispatch, query `cost_events` and assert one row exists with `usd == expect_cost_usd`:**
+- [ ] **Step 3 — In `replay_test.go`, set `CostWriter` on the dispatcher and assert both row count and sum after the developer dispatch:**
 
 ```go
-ce := store.NewCostEventStore(devDB, store.NewEventStore(devDB))
+es := store.NewEventStore(devDB)
+ce := store.NewCostEventStore(devDB, es)
+
+// Wire the dispatcher with CostWriter
+devDisp.CostWriter = ce
+
+// ... after Orchestrate returns devOut ...
+rows, err := ce.ListByJob(context.Background(), devOut.JobID)
+if err != nil {
+    t.Fatalf("cost ListByJob: %v", err)
+}
+if len(rows) != 1 {
+    t.Fatalf("developer cost rows = %d, want 1", len(rows))
+}
 sum, err := ce.SumByRun(context.Background(), devOut.RunID)
 if err != nil {
     t.Fatalf("cost SumByRun: %v", err)
 }
 if sum != expected["developer"].ExpectCostUSD {
-    t.Errorf("developer cost = %v, want %v", sum, expected["developer"].ExpectCostUSD)
+    t.Errorf("developer cost sum = %v, want %v", sum, expected["developer"].ExpectCostUSD)
 }
 ```
 
-(Add `ExpectCostUSD float64 \`json:"expect_cost_usd,omitempty"\`` to the `roleExpected` struct. Set the dispatcher's `CostWriter` in the test setup.)
+Add `ExpectCostUSD float64 \`json:"expect_cost_usd,omitempty"\`` to the `roleExpected` struct.
 
 - [ ] **Step 4 — Run + commit:**
 
@@ -321,7 +378,39 @@ git commit -m "Plan 121 Phase 4: replay scenario verifies cost persistence"
 
 **Files:** `tests/live/helpers.go`, `tests/live/claude_smoke_test.go`
 
-- [ ] **Step 1 — Add `verifyCostUnderBudget` helper:**
+- [ ] **Step 1 — Add the smoke-role fixture under `tests/live/testdata/`:**
+
+`tests/live/testdata/roles/smoke.yaml`:
+```yaml
+name: smoke
+concurrency: single
+cli: claude-code
+prompt_template: prompts/smoke.md
+inputs:
+  required: []
+outputs:
+  contract: {}
+  emits: {}
+sandbox: read-only
+permissions:
+  allowed_tools: ["read"]
+  never: []
+  requires_human: []
+budget:
+  max_tokens_per_job: 1000
+  max_wallclock_minutes: 1
+  max_cost_usd: 0.10
+retry_policy:
+  on_contract_fail: skip
+  on_job_error: skip
+```
+
+`tests/live/testdata/prompts/smoke.md`:
+```
+Print a single stream-json line: {"type":"done","exit_code":0}
+```
+
+- [ ] **Step 2 — Add `verifyCostUnderBudget` helper:**
 
 ```go
 //go:build live
@@ -336,47 +425,130 @@ import (
 )
 
 // verifyCostUnderBudget queries cost_events for the run and fails the
-// test if SUM(usd) > budgetUSD(). Tolerates zero rows (Codex/OpenCode
-// today emit no USD; only Claude has cost wired).
-func verifyCostUnderBudget(t *testing.T, db *store.DB, runID string) {
+// test if (a) row count < requireRows, or (b) SUM(usd) > budgetUSD().
+// requireRows=1 catches a broken parser silently writing zero rows;
+// requireRows=0 tolerates zero rows (Codex/OpenCode have no USD wired).
+func verifyCostUnderBudget(t *testing.T, db *store.DB, runID string, requireRows int) {
     t.Helper()
     es := store.NewEventStore(db)
     ce := store.NewCostEventStore(db, es)
+
+    rows, err := ce.ListByRun(context.Background(), runID)
+    if err != nil {
+        t.Fatalf("cost ListByRun: %v", err)
+    }
+    if len(rows) < requireRows {
+        t.Fatalf("cost rows = %d, want >= %d (parser may have skipped events)",
+            len(rows), requireRows)
+    }
     sum, err := ce.SumByRun(context.Background(), runID)
     if err != nil {
         t.Fatalf("cost SumByRun: %v", err)
     }
     budget := budgetUSD()
     if sum > budget {
-        t.Fatalf("test cost = $%.4f exceeded budget $%.2f", sum, budget)
+        t.Fatalf("test cost = $%.4f exceeded budget $%.2f (rows=%d)",
+            sum, budget, len(rows))
     }
-    t.Logf("test cost = $%.4f (budget $%.2f)", sum, budget)
+    t.Logf("test cost = $%.4f (rows=%d, budget $%.2f)", sum, len(rows), budget)
 }
 ```
 
-- [ ] **Step 2 — Update `claude_smoke_test.go`** so it dispatches via `coding.Dispatcher` (not `exec.CommandContext` directly) so `cost_events` is populated. The smoke test now:
-  1. Opens a fresh in-memory DB.
-  2. Constructs a Dispatcher with `Agent: agent.NewCliAgent("claude", ...)`, `CostWriter: store.NewCostEventStore(db, es)`.
-  3. Calls `Orchestrate` with role=developer (or a minimal role test_smoke if needed).
-  4. Calls `verifyCostUnderBudget(t, db, result.RunID)`.
+(If `CostEventStore.ListByRun` does not yet exist, mirror `ListByJob` from `store/cost_event_store.go` and add it; minor extension that does not affect schema. Verify before adding — Plan 119 may have already added it.)
 
-(If swapping the test out is more disruptive than expected, keep the exec.CommandContext path AND add a second separate test `TestLive_Claude_BudgetGuard` that runs a tiny dispatch through Dispatcher with the cost helper. Pick one approach during implementation; document the choice in the commit message.)
+- [ ] **Step 3 — Add a SECOND test `TestLive_Claude_BudgetGuard` in `tests/live/claude_smoke_test.go`** alongside the existing exec-based smoke. The new test:
 
-- [ ] **Step 3 — Add a comment in `codex_smoke_test.go` and `opencode_smoke_test.go`** noting that budget enforcement is not active for these CLIs and pointing at this plan's Out of Scope section.
+```go
+//go:build live
 
-- [ ] **Step 4 — Run live test (real API call):**
+package live
+
+import (
+    "context"
+    "path/filepath"
+    "testing"
+
+    "github.com/chris/coworker/agent"
+    "github.com/chris/coworker/coding"
+    "github.com/chris/coworker/store"
+)
+
+// TestLive_Claude_BudgetGuard exercises the full dispatcher path: a tiny
+// CliAgent invocation against the real claude binary, with cost capture
+// and budget enforcement via cost_events.
+func TestLive_Claude_BudgetGuard(t *testing.T) {
+    requireLiveEnv(t)
+    bin := requireBinary(t, "claude")
+
+    db, err := store.Open(":memory:")
+    if err != nil {
+        t.Fatal(err)
+    }
+    defer db.Close()
+    es := store.NewEventStore(db)
+
+    a := agent.NewCliAgent(bin, "-p",
+        "--output-format", "stream-json", "--verbose")
+    // Note: -p prompt comes via stdin from CliAgent (CliAgent always sends
+    // prompt on stdin); the role's prompt template at testdata/prompts/smoke.md
+    // becomes the rendered prompt.
+
+    repoRoot := repoRootFromTest(t)
+    smokeDir := filepath.Join(repoRoot, "tests", "live", "testdata")
+
+    d := &coding.Dispatcher{
+        Agent:      a,
+        DB:         db,
+        RoleDir:    filepath.Join(smokeDir, "roles"),
+        PromptDir:  smokeDir,
+        CostWriter: store.NewCostEventStore(db, es),
+    }
+    ctx, cancel := withTimeout(t, 60*time.Second)
+    defer cancel()
+    res, err := d.Orchestrate(ctx, &coding.DispatchInput{
+        RoleName: "smoke",
+        Inputs:   map[string]string{},
+    })
+    if err != nil {
+        t.Fatalf("smoke dispatch: %v", err)
+    }
+    verifyCostUnderBudget(t, db, res.RunID, 1)
+}
+
+func repoRootFromTest(t *testing.T) string {
+    t.Helper()
+    // tests/live → ../../
+    abs, err := filepath.Abs(filepath.Join("..", ".."))
+    if err != nil {
+        t.Fatal(err)
+    }
+    return abs
+}
+```
+
+If the `-p` argv vs stdin question matters at runtime: verify locally that `claude -p < stdin` reads the prompt from stdin (it does in headless `--output-format stream-json` mode per Anthropic's docs; if it doesn't, fall back to passing the prompt via additional argv or use a different invocation pattern). Document the chosen invocation in the commit.
+
+- [ ] **Step 4 — Add a comment in `codex_smoke_test.go` and `opencode_smoke_test.go`** noting that budget enforcement is not active for these CLIs and pointing at this plan's Out of Scope section. Example:
+
+```go
+// FUTURE: budget enforcement via cost_events is not active for codex —
+// turn.completed.usage emits tokens but no USD figure. See Plan 121
+// §Out of Scope. Tracked for follow-up via a per-model price table.
+```
+
+- [ ] **Step 5 — Run live test (real API call):**
 
 ```bash
 COWORKER_LIVE=1 make test-live
 ```
 
-Verify: the Claude smoke logs the cost and stays under budget. (If it exceeds, lower the prompt size; the prompt should produce <100 tokens.)
+Verify: the Claude budget-guard test logs `rows=1` (or more if retries fire) and stays under budget. The exec-based smoke continues to pass.
 
-- [ ] **Step 5 — Commit:**
+- [ ] **Step 6 — Commit:**
 
 ```bash
 git add tests/live/
-git commit -m "Plan 121 Phase 5: live test enforces cost budget against cost_events"
+git commit -m "Plan 121 Phase 5: live test enforces cost budget against cost_events (smoke role + dispatcher path)"
 ```
 
 ---
