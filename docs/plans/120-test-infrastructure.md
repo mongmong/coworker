@@ -6,7 +6,7 @@
 
 **Architecture:**
 - A *replay test* is a Go test that runs `coding.Dispatcher.Orchestrate` with a `replayAgent` that implements `core.Agent`. The replay agent's `JobHandle.Wait` parses the recorded transcript JSONL using the **same stream-json schema and parsing rules** that `agent/cli_handle.go` uses for live `CliAgent` output. This means findings flow through the existing pipeline (Dispatcher persists findings via `FindingStore.InsertFinding`).
-- A *live test* shells out to a real CLI (`claude` / `codex` / `opencode`) with a trivial prompt and asserts the binary exits cleanly and emits at least one finding-shaped or done-shaped JSON line. Live tests are protected by build tag `live` AND `COWORKER_LIVE=1`. They are NOT in default CI.
+- A *live test* shells out to a real CLI (`claude` / `codex` / `opencode`) with a trivial prompt and asserts the binary exits cleanly and emits at least one stream-json line on stdout (any JSON object with a top-level `"type"` field — `done`, `finding`, or vendor-specific kinds all qualify). Live tests are protected by build tag `live` AND `COWORKER_LIVE=1`. They are NOT in default CI.
 - No production code changes are required for replay; the only addition is `ReplayAgent` itself.
 
 **Tech Stack:** Go test framework, `core.Agent` protocol (`Dispatch(ctx, *Job, prompt) (JobHandle, error)` and `Wait(ctx) (*JobResult, error)`), build-tag gating (`//go:build live`), env-var gating.
@@ -339,7 +339,10 @@ func TestReplay_DeveloperThenReviewer(t *testing.T) {
         t.Fatal(err)
     }
     roleDir := filepath.Join(repoRoot, "coding", "roles")
-    promptDir := filepath.Join(repoRoot, "coding", "prompts")
+    // Role YAML's prompt_template is "prompts/<file>.md" relative to a
+    // PromptDir that contains a "prompts/" subdirectory. So PromptDir is
+    // "<repo>/coding" (not "<repo>/coding/prompts").
+    promptDir := filepath.Join(repoRoot, "coding")
 
     db, dbCleanup := newReplayDB(t)
     defer dbCleanup()
@@ -437,16 +440,16 @@ func assertDispatch(t *testing.T, role string, got *coding.DispatchResult, want 
     }
 }
 
-// newReplayDB opens a fresh in-memory SQLite DB with all migrations applied.
-// (Locate the existing helper in store_test.go-style tests; if none is
-// exported, write a minimal local helper using store.NewDB(":memory:").)
+// newReplayDB opens a fresh in-memory SQLite DB with all migrations
+// applied. The store package exposes Open(path string) (*DB, error) which
+// auto-runs migrations.
 func newReplayDB(t *testing.T) (*store.DB, func()) {
     t.Helper()
-    db, err := store.NewDB(":memory:")
+    db, err := store.Open(":memory:")
     if err != nil {
         t.Fatal(err)
     }
-    return db, func() { db.Close() }
+    return db, func() { _ = db.Close() }
 }
 ```
 
@@ -614,15 +617,21 @@ func bytesNewReader(s string) *bytes.Reader { return bytes.NewReader([]byte(s)) 
 - [ ] **Step 4 — Sanity-check the build tag wiring:**
 
 ```bash
-# Default `go test` should NOT see these files.
-go test ./tests/live/... -count=1
-# Expected: "no test files" or "no Go files matched" — exit 0.
+# Default `go test ./...` from the repo root must NOT execute these tests
+# and must exit 0 (the package is excluded by the build tag).
+go test ./... -count=1 -timeout 60s
+# Expected: PASS for all matched packages; tests/live/ is silently excluded.
 
-# With the tag but without COWORKER_LIVE, tests should skip cleanly.
+# Targeting the tests/live/ package directly without the tag prints
+# "[no test files]" or "build constraints exclude all Go files" and
+# exits 0 — this is informational only, not an error.
+go test ./tests/live/... -count=1
+
+# With the tag but without COWORKER_LIVE, tests SKIP cleanly.
 go test -tags live ./tests/live/... -count=1
 # Expected: PASS (all SKIPped).
 
-# With the env var but missing binaries, tests should still skip.
+# With the env var but missing binaries, tests still SKIP.
 COWORKER_LIVE=1 go test -tags live ./tests/live/... -count=1
 # Expected: PASS (Skipf on missing binary).
 ```
