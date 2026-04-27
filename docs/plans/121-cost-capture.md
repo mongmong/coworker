@@ -610,10 +610,80 @@ Expected: build clean, all tests pass with `-race`, 0 lint issues, replay scenar
 
 ## Code Review
 
-(To be filled in after implementation by Codex review subagent.)
+### Codex post-implementation review (2026-04-27)
+
+#### Important — Claude `result` could be overwritten by a later `turn.completed` [FIXED]
+
+`agent/cost_helpers.go:32` — original `populateCost` overwrote `result.Cost` on every recognized event type. If a transcript happened to contain both a Claude `result` AND a Codex `turn.completed` (in any order with the latter last), the USD-bearing Anthropic sample would be replaced by a tokens-only OpenAI sample with USD=0. In practice no single CLI emits both, but the parser should be robust.
+
+→ Fixed: the `turn.completed` branch now checks `result.Cost.Provider == "anthropic"` and short-circuits if true. New test `TestPopulateCost_ClaudeResultWinsOverLaterTurnCompleted` codifies the rule.
+
+#### Sandbox-only blockers (build/test/lint) [N/A]
+
+Codex flagged blockers because its sandbox `/tmp` is read-only and golangci-lint isn't installed. Local verification on the actual repo:
+
+```text
+$ go build ./...                                                  → clean
+$ go test -race ./... -count=1 -timeout 180s                      → 30 ok, 0 failed, 0 races
+$ golangci-lint run ./...                                         → 0 issues
+$ COWORKER_REPLAY=1 make test-replay                              → PASS
+$ COWORKER_LIVE=1 go test -tags live ./tests/live/... -run TestLive_Claude_BudgetGuard
+                                                                  → PASS, cost $0.1215 under $0.50 budget
+```
 
 ---
 
 ## Post-Execution Report
 
-(To be filled in after implementation.)
+### Date
+2026-04-27
+
+### Implementation summary
+
+Six phases, all merged inline:
+
+**Phase 1+2 — Parser + JobResult**
+- `core.JobResult.Cost *core.CostSample` field added.
+- `agent/cli_handle.go::streamMessage` extended with `TotalCostUSD`, `Usage`, `ModelUsage` fields.
+- Shared `agent/cost_helpers.go::populateCost` extracts cost from `result` (Claude) and `turn.completed` (Codex). Sorted modelUsage key wins for deterministic Claude model selection. Codex `turn.completed` is cumulative-per-session (latest event wins).
+- `CliAgent.Wait` and `ReplayAgent.Wait` both call `populateCost` for every decoded message.
+- 9 unit tests: Claude result, deterministic model, empty no-op, Codex turn.completed (single + cumulative last-wins), unknown event no-op, done no-op, claude-result-wins-over-later-turn-completed, replay agent cost from result, replay agent cost from turn.completed.
+
+**Phase 3 — Dispatcher cost persistence**
+- `Dispatcher.CostWriter core.CostWriter` optional field.
+- `executeAttempt` records cost after `agent.Wait()` succeeds, before returning attempt result. Each retry produces its own cost_events row tied to the retry's distinct `jobID`.
+- Best-effort: write failure logged; dispatch continues.
+- Wired `CostEventStore` into both `cli/daemon.go` and `cli/run.go` production paths.
+- 4 dispatcher tests added.
+
+**Phase 4 — Replay scenario carries cost**
+- `tests/replay/developer_then_reviewer/transcripts/developer.jsonl` extended with a Claude `result` line.
+- `expected.json` adds `expect_cost_usd: 0.0123`.
+- Test wires `CostEventStore` into the developer dispatcher and asserts `ListByJob` returns 1 row + `SumByRun` matches the expected USD.
+
+**Phase 5 — Live test budget enforcement**
+- `store.CostEventStore.ListByRun` added (mirrors `ListByJob`).
+- `tests/live/helpers.go::verifyCostUnderBudget(t, db, runID, requireRows)` enforces row count + sum < `budgetUSD()`.
+- New minimal smoke role at `tests/live/testdata/roles/smoke.yaml` (one input `prompt_text`, allows `bash:claude`).
+- New live test `TestLive_Claude_BudgetGuard` runs CliAgent through Dispatcher; verified locally with `COWORKER_LIVE=1` (real API call, cost $0.12 under $0.50 budget, 3.77s wall).
+- `TestLive_{Codex,OpenCode}_Smoke` get `FUTURE` comments explaining inactive enforcement.
+
+**Phase 6 — Documentation + verification**
+- `docs/architecture/decisions.md` Decision 8 added.
+
+### Verification
+
+```text
+go build ./...                                          → clean
+go test -race ./... -count=1 -timeout 180s              → 30 ok, 0 failed, 0 races
+golangci-lint run ./...                                 → 0 issues
+COWORKER_REPLAY=1 make test-replay                      → PASS
+COWORKER_LIVE=1 go test -tags live ... TestLive_Claude_BudgetGuard
+                                                        → PASS, $0.1215 under $0.50 budget
+```
+
+### Notes / deviations from plan
+
+- The smoke role initially had `inputs.required: []`, which trips the role validator (`coding/roles/loader.go:97` — "inputs.required must have at least one entry"). Resolved by adding a single `prompt_text` input that's substituted into a trivial prompt template.
+- Smoke role needed `"bash:claude"` in `allowed_tools` to satisfy default-deny permission enforcement. Documented in the role file.
+- Codex post-impl review found one mixed-transcript edge case (turn.completed could overwrite an earlier result); fixed in a follow-up commit before merge.

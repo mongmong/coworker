@@ -56,6 +56,14 @@ func populateCost(msg streamMessage, result *core.JobResult) {
 		if msg.Usage == nil {
 			return
 		}
+		// Claude `result` is authoritative for USD. If we have already
+		// captured a Claude result, do not overwrite it with a Codex
+		// turn.completed (which would replace USD=$0.05 with USD=$0.00).
+		// In practice no single CLI emits both events; this rule defends
+		// against hand-constructed transcripts and future combined flows.
+		if result.Cost != nil && result.Cost.Provider == "anthropic" {
+			return
+		}
 		result.Cost = &core.CostSample{
 			Provider:  "openai",
 			TokensIn:  msg.Usage.InputTokens + msg.Usage.CachedInputTokens,

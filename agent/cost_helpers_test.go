@@ -132,6 +132,26 @@ func TestPopulateCost_UnknownTypeIsNoOp(t *testing.T) {
 	}
 }
 
+func TestPopulateCost_ClaudeResultWinsOverLaterTurnCompleted(t *testing.T) {
+	// Defensive rule: if a Claude `result` has already populated Cost,
+	// a later Codex `turn.completed` must not overwrite it (would zero out
+	// the USD figure). In practice no single CLI emits both events; this
+	// guards hand-constructed or combined-flow transcripts.
+	res := &core.JobResult{}
+	populateCost(streamMessage{
+		Type:         "result",
+		TotalCostUSD: 0.05,
+		ModelUsage:   map[string]modelUsageRow{"claude": {CostUSD: 0.05}},
+	}, res)
+	populateCost(streamMessage{
+		Type:  "turn.completed",
+		Usage: &streamUsage{InputTokens: 999, OutputTokens: 999},
+	}, res)
+	if res.Cost == nil || res.Cost.Provider != "anthropic" || res.Cost.USD != 0.05 {
+		t.Errorf("Claude result should win; got %+v", res.Cost)
+	}
+}
+
 func TestPopulateCost_DoneIsNoOp(t *testing.T) {
 	msg := streamMessage{Type: "done", ExitCode: 0}
 	res := &core.JobResult{}
