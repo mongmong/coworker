@@ -3,7 +3,6 @@ package agent
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -88,12 +87,14 @@ func (h *replayHandle) Wait(ctx context.Context) (*core.JobResult, error) {
 
 		var msg streamMessage
 		if err := decoder.Decode(&msg); err != nil {
+			// Mirror cli_handle.go: on decode error, accumulate
+			// remaining bytes into Stdout and stop. Do NOT set Stderr
+			// here — Stderr is reserved for the agent's own stderr in
+			// CliAgent (no equivalent in replay; left empty).
+			_ = err
 			rest, _ := io.ReadAll(decoder.Buffered())
 			extra, _ := io.ReadAll(h.f)
 			result.Stdout = string(rest) + string(extra)
-			if !errors.Is(err, io.EOF) {
-				result.Stderr = err.Error()
-			}
 			return result, nil
 		}
 

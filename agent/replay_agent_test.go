@@ -101,7 +101,18 @@ func TestReplayAgent_ContextCancel(t *testing.T) {
 	if res == nil {
 		t.Fatal("res is nil")
 	}
-	// Some findings may be present; what matters is that Wait returned promptly.
+	// Partial result should contain the first finding parsed before
+	// cancellation fired — proves cancel returns *partial* state, not
+	// throws away parsed findings.
+	if len(res.Findings) == 0 {
+		t.Errorf("partial result should include at least 1 finding parsed before cancel; got 0")
+	}
+	if len(res.Findings) >= 4 {
+		t.Errorf("partial result should be partial; got all %d findings", len(res.Findings))
+	}
+	if res.ExitCode != 0 {
+		t.Errorf("ExitCode = %d, want 0 (done line not yet reached)", res.ExitCode)
+	}
 }
 
 func TestReplayAgent_HandleCancel(t *testing.T) {
@@ -129,6 +140,15 @@ func TestReplayAgent_HandleCancel(t *testing.T) {
 	if res == nil {
 		t.Fatal("res is nil")
 	}
+	if len(res.Findings) == 0 {
+		t.Errorf("partial result should include at least 1 finding before Cancel; got 0")
+	}
+	if len(res.Findings) >= 4 {
+		t.Errorf("partial result should be partial; got all %d findings", len(res.Findings))
+	}
+	if res.ExitCode != 0 {
+		t.Errorf("ExitCode = %d, want 0 (done line not yet reached)", res.ExitCode)
+	}
 }
 
 func TestReplayAgent_MalformedJSON(t *testing.T) {
@@ -150,8 +170,13 @@ func TestReplayAgent_MalformedJSON(t *testing.T) {
 	if len(res.Findings) != 1 {
 		t.Errorf("findings = %d, want 1 (parsed before malformed line)", len(res.Findings))
 	}
-	if res.Stderr == "" {
-		t.Error("stderr should mention parse error")
+	// Mirror cli_handle.go behavior: malformed JSON does NOT populate Stderr.
+	// Remaining bytes are appended to Stdout instead.
+	if res.Stderr != "" {
+		t.Errorf("stderr = %q, want empty (parser parity with cli_handle.go)", res.Stderr)
+	}
+	if !strings.Contains(res.Stdout, "not valid json") {
+		t.Errorf("stdout = %q; expected to contain remaining 'not valid json' bytes", res.Stdout)
 	}
 }
 

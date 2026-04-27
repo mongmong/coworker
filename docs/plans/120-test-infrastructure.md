@@ -798,10 +798,78 @@ Expected: tests skip when binaries are missing; no failures.
 
 ## Code Review
 
-(To be filled in after implementation by Codex review subagent.)
+### Codex post-implementation review (2026-04-27)
+
+#### Blocker — Parser parity gap with `cli_handle.go` on malformed JSON [FIXED]
+
+`agent/replay_agent.go:90` — Original implementation populated `JobResult.Stderr` with the decode error message; `agent/cli_handle.go:51-57` does NOT. CliAgent only accumulates remaining stdout bytes and breaks. The replay agent diverged from this contract; the test (`agent/replay_agent_test.go:153`) codified the divergence by asserting `Stderr != ""`.
+
+→ Fixed: `replay_agent.go` now mirrors `cli_handle.go` exactly: on decode error, append remaining bytes (decoder.Buffered() + io.ReadAll(h.f)) to `result.Stdout` and return; `Stderr` stays empty. `replay_agent_test.go::TestReplayAgent_MalformedJSON` updated to assert the new behavior (`Stderr == ""`, `Stdout` contains the malformed bytes).
+
+#### Important — Cancel tests did not assert partial result content [FIXED]
+
+`agent/replay_agent_test.go:104` (`TestReplayAgent_ContextCancel`) and `:129` (`TestReplayAgent_HandleCancel`) only checked that `res != nil` and `err == context.Canceled`. They did not verify that the partial result actually contained findings parsed before the cancel — leaving room for a regression where Wait could return zero findings on cancel.
+
+→ Fixed: both tests now assert `1 <= len(res.Findings) <= 3` (some, not all) and `res.ExitCode == 0` (the trailing `done` line was not reached). Documents the partial-result contract.
+
+#### Sandbox-only blockers (build/test/lint) [N/A]
+
+Codex flagged build/test/lint as blockers because its sandbox `/tmp` is read-only. Local verification on the actual repo:
+
+```text
+$ go build ./...                                          → clean
+$ go test -race ./... -count=1 -timeout 180s              → 28 ok, 0 failed, 0 races
+$ golangci-lint run ./...                                 → 0 issues
+$ COWORKER_REPLAY=1 go test ./tests/replay/... -count=1   → PASS
+$ COWORKER_LIVE=1 go test -tags live ./tests/live/...     → PASS (3 live smoke tests, 23.6s)
+```
 
 ---
 
 ## Post-Execution Report
 
-(To be filled in after implementation.)
+### Date
+2026-04-27
+
+### Implementation summary
+
+All six phases completed.
+
+**Phase 1 — `agent/replay_agent.go` + `agent/replay_agent_test.go`**
+- `ReplayAgent` implements `core.Agent`. `Dispatch(ctx, *core.Job, prompt)` opens the per-role transcript (dots → underscores in filename) and returns a `replayHandle`. `Wait(ctx)` parses each line as a `streamMessage` (same struct as `cli_handle.go`) and assembles `core.JobResult`. `Cancel()` causes the next loop iteration to return `context.Canceled`.
+- Eight unit tests: happy path, missing transcript, role with dots, ctx-cancel mid-stream (with partial-result check), Cancel() mid-stream (with partial-result check), malformed JSON (parser parity), line-delay throttle, empty transcript.
+
+**Phase 2 — first replay scenario**
+- `tests/replay/developer_then_reviewer/`: per-role JSONL transcripts under `transcripts/`, placeholder template inputs under `inputs/`, expected results in `expected.json`, `replay_test.go` driving `Dispatcher.Orchestrate` for both roles.
+- Test verifies: developer (no findings, exit 0), reviewer.arch (2 findings with expected fingerprints, exit 0). Findings persisted to the `findings` table verified via `FindingStore.ListFindings`.
+
+**Phase 3 — live test scaffold**
+- `tests/live/` package with `//go:build live` on every file. Default `go test ./...` ignores the directory entirely.
+- Three smoke tests (claude/codex/opencode) shell out to the binary directly with a trivial prompt, assert exit 0 + at least one stream-json line on stdout. Helpers: `requireLiveEnv`, `requireBinary`, `withTimeout`, `hasJSONLine`.
+
+**Phase 4 — Makefile + CI**
+- Five Makefile targets: `test` (alias for test-unit), `test-unit` (race), `test-integration`, `test-replay` (env-gated), `test-live` (tag + env gated).
+- `ci.yml`: replay step added.
+- `live-tests.yml`: separate `workflow_dispatch`-triggered workflow with API-key secrets and per-CLI install steps.
+
+**Phase 5 — documentation**
+- `docs/architecture/testing.md`: full description of all four layers, when/how to use each, replay-recording recipe.
+- `decisions.md`: Decision 7 entry.
+
+**Phase 6 — verification**
+- All checks pass locally (see Code Review verification block).
+
+### Verification
+
+```text
+go build ./...                                          → clean
+go test -race ./... -count=1 -timeout 180s              → 28 ok, 0 failed, 0 races
+golangci-lint run ./...                                 → 0 issues
+COWORKER_REPLAY=1 go test ./tests/replay/... -count=1   → PASS
+COWORKER_LIVE=1 go test -tags live ./tests/live/...     → PASS (3 live smoke tests, 23.6s wall)
+```
+
+### Notes / deviations from plan
+
+- Live test for Claude Code initially failed because Claude's `--output-format stream-json` requires `--verbose`. Test was updated; documented in commit `2872a80`.
+- Cost assertions in live tests were intentionally not implemented; this remains the documented Plan 121 follow-up.
