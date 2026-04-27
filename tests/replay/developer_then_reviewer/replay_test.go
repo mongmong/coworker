@@ -53,11 +53,14 @@ func TestReplay_DeveloperThenReviewer(t *testing.T) {
 	// --- Developer ---
 	devDB, devCleanup := newReplayDB(t)
 	defer devCleanup()
+	devEs := store.NewEventStore(devDB)
+	devCe := store.NewCostEventStore(devDB, devEs)
 	devDisp := &coding.Dispatcher{
-		Agent:     replay,
-		DB:        devDB,
-		RoleDir:   roleDir,
-		PromptDir: promptDir,
+		Agent:      replay,
+		DB:         devDB,
+		RoleDir:    roleDir,
+		PromptDir:  promptDir,
+		CostWriter: devCe,
 	}
 	devOut, err := devDisp.Orchestrate(context.Background(), &coding.DispatchInput{
 		RoleName: "developer",
@@ -71,6 +74,23 @@ func TestReplay_DeveloperThenReviewer(t *testing.T) {
 		t.Fatalf("developer dispatch: %v", err)
 	}
 	assertDispatch(t, "developer", devOut, expected["developer"])
+
+	// Verify cost persisted: at least one cost_events row, sum matches.
+	devCostRows, err := devCe.ListByJob(context.Background(), devOut.JobID)
+	if err != nil {
+		t.Fatalf("cost ListByJob: %v", err)
+	}
+	if len(devCostRows) != 1 {
+		t.Errorf("developer cost rows = %d, want 1", len(devCostRows))
+	}
+	devCostSum, err := devCe.SumByRun(context.Background(), devOut.RunID)
+	if err != nil {
+		t.Fatalf("cost SumByRun: %v", err)
+	}
+	if devCostSum != expected["developer"].ExpectCostUSD {
+		t.Errorf("developer cost sum = %v, want %v",
+			devCostSum, expected["developer"].ExpectCostUSD)
+	}
 
 	// --- Reviewer.arch ---
 	revDB, revCleanup := newReplayDB(t)
@@ -109,6 +129,7 @@ type roleExpected struct {
 	ExitCode      int      `json:"exit_code"`
 	FindingsCount int      `json:"findings_count"`
 	Fingerprints  []string `json:"fingerprints,omitempty"`
+	ExpectCostUSD float64  `json:"expect_cost_usd,omitempty"`
 }
 
 func loadExpected(t *testing.T, dir string) map[string]roleExpected {

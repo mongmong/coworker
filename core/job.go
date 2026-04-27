@@ -36,4 +36,10 @@ type JobResult struct {
 	ExitCode  int
 	Stdout    string
 	Stderr    string
+
+	// Cost is populated when the agent's stream-json output contained a
+	// recognized cost-bearing event (Claude `result`, Codex `turn.completed`).
+	// Nil otherwise. The dispatcher persists this via core.CostWriter when
+	// configured. Plan 121.
+	Cost *CostSample
 }

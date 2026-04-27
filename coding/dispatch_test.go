@@ -67,6 +67,21 @@ func (failingSupervisorWriter) RecordVerdict(context.Context, string, string, co
 	return fmt.Errorf("writer failed")
 }
 
+type captureCostWriter struct {
+	calls []core.CostSample
+}
+
+func (c *captureCostWriter) RecordCost(_ context.Context, _ string, _ string, s core.CostSample) error {
+	c.calls = append(c.calls, s)
+	return nil
+}
+
+type failingCostWriter struct{}
+
+func (failingCostWriter) RecordCost(context.Context, string, string, core.CostSample) error {
+	return fmt.Errorf("cost writer failed")
+}
+
 type staticSupervisor struct {
 	verdict *core.SupervisorVerdict
 }
@@ -1167,6 +1182,126 @@ func TestOrchestrate_SupervisorEvalError_JobAndRunFailed(t *testing.T) {
 	}
 	if run.State != core.RunStateFailed {
 		t.Errorf("run state = %q, want %q", run.State, core.RunStateFailed)
+	}
+}
+
+func TestOrchestrate_PersistsCostWhenPresent(t *testing.T) {
+	repoRoot := findRepoRoot(t)
+	db, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("Open(:memory:): %v", err)
+	}
+	defer db.Close()
+
+	cost := &core.CostSample{Provider: "anthropic", Model: "opus", USD: 0.1234, TokensIn: 100, TokensOut: 50}
+	writer := &captureCostWriter{}
+	d := &Dispatcher{
+		RoleDir:   filepath.Join(repoRoot, "coding", "roles"),
+		PromptDir: filepath.Join(repoRoot, "coding"),
+		Agent: &countingAgent{wait: func(context.Context, *core.Job, string) (*core.JobResult, error) {
+			return &core.JobResult{ExitCode: 0, Cost: cost}, nil
+		}},
+		DB:         db,
+		CostWriter: writer,
+		Policy:     warnPolicy(),
+	}
+
+	if _, err := d.Orchestrate(context.Background(), &DispatchInput{
+		RoleName: "reviewer.arch",
+		Inputs:   map[string]string{"diff_path": "/tmp/x.diff", "spec_path": "/tmp/x.spec"},
+	}); err != nil {
+		t.Fatalf("Orchestrate: %v", err)
+	}
+	if len(writer.calls) != 1 {
+		t.Fatalf("RecordCost called %d times, want 1", len(writer.calls))
+	}
+	if writer.calls[0].USD != 0.1234 || writer.calls[0].Provider != "anthropic" {
+		t.Errorf("RecordCost arg = %+v, want %+v", writer.calls[0], *cost)
+	}
+}
+
+func TestOrchestrate_NoCostWhenAgentResultMissing(t *testing.T) {
+	repoRoot := findRepoRoot(t)
+	db, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("Open(:memory:): %v", err)
+	}
+	defer db.Close()
+
+	writer := &captureCostWriter{}
+	d := &Dispatcher{
+		RoleDir:   filepath.Join(repoRoot, "coding", "roles"),
+		PromptDir: filepath.Join(repoRoot, "coding"),
+		Agent: &countingAgent{wait: func(context.Context, *core.Job, string) (*core.JobResult, error) {
+			return &core.JobResult{ExitCode: 0}, nil // Cost == nil
+		}},
+		DB:         db,
+		CostWriter: writer,
+		Policy:     warnPolicy(),
+	}
+
+	if _, err := d.Orchestrate(context.Background(), &DispatchInput{
+		RoleName: "reviewer.arch",
+		Inputs:   map[string]string{"diff_path": "/tmp/x.diff", "spec_path": "/tmp/x.spec"},
+	}); err != nil {
+		t.Fatalf("Orchestrate: %v", err)
+	}
+	if len(writer.calls) != 0 {
+		t.Errorf("RecordCost called %d times, want 0", len(writer.calls))
+	}
+}
+
+func TestOrchestrate_CostWriterErrorIsNonFatal(t *testing.T) {
+	repoRoot := findRepoRoot(t)
+	db, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("Open(:memory:): %v", err)
+	}
+	defer db.Close()
+
+	cost := &core.CostSample{Provider: "anthropic", USD: 0.05}
+	d := &Dispatcher{
+		RoleDir:   filepath.Join(repoRoot, "coding", "roles"),
+		PromptDir: filepath.Join(repoRoot, "coding"),
+		Agent: &countingAgent{wait: func(context.Context, *core.Job, string) (*core.JobResult, error) {
+			return &core.JobResult{ExitCode: 0, Cost: cost}, nil
+		}},
+		DB:         db,
+		CostWriter: failingCostWriter{},
+		Policy:     warnPolicy(),
+	}
+
+	if _, err := d.Orchestrate(context.Background(), &DispatchInput{
+		RoleName: "reviewer.arch",
+		Inputs:   map[string]string{"diff_path": "/tmp/x.diff", "spec_path": "/tmp/x.spec"},
+	}); err != nil {
+		t.Fatalf("Orchestrate must tolerate cost writer failure: %v", err)
+	}
+}
+
+func TestOrchestrate_NilCostWriterIsNoOp(t *testing.T) {
+	repoRoot := findRepoRoot(t)
+	db, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("Open(:memory:): %v", err)
+	}
+	defer db.Close()
+
+	d := &Dispatcher{
+		RoleDir:   filepath.Join(repoRoot, "coding", "roles"),
+		PromptDir: filepath.Join(repoRoot, "coding"),
+		Agent: &countingAgent{wait: func(context.Context, *core.Job, string) (*core.JobResult, error) {
+			return &core.JobResult{ExitCode: 0, Cost: &core.CostSample{USD: 1}}, nil
+		}},
+		DB:     db,
+		Policy: warnPolicy(),
+	}
+
+	if _, err := d.Orchestrate(context.Background(), &DispatchInput{
+		RoleName: "reviewer.arch",
+		Inputs:   map[string]string{"diff_path": "/tmp/x.diff", "spec_path": "/tmp/x.spec"},
+	}); err != nil {
+		t.Fatalf("Orchestrate must not panic when CostWriter is nil: %v", err)
 	}
 }
 

@@ -1,7 +1,8 @@
 {
     "developer": {
         "exit_code": 0,
-        "findings_count": 0
+        "findings_count": 0,
+        "expect_cost_usd": 0.0123
     },
     "reviewer.arch": {
         "exit_code": 0,

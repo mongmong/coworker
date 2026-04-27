@@ -204,6 +204,55 @@ func TestReplayAgent_LineDelay(t *testing.T) {
 	}
 }
 
+func TestReplayAgent_CostFromResult(t *testing.T) {
+	dir := t.TempDir()
+	writeTranscript(t, dir, "developer.jsonl", strings.Join([]string{
+		`{"type":"finding","path":"x.go","line":1,"severity":"minor","body":"y"}`,
+		`{"type":"done","exit_code":0}`,
+		`{"type":"result","total_cost_usd":0.0123,"usage":{"input_tokens":10,"output_tokens":5},"modelUsage":{"claude-opus-4-7":{"inputTokens":10,"outputTokens":5,"costUSD":0.0123}}}`,
+	}, "\n"))
+	a := &ReplayAgent{TranscriptDir: dir}
+	h, err := a.Dispatch(context.Background(), &core.Job{Role: "developer"}, "")
+	if err != nil {
+		t.Fatalf("Dispatch: %v", err)
+	}
+	res, err := h.Wait(context.Background())
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if res.Cost == nil {
+		t.Fatal("Cost was not populated from `result` event")
+	}
+	if res.Cost.Provider != "anthropic" || res.Cost.USD != 0.0123 ||
+		res.Cost.Model != "claude-opus-4-7" {
+		t.Errorf("Cost = %+v", res.Cost)
+	}
+}
+
+func TestReplayAgent_CostFromTurnCompleted(t *testing.T) {
+	dir := t.TempDir()
+	writeTranscript(t, dir, "developer.jsonl", strings.Join([]string{
+		`{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":50,"output_tokens":20}}`,
+		`{"type":"done","exit_code":0}`,
+	}, "\n"))
+	a := &ReplayAgent{TranscriptDir: dir}
+	h, err := a.Dispatch(context.Background(), &core.Job{Role: "developer"}, "")
+	if err != nil {
+		t.Fatalf("Dispatch: %v", err)
+	}
+	res, err := h.Wait(context.Background())
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if res.Cost == nil {
+		t.Fatal("Cost was not populated from `turn.completed` event")
+	}
+	if res.Cost.Provider != "openai" || res.Cost.USD != 0 ||
+		res.Cost.TokensIn != 150 || res.Cost.TokensOut != 20 {
+		t.Errorf("Cost = %+v", res.Cost)
+	}
+}
+
 func TestReplayAgent_EmptyTranscript(t *testing.T) {
 	dir := t.TempDir()
 	writeTranscript(t, dir, "developer.jsonl", "")

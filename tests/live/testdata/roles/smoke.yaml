@@ -1,0 +1,24 @@
+name: smoke
+concurrency: single
+cli: claude-code
+prompt_template: prompts/smoke.md
+inputs:
+  required:
+    - prompt_text
+outputs:
+  contract: {}
+  emits: {}
+sandbox: read-only
+permissions:
+  allowed_tools:
+    - read
+    - "bash:claude"
+  never: []
+  requires_human: []
+budget:
+  max_tokens_per_job: 1000
+  max_wallclock_minutes: 1
+  max_cost_usd: 0.10
+retry_policy:
+  on_contract_fail: skip
+  on_job_error: skip

@@ -20,6 +20,10 @@ type cliJobHandle struct {
 }
 
 // streamMessage represents one line of the stream-JSON output from a CLI agent.
+//
+// Finding/done fields are present for any agent that emits them. Cost-bearing
+// fields populate from the optional Claude `result` event and Codex
+// `turn.completed` event; populateCost (cost_helpers.go) extracts the data.
 type streamMessage struct {
 	Type     string `json:"type"`
 	Path     string `json:"path,omitempty"`
@@ -27,6 +31,31 @@ type streamMessage struct {
 	Severity string `json:"severity,omitempty"`
 	Body     string `json:"body,omitempty"`
 	ExitCode int    `json:"exit_code,omitempty"`
+
+	// Cost-bearing fields. Plan 121.
+	TotalCostUSD float64                  `json:"total_cost_usd,omitempty"`
+	Usage        *streamUsage             `json:"usage,omitempty"`
+	ModelUsage   map[string]modelUsageRow `json:"modelUsage,omitempty"`
+}
+
+// streamUsage is the union of token-count fields emitted by Claude and Codex.
+// Only the relevant subset is non-zero for any one CLI:
+//
+//   - Claude: InputTokens, OutputTokens, CacheReadInputTokens.
+//   - Codex:  InputTokens, OutputTokens, CachedInputTokens.
+type streamUsage struct {
+	InputTokens          int `json:"input_tokens,omitempty"`
+	OutputTokens         int `json:"output_tokens,omitempty"`
+	CacheReadInputTokens int `json:"cache_read_input_tokens,omitempty"`
+	CachedInputTokens    int `json:"cached_input_tokens,omitempty"`
+}
+
+// modelUsageRow is one entry in Claude's `modelUsage` map. Used only to
+// extract the model identifier (the key) and verify there is data present.
+type modelUsageRow struct {
+	InputTokens  int     `json:"inputTokens"`
+	OutputTokens int     `json:"outputTokens"`
+	CostUSD      float64 `json:"costUSD"`
 }
 
 // Wait blocks until the CLI process completes, parsing stream-JSON stdout
@@ -68,6 +97,8 @@ func (h *cliJobHandle) Wait(ctx context.Context) (*core.JobResult, error) {
 		case "done":
 			result.ExitCode = msg.ExitCode
 		}
+		// Plan 121: extract cost from result/turn.completed events.
+		populateCost(msg, result)
 	}
 
 	// Read any remaining stdout.

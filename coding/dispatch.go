@@ -58,6 +58,11 @@ type Dispatcher struct {
 	// projection row. Optional; when nil, supervisor persistence is skipped.
 	SupervisorWriter core.SupervisorWriter
 
+	// CostWriter records cost samples after each completed attempt.
+	// Optional; when nil, cost persistence is skipped. Failure to persist is
+	// logged but does not fail dispatch (Plan 121).
+	CostWriter core.CostWriter
+
 	// MaxRetries is the maximum number of supervisor retries per job.
 	// Zero means use DefaultMaxRetries. Negative means no retries.
 	MaxRetries int
@@ -393,6 +398,16 @@ func (d *Dispatcher) executeAttempt(
 		return nil, fmt.Errorf("wait for agent: %w", err)
 	}
 	logger.Info("agent completed", "findings", len(result.Findings), "exit_code", result.ExitCode, "attempt", attempt)
+
+	// Plan 121: persist cost per-attempt. Each retry has a distinct jobID,
+	// so retries produce N rows for N attempts (matching real API spend).
+	// Best-effort: failure logs and continues.
+	if d.CostWriter != nil && result.Cost != nil {
+		if err := d.CostWriter.RecordCost(ctx, runID, jobID, *result.Cost); err != nil {
+			logger.Error("failed to persist cost sample",
+				"run_id", runID, "job_id", jobID, "attempt", attempt, "error", err)
+		}
+	}
 
 	attemptResult := &dispatchAttemptResult{
 		jobID:   jobID,
