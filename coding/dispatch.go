@@ -98,6 +98,18 @@ func (d *Dispatcher) agentFor(role *core.Role) core.Agent {
 type DispatchInput struct {
 	RoleName string
 	Inputs   map[string]string // required inputs (e.g., "diff_path", "spec_path")
+
+	// RunID, when non-empty, attaches the dispatch's job to the existing
+	// run instead of creating a new one. Used by autopilot
+	// (BuildFromPRDWorkflow + cli/run.go) so every architect / planner /
+	// developer / reviewer / tester / shipper job lives under the workflow's
+	// top-level run, giving orch_run_inspect, replay, cost reconstruction,
+	// and incident debugging one coherent run tree. Plan 139 (CRITICAL #2).
+	//
+	// Empty RunID preserves the legacy behavior: Orchestrate creates a new
+	// interactive run. This keeps `coworker invoke <role>` and tests working
+	// without changes.
+	RunID string
 }
 
 // DispatchResult contains the output of a dispatch operation.
@@ -153,18 +165,28 @@ func (d *Dispatcher) Orchestrate(ctx context.Context, input *DispatchInput) (*Di
 	jobStore := store.NewJobStore(d.DB, eventStore)
 	findingStore := store.NewFindingStore(d.DB, eventStore)
 
-	// 4. Create a run.
-	runID := core.NewID()
-	run := &core.Run{
-		ID:        runID,
-		Mode:      "interactive",
-		State:     core.RunStateActive,
-		StartedAt: time.Now(),
+	// 4. Use the caller-supplied RunID when present; otherwise create a
+	// new interactive run. The RunID parameter lets autopilot
+	// (BuildFromPRDWorkflow + cli/run.go) attach every role job to the
+	// workflow's top-level run instead of creating an orphan run per
+	// dispatch. Plan 139 (CRITICAL #2).
+	var runID string
+	if input.RunID != "" {
+		runID = input.RunID
+		logger.Info("attaching to existing run", "id", runID)
+	} else {
+		runID = core.NewID()
+		run := &core.Run{
+			ID:        runID,
+			Mode:      "interactive",
+			State:     core.RunStateActive,
+			StartedAt: time.Now(),
+		}
+		if err := runStore.CreateRun(ctx, run); err != nil {
+			return nil, fmt.Errorf("create run: %w", err)
+		}
+		logger.Info("created run", "id", runID)
 	}
-	if err := runStore.CreateRun(ctx, run); err != nil {
-		return nil, fmt.Errorf("create run: %w", err)
-	}
-	logger.Info("created run", "id", runID)
 
 	// 6. Render the prompt template.
 	tmpl, err := roles.LoadPromptTemplate(d.PromptDir, role.PromptTemplate)
@@ -203,11 +225,15 @@ func (d *Dispatcher) Orchestrate(ctx context.Context, input *DispatchInput) (*Di
 
 		attemptResult, err := d.executeAttempt(ctx, logger, eventStore, jobStore, runID, role, selectedAgent, prompt, originalPrompt, attempt, maxRetries)
 		if err != nil {
-			// Mark the run as failed so state is consistent even though the
-			// job was already marked failed inside executeAttempt.
-			if completeErr := runStore.CompleteRun(ctx, runID, core.RunStateFailed); completeErr != nil {
-				logger.Error("failed to mark run as failed after attempt error",
-					"run_id", runID, "error", completeErr)
+			// Mark the run as failed only when WE created it. When the
+			// caller attached us to an existing run (autopilot path), the
+			// caller owns run lifecycle — completing it here would
+			// terminate sibling jobs prematurely. Plan 139 (CRITICAL #2).
+			if input.RunID == "" {
+				if completeErr := runStore.CompleteRun(ctx, runID, core.RunStateFailed); completeErr != nil {
+					logger.Error("failed to mark run as failed after attempt error",
+						"run_id", runID, "error", completeErr)
+				}
 			}
 			return nil, err
 		}
@@ -269,10 +295,23 @@ func (d *Dispatcher) Orchestrate(ctx context.Context, input *DispatchInput) (*Di
 		return nil, fmt.Errorf("update job to %s: %w", finalState, err)
 	}
 
-	// 13. Complete the run.
+	// 13. Complete the run — but only when WE created it. Caller-attached
+	// runs are owned by the caller (autopilot's BuildFromPRDWorkflow). Plan 139.
 	runState := core.RunStateCompleted
 	if finalState == core.JobStateFailed {
 		runState = core.RunStateFailed
+	}
+	if input.RunID != "" {
+		// Skip CompleteRun: caller will close the workflow run.
+		return &DispatchResult{
+			RunID:             runID,
+			JobID:             lastJobID,
+			Findings:          lastResult.Findings,
+			Artifacts:         lastResult.Artifacts,
+			ExitCode:          lastResult.ExitCode,
+			SupervisorVerdict: lastVerdict,
+			RetryCount:        retryCount,
+		}, nil
 	}
 	if err := runStore.CompleteRun(ctx, runID, runState); err != nil {
 		return nil, fmt.Errorf("complete run: %w", err)

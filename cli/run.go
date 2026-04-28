@@ -263,6 +263,7 @@ func prepareArchitectDispatch(
 	logger.Info("dispatching architect role", "prd_path", prdPath)
 	result, archErr := dispatcher.Orchestrate(ctx, &coding.DispatchInput{
 		RoleName: "architect",
+		RunID:    run.ID, // Plan 139: attach to workflow run, not orphan run
 		Inputs:   map[string]string{"prd_path": prdPath},
 	})
 	if archErr != nil {
@@ -522,6 +523,7 @@ func runPlanLoopWithDeps(
 		logger.Info("dispatching planner role", "plan_id", plan.ID, "title", plan.Title)
 		plannerResult, plannerErr := plDispatcher.Orchestrate(ctx, &coding.DispatchInput{
 			RoleName: "planner",
+			RunID:    runID, // Plan 139: attach to workflow run
 			Inputs:   plannerInputs,
 		})
 		if plannerErr != nil {

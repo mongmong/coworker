@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/chris/coworker/agent"
 	"github.com/chris/coworker/coding/supervisor"
@@ -1327,6 +1328,83 @@ func TestOrchestrate_NilCostWriterIsNoOp(t *testing.T) {
 		Inputs:   map[string]string{"diff_path": "/tmp/x.diff", "spec_path": "/tmp/x.spec"},
 	}); err != nil {
 		t.Fatalf("Orchestrate must not panic when CostWriter is nil: %v", err)
+	}
+}
+
+// TestOrchestrate_AttachesToExistingRun verifies that when DispatchInput.RunID
+// is set, the dispatcher attaches its job to the existing run instead of
+// creating a new one. Plan 139 (Codex CRITICAL #2). Without this fix,
+// autopilot was fragmenting every role into its own orphan run.
+func TestOrchestrate_AttachesToExistingRun(t *testing.T) {
+	repoRoot := findRepoRoot(t)
+	db, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	es := store.NewEventStore(db)
+	rs := store.NewRunStore(db, es)
+	workflowRunID := "workflow-run-1"
+	if err := rs.CreateRun(context.Background(), &core.Run{
+		ID: workflowRunID, Mode: "autopilot", State: core.RunStateActive,
+		StartedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	d := &Dispatcher{
+		RoleDir:   filepath.Join(repoRoot, "coding", "roles"),
+		PromptDir: filepath.Join(repoRoot, "coding"),
+		Agent: &countingAgent{wait: func(context.Context, *core.Job, string) (*core.JobResult, error) {
+			return &core.JobResult{ExitCode: 0}, nil
+		}},
+		DB:     db,
+		Policy: warnPolicy(),
+	}
+
+	res, err := d.Orchestrate(context.Background(), &DispatchInput{
+		RoleName: "reviewer.arch",
+		RunID:    workflowRunID,
+		Inputs:   map[string]string{"diff_path": "/tmp/x.diff", "spec_path": "/tmp/x.spec"},
+	})
+	if err != nil {
+		t.Fatalf("Orchestrate: %v", err)
+	}
+	if res.RunID != workflowRunID {
+		t.Errorf("DispatchResult.RunID = %q, want %q", res.RunID, workflowRunID)
+	}
+
+	js := store.NewJobStore(db, es)
+	jobs, err := js.ListJobsByRun(context.Background(), workflowRunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("workflow run jobs = %d, want 1", len(jobs))
+	}
+	if jobs[0].Role != "reviewer.arch" {
+		t.Errorf("attached job role = %q, want reviewer.arch", jobs[0].Role)
+	}
+
+	run, err := rs.GetRun(context.Background(), workflowRunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.State != core.RunStateActive {
+		t.Errorf("workflow run state = %q after attached dispatch, want %q",
+			run.State, core.RunStateActive)
+	}
+	if run.Mode != "autopilot" {
+		t.Errorf("workflow run mode mutated to %q, want autopilot", run.Mode)
+	}
+
+	allRuns, err := rs.ListRuns(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(allRuns) != 1 {
+		t.Errorf("ListRuns returned %d runs; want 1 (no orphan run created)", len(allRuns))
 	}
 }
 

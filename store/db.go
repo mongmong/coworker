@@ -21,30 +21,32 @@ type DB struct {
 
 // Open opens (or creates) a SQLite database at the given path and
 // runs all pending migrations. Use ":memory:" for in-memory databases.
+//
+// Plan 139 (Codex CRITICAL #5): the DSN encodes PRAGMAs so they apply
+// to every connection in the pool, not just the first one. Without
+// this, fresh pooled connections silently lost foreign_keys
+// enforcement under concurrent load. busy_timeout retries lock
+// contention rather than failing immediately.
 func Open(path string) (*DB, error) {
-	sqlDB, err := sql.Open("sqlite", path)
+	dsn := buildSQLiteDSN(path)
+	sqlDB, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite %q: %w", path, err)
 	}
 
 	// In-memory SQLite databases exist only on a single connection.
 	// Limit the pool to one connection so all queries share the same DB
-	// instance; otherwise concurrent or goroutine-based callers may receive a
-	// fresh empty connection from the pool.
+	// instance; otherwise concurrent or goroutine-based callers may
+	// receive a fresh empty connection from the pool.
 	if path == ":memory:" {
 		sqlDB.SetMaxOpenConns(1)
 	}
 
-	// Enable WAL mode for better concurrent read performance.
-	if _, err := sqlDB.Exec("PRAGMA journal_mode=WAL"); err != nil {
+	// Probe the connection so PRAGMA failures (e.g., a corrupt file)
+	// surface here instead of at the first real query.
+	if err := sqlDB.Ping(); err != nil {
 		sqlDB.Close()
-		return nil, fmt.Errorf("set WAL mode: %w", err)
-	}
-
-	// Enable foreign keys.
-	if _, err := sqlDB.Exec("PRAGMA foreign_keys=ON"); err != nil {
-		sqlDB.Close()
-		return nil, fmt.Errorf("enable foreign keys: %w", err)
+		return nil, fmt.Errorf("ping sqlite %q: %w", path, err)
 	}
 
 	db := &DB{DB: sqlDB}
@@ -54,6 +56,32 @@ func Open(path string) (*DB, error) {
 	}
 
 	return db, nil
+}
+
+// buildSQLiteDSN attaches per-connection PRAGMAs to the DSN. modernc.org/sqlite
+// supports `_pragma=<name>(<value>)` query parameters that the driver applies
+// every time it opens a fresh connection — avoiding the "first connection only"
+// trap with sqlDB.Exec("PRAGMA ...").
+//
+// PRAGMAs we set:
+//   - foreign_keys(1)   — enforce FK constraints. SQLite default is OFF; per-conn.
+//   - busy_timeout(5000) — wait up to 5s for locks instead of failing immediately.
+//   - journal_mode(WAL)  — concurrent readers + one writer. (WAL persists in
+//     the file header so technically only the first conn needs to set it,
+//     but encoding it here makes intent obvious and is harmless on later opens.)
+//
+// Plan 139 (Codex CRITICAL #5).
+func buildSQLiteDSN(path string) string {
+	pragmas := "_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
+	if path == ":memory:" {
+		// In-memory: pool is capped at 1 connection (above), so the
+		// single connection gets the pragmas. Do NOT use cache=shared
+		// here — that would make every Open(":memory:") call share the
+		// same DB, breaking test isolation.
+		return "file::memory:?" + pragmas
+	}
+	// Non-memory: file: URI form so query params parse correctly.
+	return "file:" + path + "?" + pragmas
 }
 
 // migrate applies all pending migrations from the embedded migrations/ directory.
