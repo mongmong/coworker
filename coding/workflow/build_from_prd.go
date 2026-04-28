@@ -243,8 +243,12 @@ func (w *BuildFromPRDWorkflow) RunPhasesForPlan(
 		// registered with no roles (disabled).
 		w.PhaseExecutor.TesterRoles = w.StageRegistry.RolesForStage("phase-test")
 		// phase-ship is structurally different: Shipper does git+gh, not
-		// role dispatch. Customizing the ship stage is deferred until
-		// Shipper itself supports a role-based shape.
+		// role dispatch. Customizing the ship stage is deferred — see
+		// docs/architecture/decisions.md Decision 15 for the
+		// authoritative rationale and follow-up shape options.
+		// `stages.DefaultStages["phase-ship"]` is kept for spec
+		// completeness; `policy.workflow_overrides.phase-ship` has no
+		// effect today.
 	}
 
 	// Propagate WorkDir to PhaseExecutor for applies_when evaluation.
