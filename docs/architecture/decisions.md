@@ -211,4 +211,6 @@ This Decision consolidates items the audit + post-audit plans (122-135) explicit
 
 **Time-parse silent drops in store reads** (audit N7). `time.Parse(layout, str)` errors are dropped in store reads. The values come from code we wrote (DB writes use the same layout), so a parse failure indicates schema corruption rather than user input. Acceptable; a follow-up could add debug-level slog calls if production debugging needs them.
 
-**Status:** Reviewed in Plan 136. Each item has a clear path forward; none block V1.
+**`phase-ship` workflow override not consumed** (Plan 138, surfaced by re-audit). `coding/stages/defaults.go` declares `phase-ship: [shipper]` for completeness with the spec's four-stage model, but `BuildFromPRDWorkflow.RunPhasesForPlan` only consults the registry for `phase-dev`, `phase-review`, and `phase-test`. The Shipper does git + `gh pr create` directly — it's structurally different from the role-dispatch path the registry feeds. Customizing the ship stage requires either (a) refactoring Shipper to dispatch a configurable `shipper.*` role chain, or (b) extending Shipper to consult its own override field. Both are bigger than V1 needed; the entry stays in `DefaultStages` so the spec's stage catalog is complete, but `policy.workflow_overrides.phase-ship` has no effect today. A code comment in `coding/workflow/build_from_prd.go:245` notes this; this Decision entry is the authoritative deferral.
+
+**Status:** Reviewed in Plan 136 and updated in Plan 138. Each item has a clear path forward; none block V1.
