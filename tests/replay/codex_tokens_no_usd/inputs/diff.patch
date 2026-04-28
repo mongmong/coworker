@@ -1,0 +1,6 @@
+--- a/server.go
++++ b/server.go
+@@ -75,7 +75,9 @@ func handler(w http.ResponseWriter, r *http.Request) {
++    rows, _ := db.Query("...")
++    rows.Scan()
+}

@@ -1,0 +1,3 @@
+--- a/auth.go
++++ b/auth.go
++const apiKey = "sk-..."
