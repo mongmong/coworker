@@ -24,6 +24,10 @@ type Orchestrator interface {
 	Orchestrate(ctx context.Context, input *coding.DispatchInput) (*coding.DispatchResult, error)
 }
 
+// defaultDeveloperRole is the role dispatched at the start of each fix-loop
+// iteration when no override is provided. Plan 131.
+const defaultDeveloperRole = "developer"
+
 // defaultReviewerRoles are the roles dispatched in parallel after each developer
 // job when no override is provided.
 var defaultReviewerRoles = []string{"reviewer.arch", "reviewer.frontend"}
@@ -60,6 +64,14 @@ type PhaseExecutor struct {
 	// Policy controls fix-cycle limits and checkpoint behavior.
 	// May be nil; defaults are used when nil.
 	Policy *core.Policy
+
+	// DeveloperRole is the role dispatched at the start of each fix-loop
+	// iteration. Empty means use defaultDeveloperRole ("developer"). Set by
+	// BuildFromPRDWorkflow from StageRegistry.RolesForStage("phase-dev")[0]
+	// so policy.yaml workflow_overrides can swap the developer role.
+	// Plan 131. Multi-developer phase support is intentionally out of scope:
+	// the registry's first entry wins.
+	DeveloperRole string
 
 	// ReviewerRoles is the list of roles dispatched in parallel after each
 	// developer job. When nil, defaultReviewerRoles is used.
@@ -202,8 +214,12 @@ func (e *PhaseExecutor) runLoop(
 		log.Info("dispatching developer",
 			"plan_id", planID, "phase_index", phaseIndex, "fix_cycle", fixCycles)
 
+		devRole := e.DeveloperRole
+		if devRole == "" {
+			devRole = defaultDeveloperRole
+		}
 		devResult, err := e.Dispatcher.Orchestrate(ctx, &coding.DispatchInput{
-			RoleName: "developer",
+			RoleName: devRole,
 			Inputs:   devInputs,
 		})
 		if err != nil {
@@ -211,7 +227,7 @@ func (e *PhaseExecutor) runLoop(
 		}
 
 		// Step 2: fan-out reviewers + tester in parallel.
-		reviewerResults, err := e.fanOut(ctx, runID, inputs, log)
+		reviewerResults, err := e.fanOut(ctx, runID, phaseIndex, inputs, log)
 		if err != nil {
 			return nil, fmt.Errorf("phase %d/%d fan-out: %w", planID, phaseIndex, err)
 		}
@@ -332,6 +348,7 @@ func (e *PhaseExecutor) testerRoles() []string {
 func (e *PhaseExecutor) fanOut(
 	ctx context.Context,
 	runID string,
+	phaseIndex int,
 	inputs map[string]string,
 	log *slog.Logger,
 ) ([]*coding.DispatchResult, error) {
@@ -354,7 +371,7 @@ func (e *PhaseExecutor) fanOut(
 					// anyway (graceful degradation — applies_when is optional).
 					log.Warn("could not load role for applies_when check; dispatching unconditionally",
 						"role", roleName, "error", err)
-				} else if shouldSkip, skipErr := e.roleShouldSkip(gCtx, role); skipErr != nil {
+				} else if shouldSkip, skipErr := e.roleShouldSkip(gCtx, role, phaseIndex); skipErr != nil {
 					// Predicate error: log warning and dispatch anyway (don't crash the phase).
 					if e.WorkDir == "" {
 						log.Warn("WorkDir not set for applies_when evaluation; dispatching unconditionally",
@@ -402,7 +419,11 @@ func (e *PhaseExecutor) fanOut(
 // roleShouldSkip returns true if the role's AppliesWhen clause evaluates to
 // false (meaning the role should be skipped, not dispatched).
 // Returns (false, nil) when AppliesWhen is nil (no filter → always dispatch).
-func (e *PhaseExecutor) roleShouldSkip(ctx context.Context, role *core.Role) (bool, error) {
+//
+// Multiple predicates AND together: every populated predicate must hold for
+// the role to fire. Plan 131 (I3) extended this from changes_touch to also
+// support commit_msg_contains and phase_index_in.
+func (e *PhaseExecutor) roleShouldSkip(ctx context.Context, role *core.Role, phaseIndex int) (bool, error) {
 	_ = ctx // reserved for future async predicate evaluation
 	if role.AppliesWhen == nil {
 		return false, nil // no filter → dispatch
@@ -410,17 +431,41 @@ func (e *PhaseExecutor) roleShouldSkip(ctx context.Context, role *core.Role) (bo
 
 	if len(role.AppliesWhen.ChangesTouch) > 0 {
 		if e.WorkDir == "" {
-			// WorkDir not set: log warning and dispatch unconditionally.
 			return false, fmt.Errorf("WorkDir not set; cannot evaluate changes_touch for role %q", role.Name)
 		}
 		touched, err := predicates.ChangesTouchInDir(e.WorkDir, role.AppliesWhen.ChangesTouch)
 		if err != nil {
 			return false, err
 		}
-		return !touched, nil // skip if NOT touched
+		if !touched {
+			return true, nil // skip
+		}
 	}
 
-	return false, nil // unknown applies_when keys → dispatch (forward-compat)
+	if role.AppliesWhen.CommitMsgContains != "" {
+		if e.WorkDir == "" {
+			return false, fmt.Errorf("WorkDir not set; cannot evaluate commit_msg_contains for role %q", role.Name)
+		}
+		matched, err := predicates.CommitMsgContains(e.WorkDir, role.AppliesWhen.CommitMsgContains)
+		if err != nil {
+			return false, err
+		}
+		if !matched {
+			return true, nil // skip
+		}
+	}
+
+	if role.AppliesWhen.PhaseIndexIn != "" {
+		inRange, err := predicates.PhaseIndexIn(phaseIndex, role.AppliesWhen.PhaseIndexIn)
+		if err != nil {
+			return false, err
+		}
+		if !inRange {
+			return true, nil // skip
+		}
+	}
+
+	return false, nil // all predicates hold → dispatch
 }
 
 // emitJobSkippedEvent writes a job.skipped event to the EventStore.

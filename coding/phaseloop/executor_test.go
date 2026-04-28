@@ -375,7 +375,7 @@ func TestPhaseExecutor_FeedbackPassedToDevOnFixCycle(t *testing.T) {
 func TestPhaseExecutor_RoleShouldSkip_NilAppliesWhen(t *testing.T) {
 	exec := &PhaseExecutor{}
 	role := &core.Role{Name: "reviewer.arch"}
-	skip, err := exec.roleShouldSkip(context.Background(), role)
+	skip, err := exec.roleShouldSkip(context.Background(), role, 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -391,9 +391,35 @@ func TestPhaseExecutor_RoleShouldSkip_EmptyWorkDir(t *testing.T) {
 		Name:        "reviewer.frontend",
 		AppliesWhen: &core.RoleAppliesWhen{ChangesTouch: []string{"web/**"}},
 	}
-	_, err := exec.roleShouldSkip(context.Background(), role)
+	_, err := exec.roleShouldSkip(context.Background(), role, 0)
 	if err == nil {
 		t.Error("expected error when WorkDir is empty and applies_when is set")
+	}
+}
+
+// TestPhaseExecutor_RoleShouldSkip_PhaseIndexIn verifies the new
+// phase_index_in predicate gates dispatch by phase index. Plan 131 (I3).
+func TestPhaseExecutor_RoleShouldSkip_PhaseIndexIn(t *testing.T) {
+	exec := &PhaseExecutor{}
+	role := &core.Role{
+		Name:        "deploy",
+		AppliesWhen: &core.RoleAppliesWhen{PhaseIndexIn: "0-2"},
+	}
+	// phase 1 → in range → don't skip.
+	skip, err := exec.roleShouldSkip(context.Background(), role, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if skip {
+		t.Error("phase 1 in range '0-2' should not be skipped")
+	}
+	// phase 5 → out of range → skip.
+	skip, err = exec.roleShouldSkip(context.Background(), role, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !skip {
+		t.Error("phase 5 outside range '0-2' should be skipped")
 	}
 }
 
