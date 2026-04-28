@@ -187,3 +187,28 @@ The helper is then invoked at the post-spec-approved code path in `runPlanLoopWi
 **Decision:** The HTTP server now binds to `127.0.0.1:7700` by default. Users who need LAN access pass `--http-bind 0.0.0.0` (documented in the daemon's long help with a "trusted-LAN only" caveat). Authenticated endpoints remain a V2 deferral, but the loopback default narrows the V1 surface significantly.
 
 **Status:** Introduced in Plan 127.
+
+
+## Decision 15: V1.1+ Deferrals (Plan 136)
+
+This Decision consolidates items the audit + post-audit plans (122-135) explicitly deferred. Each is in scope for a future plan but not required for V1 ship readiness.
+
+**Codex USD computation from tokens** (audit N8). Codex `turn.completed.usage` carries token counts but no USD. A per-model price table (with fallback to API-reported pricing if/when Codex exposes it) would convert tokens → USD. For V1, `cost_events.usd` is 0 for Codex jobs and `verifyCostUnderBudget` skips assertions for Codex. Tracked separately when the price table lands.
+
+**Runtime budget enforcement** (audit context). `runs.budget_usd` is recorded on `CreateRun` and `cumulative_usd` is computed inside `CostEventStore.RecordCost`. Neither value gates further dispatch today. A future plan compares cumulative against budget on every cost write and surfaces a `budget-exceeded` checkpoint that blocks until a human approves continuation.
+
+**TUI attention auto-refresh** (audit I10). `EventAttentionCreated` / `EventAttentionResolved` event constants exist in `core/event.go` and the TUI's `applyEvent` switch consumes them, but no producer emits them — Decision 6 (Plan 119) made attention writes intentionally non-event-based. Two plausible fixes for a follow-up: (a) `AttentionStore` publishes to `EventBus` as a side-effect (no event-log row, just a live observer signal); or (b) replace the TUI's event-driven attention sync with HTTP polling against `/attention`. Pick (a) for fewer moving parts.
+
+**`coworker redo`** (audit I1, partial). Re-dispatching a role with prior inputs needs `DispatchInput.Inputs` persisted (today only role/cli/state are on the `jobs` row). Smallest change: extend the `job.created` event payload with the input map, and have JobStore decode it on Get. Workaround: `coworker invoke <role> --diff <...> --spec <...>` runs the role with explicit inputs.
+
+**`coworker resume`** (audit I1, partial). The spec described it as the inverse of "interactive pause", but the runtime has no separate "paused-interactive" state — pauses happen via attention checkpoints, and resumption happens via `coworker run --resume-after-attention <id>`. A standalone `resume` command would be a thin alias and risks confusion. Documented as out-of-scope; user's mental model is served by the existing flag.
+
+**Filesystem watch on `coworker edit`** (audit I1, partial / spec line 519). `coworker edit <path>` opens `$EDITOR`, then on exit prints next-step hints if the file is dirty. The spec's "runtime watches fs" semantics need an event-bus path that publishes `human-edit` jobs from filesystem events. Workaround: explicit `coworker record-human-edit --commit <sha>`.
+
+**Phase-loop replay scenarios** (audit B7, partial). The 3 single-role replay scenarios shipped (Plan 132) cover the agent + parser + persistence pipeline. Multi-phase plans, supervisor retry loops, phase-clean checkpoints, quality-gate escalations, and worker registration scenarios all need PhaseExecutor / supervisor / worker-registry test wiring beyond the single-Dispatcher template. Tracked as a follow-up.
+
+**`cmd/coworker/main.go` test** (audit N2). 3-line shim (`os.Exit(cli.Execute())`). Coverage is implicit via the CLI integration tests. Adding a direct test would either need a process-fork or a mock-Execute injection — neither is justified for the LOC.
+
+**Time-parse silent drops in store reads** (audit N7). `time.Parse(layout, str)` errors are dropped in store reads. The values come from code we wrote (DB writes use the same layout), so a parse failure indicates schema corruption rather than user input. Acceptable; a follow-up could add debug-level slog calls if production debugging needs them.
+
+**Status:** Reviewed in Plan 136. Each item has a clear path forward; none block V1.
