@@ -28,19 +28,35 @@ func NewCostEventStore(db *DB, event *EventStore) *CostEventStore {
 // applied) and `budget_usd` (the run's configured budget, 0 when unset).
 // TUI and other live consumers read those derived fields directly from the
 // event payload without re-querying the runs row. Plan 130 (I11).
+//
+// Concurrency note: the cumulative + budget pre-read happens INSIDE the
+// SQLite transaction (Plan 137 fix for re-audit finding). Two concurrent
+// RecordCost calls for the same run will each see snapshot-isolated
+// cost_usd values, so the cumulative_usd written into each event payload
+// matches the post-bump truth in runs.cost_usd. Without the in-transaction
+// read, the event payload could carry a stale cumulative under parallel
+// dispatch (max_parallel_plans > 1).
+//
+// Implementation note: we open the transaction directly (not via
+// EventStore.WriteEventThenRow) because the payload is computed inside
+// the transaction. The event-first invariant is preserved: the event
+// INSERT happens before the projection writes within the same tx.
 func (s *CostEventStore) RecordCost(ctx context.Context, runID, jobID string, sample core.CostSample) error {
-	// Pre-read the run's current cost + budget so the event payload can
-	// surface cumulative + budget to live consumers (e.g., TUI). The
-	// transaction below bumps runs.cost_usd; cumulative = pre + sample.USD.
+	now := time.Now()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Read inside the transaction so cumulative reflects the pre-bump
+	// value at the same isolation level as the UPDATE below.
 	var preCost float64
 	var budgetUSD sql.NullFloat64
-	if err := s.db.QueryRowContext(ctx,
+	if err := tx.QueryRowContext(ctx,
 		`SELECT cost_usd, budget_usd FROM runs WHERE id = ?`, runID,
 	).Scan(&preCost, &budgetUSD); err != nil {
-		// Non-fatal: missing run row is a real error, but we still want
-		// the cost write itself to surface it via the FK below. Treat
-		// the read as best-effort.
-		preCost = 0
+		return fmt.Errorf("read run cost: %w", err)
 	}
 	cumulative := preCost + sample.USD
 	budget := 0.0
@@ -62,39 +78,71 @@ func (s *CostEventStore) RecordCost(ctx context.Context, runID, jobID string, sa
 	if err != nil {
 		return fmt.Errorf("marshal cost.delta: %w", err)
 	}
-	now := time.Now()
-	ev := &core.Event{
-		ID:            core.NewID(),
-		RunID:         runID,
-		Kind:          core.EventCostDelta,
-		SchemaVersion: 1,
-		CorrelationID: jobID,
-		Payload:       string(payload),
-		CreatedAt:     now,
+
+	// Compute the event sequence number for this run (matches
+	// EventStore.WriteEventThenRow's algorithm).
+	var seq int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COALESCE(MAX(sequence), 0) + 1 FROM events WHERE run_id = ?`,
+		runID,
+	).Scan(&seq); err != nil {
+		return fmt.Errorf("compute event sequence: %w", err)
 	}
-	return s.event.WriteEventThenRow(ctx, ev, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, `
-			INSERT INTO cost_events
-				(id, run_id, job_id, provider, model, tokens_in, tokens_out, usd, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			core.NewID(), runID, jobID, sample.Provider, sample.Model,
-			sample.TokensIn, sample.TokensOut, sample.USD, now.UTC().Format(time.RFC3339Nano),
-		)
-		if err != nil {
-			return fmt.Errorf("insert cost_event: %w", err)
-		}
-		if _, err := tx.ExecContext(ctx,
-			`UPDATE jobs SET cost_usd = cost_usd + ? WHERE id = ?`,
-			sample.USD, jobID); err != nil {
-			return fmt.Errorf("bump job cost: %w", err)
-		}
-		if _, err := tx.ExecContext(ctx,
-			`UPDATE runs SET cost_usd = cost_usd + ? WHERE id = ?`,
-			sample.USD, runID); err != nil {
-			return fmt.Errorf("bump run cost: %w", err)
-		}
-		return nil
-	})
+
+	// Event-first: INSERT the event row before the projection writes.
+	eventID := core.NewID()
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO events (id, run_id, sequence, kind, schema_version,
+			idempotency_key, causation_id, correlation_id, payload, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		eventID, runID, seq, string(core.EventCostDelta), 1,
+		nullableString(""), nullableString(""), nullableString(jobID),
+		string(payload), now.UTC().Format(time.RFC3339),
+	); err != nil {
+		return fmt.Errorf("insert cost.delta event: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO cost_events
+			(id, run_id, job_id, provider, model, tokens_in, tokens_out, usd, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		core.NewID(), runID, jobID, sample.Provider, sample.Model,
+		sample.TokensIn, sample.TokensOut, sample.USD, now.UTC().Format(time.RFC3339Nano),
+	); err != nil {
+		return fmt.Errorf("insert cost_event: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE jobs SET cost_usd = cost_usd + ? WHERE id = ?`,
+		sample.USD, jobID); err != nil {
+		return fmt.Errorf("bump job cost: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE runs SET cost_usd = cost_usd + ? WHERE id = ?`,
+		sample.USD, runID); err != nil {
+		return fmt.Errorf("bump run cost: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit cost.delta tx: %w", err)
+	}
+
+	// Publish to the in-memory bus after commit, mirroring
+	// EventStore.WriteEventThenRow. Use the constructed event so SSE
+	// subscribers see the same payload + sequence.
+	if s.event != nil && s.event.Bus != nil {
+		s.event.Bus.Publish(&core.Event{
+			ID:            eventID,
+			RunID:         runID,
+			Sequence:      seq,
+			Kind:          core.EventCostDelta,
+			SchemaVersion: 1,
+			CorrelationID: jobID,
+			Payload:       string(payload),
+			CreatedAt:     now,
+		})
+	}
+
+	return nil
 }
 
 // CostEventRow is a row from the cost_events projection.

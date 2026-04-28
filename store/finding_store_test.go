@@ -104,6 +104,10 @@ func TestFindingsImmutableTrigger_AllImmutableColumns(t *testing.T) {
 		{"fingerprint", "UPDATE findings SET fingerprint = 'tampered-fp' WHERE id = 'find_immut'"},
 		{"run_id", "UPDATE findings SET run_id = 'run_other' WHERE id = 'find_immut'"},
 		{"job_id", "UPDATE findings SET job_id = 'job_other' WHERE id = 'find_immut'"},
+		// Plan 137: extended trigger covers Plan 125's columns too.
+		{"plan_id", "UPDATE findings SET plan_id = 'plan-evil' WHERE id = 'find_immut'"},
+		{"phase_index", "UPDATE findings SET phase_index = 99 WHERE id = 'find_immut'"},
+		{"reviewer_handle", "UPDATE findings SET reviewer_handle = 'attacker' WHERE id = 'find_immut'"},
 	}
 
 	for _, tc := range tests {
