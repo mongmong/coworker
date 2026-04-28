@@ -1,0 +1,4 @@
+{"type":"finding","path":"server.go","line":78,"severity":"important","body":"unhandled error from rows.Scan"}
+{"type":"finding","path":"server.go","line":102,"severity":"minor","body":"prefer prepared statement"}
+{"type":"turn.completed","usage":{"input_tokens":54000,"cached_input_tokens":12000,"output_tokens":820}}
+{"type":"done","exit_code":0}

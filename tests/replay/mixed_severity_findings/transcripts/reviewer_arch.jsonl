@@ -1,0 +1,5 @@
+{"type":"finding","path":"auth.go","line":17,"severity":"critical","body":"hardcoded API key — must be env var"}
+{"type":"finding","path":"server.go","line":42,"severity":"important","body":"unhandled error from rows.Scan"}
+{"type":"finding","path":"server.go","line":89,"severity":"minor","body":"prefer prepared statement"}
+{"type":"finding","path":"server.go","line":150,"severity":"nit","body":"trailing whitespace"}
+{"type":"done","exit_code":0}
