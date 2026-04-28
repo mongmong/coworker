@@ -1271,11 +1271,36 @@ func TestOrchestrate_CostWriterErrorIsNonFatal(t *testing.T) {
 		Policy:     warnPolicy(),
 	}
 
-	if _, err := d.Orchestrate(context.Background(), &DispatchInput{
+	res, err := d.Orchestrate(context.Background(), &DispatchInput{
 		RoleName: "reviewer.arch",
 		Inputs:   map[string]string{"diff_path": "/tmp/x.diff", "spec_path": "/tmp/x.spec"},
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("Orchestrate must tolerate cost writer failure: %v", err)
+	}
+	// Plan 136 (N6): assert the dispatch itself succeeded — the agent's
+	// findings should still flow through, the run should be active, and
+	// the job state should be complete. Cost writer failure is best-effort
+	// and must not poison the result.
+	if res.ExitCode != 0 {
+		t.Errorf("DispatchResult.ExitCode = %d, want 0 — cost-writer failure must not change exit", res.ExitCode)
+	}
+	js := store.NewJobStore(db, store.NewEventStore(db))
+	job, err := js.GetJob(context.Background(), res.JobID)
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	if job.State != core.JobStateComplete {
+		t.Errorf("job state = %q, want %q after cost-writer failure",
+			job.State, core.JobStateComplete)
+	}
+	rs := store.NewRunStore(db, store.NewEventStore(db))
+	run, err := rs.GetRun(context.Background(), res.RunID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if run.State != core.RunStateCompleted {
+		t.Errorf("run state = %q, want %q", run.State, core.RunStateCompleted)
 	}
 }
 
