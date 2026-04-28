@@ -1,4 +1,4 @@
-.PHONY: help test test-unit test-integration test-replay test-live lint build clean tidy
+.PHONY: help test test-unit test-integration test-replay test-live lint build clean tidy release release-clean
 
 BINARY := coworker
 MODULE := github.com/chris/coworker
@@ -40,3 +40,28 @@ tidy: ## Tidy go.mod / go.sum.
 .PHONY: golden-update
 golden-update: ## Regenerate TUI golden output files.
 	UPDATE_GOLDEN=1 go test ./tui/... -run TestGolden -count=1
+
+# --- Release / cross-compile ------------------------------------------------
+# Targets verify the single-binary distribution claim (CLAUDE.md). Pure-Go
+# SQLite (modernc.org/sqlite) means cross-compilation needs no C toolchain.
+RELEASE_DIR := dist
+RELEASE_TARGETS := \
+	linux/amd64 \
+	linux/arm64 \
+	darwin/amd64 \
+	darwin/arm64
+
+release: ## Cross-compile release binaries for linux + darwin (amd64/arm64).
+	@mkdir -p $(RELEASE_DIR)
+	@for target in $(RELEASE_TARGETS); do \
+		os=$${target%/*}; arch=$${target#*/}; \
+		name=$(BINARY)-$$os-$$arch; \
+		echo "Building $$name..."; \
+		CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch \
+			go build $(LDFLAGS) -o $(RELEASE_DIR)/$$name ./cmd/coworker || exit 1; \
+	done
+	@echo "Release artifacts in $(RELEASE_DIR)/"
+	@ls -lh $(RELEASE_DIR)/
+
+release-clean: ## Remove release artifacts.
+	rm -rf $(RELEASE_DIR)
