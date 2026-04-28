@@ -3,6 +3,8 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"sort"
+	"sync"
 	"testing"
 	"time"
 
@@ -150,6 +152,101 @@ func TestCostEventStore_RollsBackEventOnProjectionFailure(t *testing.T) {
 	}
 	if len(after) != len(before) {
 		t.Fatalf("event count after failed projection = %d, want %d", len(after), len(before))
+	}
+}
+
+// TestCostEventStore_ConcurrentRecordCostMatchesFinalCumulative
+// verifies that concurrent RecordCost calls for the same run produce
+// event payloads whose cumulative_usd values, when sorted, form an
+// arithmetic sequence summing to the final runs.cost_usd. Plan 137
+// fixed a race where the pre-read happened outside the transaction;
+// without the fix, multiple events could carry the same stale
+// cumulative value.
+func TestCostEventStore_ConcurrentRecordCostMatchesFinalCumulative(t *testing.T) {
+	db := setupTestDB(t)
+	es := NewEventStore(db)
+	rs := NewRunStore(db, es)
+	js := NewJobStore(db, es)
+	cs := NewCostEventStore(db, es)
+	ctx := context.Background()
+
+	runID := "run_concurrent_cost"
+	if err := rs.CreateRun(ctx, &core.Run{
+		ID: runID, Mode: "interactive", State: core.RunStateActive,
+		StartedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	jobID := "job_concurrent_cost"
+	if err := js.CreateJob(ctx, &core.Job{
+		ID: jobID, RunID: runID, Role: "developer",
+		State: core.JobStatePending, DispatchedBy: "test", StartedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 10 concurrent RecordCost calls. Each adds 0.01.
+	const N = 10
+	const sample = 0.01
+	var wg sync.WaitGroup
+	wg.Add(N)
+	errs := make(chan error, N)
+	for i := 0; i < N; i++ {
+		go func() {
+			defer wg.Done()
+			if err := cs.RecordCost(ctx, runID, jobID, core.CostSample{
+				Provider: "anthropic", Model: "opus", USD: sample,
+			}); err != nil {
+				errs <- err
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Errorf("concurrent RecordCost: %v", err)
+	}
+
+	// Final runs.cost_usd must be exactly N*sample.
+	run, err := rs.GetRun(ctx, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := float64(N) * sample
+	if run.CostUSD < expected-0.0001 || run.CostUSD > expected+0.0001 {
+		t.Errorf("runs.cost_usd = %v, want %v (10 × 0.01)", run.CostUSD, expected)
+	}
+
+	// Each event payload's cumulative_usd is the post-bump cost
+	// computed inside the same transaction. The set of cumulatives
+	// must be {0.01, 0.02, ..., 0.10} (in some order).
+	events, err := es.ListEvents(ctx, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotCumulatives := []float64{}
+	for _, ev := range events {
+		if ev.Kind != core.EventCostDelta {
+			continue
+		}
+		var p struct {
+			Cumulative float64 `json:"cumulative_usd"`
+		}
+		if err := json.Unmarshal([]byte(ev.Payload), &p); err != nil {
+			t.Fatal(err)
+		}
+		gotCumulatives = append(gotCumulatives, p.Cumulative)
+	}
+	if len(gotCumulatives) != N {
+		t.Fatalf("collected %d cost cumulatives, want %d", len(gotCumulatives), N)
+	}
+	sort.Float64s(gotCumulatives)
+	for i, c := range gotCumulatives {
+		want := float64(i+1) * sample
+		if c < want-0.0001 || c > want+0.0001 {
+			t.Errorf("cumulative[%d] = %v, want %v (cumulatives must form an arithmetic sequence under the in-transaction read fix)",
+				i, c, want)
+		}
 	}
 }
 
