@@ -159,6 +159,46 @@ EOF`)
 	}
 }
 
+// TestCliHandle_ParsesArtifact verifies that {"type":"artifact",
+// "kind":"<k>","path":"<p>"} events populate result.Artifacts.
+// Plan 139 (Codex CRITICAL #1).
+func TestCliHandle_ParsesArtifact(t *testing.T) {
+	res, err := runStreamScript(t, `cat <<'EOF'
+{"type":"artifact","kind":"spec","path":"docs/specs/2026-04-28-x.md"}
+{"type":"artifact","kind":"manifest","path":"docs/plans/x-manifest.yaml"}
+{"type":"done","exit_code":0}
+EOF`)
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if len(res.Artifacts) != 2 {
+		t.Fatalf("Artifacts = %d, want 2", len(res.Artifacts))
+	}
+	if res.Artifacts[0].Kind != "spec" || res.Artifacts[0].Path != "docs/specs/2026-04-28-x.md" {
+		t.Errorf("Artifacts[0] = %+v", res.Artifacts[0])
+	}
+	if res.Artifacts[1].Kind != "manifest" || res.Artifacts[1].Path != "docs/plans/x-manifest.yaml" {
+		t.Errorf("Artifacts[1] = %+v", res.Artifacts[1])
+	}
+}
+
+// TestCliHandle_ArtifactRequiresKindAndPath verifies that an artifact
+// event missing kind or path is silently dropped (defensive).
+func TestCliHandle_ArtifactRequiresKindAndPath(t *testing.T) {
+	res, err := runStreamScript(t, `cat <<'EOF'
+{"type":"artifact","kind":"","path":"/tmp/x"}
+{"type":"artifact","kind":"spec","path":""}
+{"type":"artifact","kind":"manifest","path":"docs/plans/m.yaml"}
+{"type":"done","exit_code":0}
+EOF`)
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if len(res.Artifacts) != 1 {
+		t.Errorf("Artifacts = %d, want 1 (incomplete entries dropped)", len(res.Artifacts))
+	}
+}
+
 func TestCliHandle_UnknownTypeIgnored(t *testing.T) {
 	// Unknown event types are silently dropped (no findings produced).
 	// Cost-bearing types (`result`, `turn.completed`) populate Cost via

@@ -32,6 +32,11 @@ type streamMessage struct {
 	Body     string `json:"body,omitempty"`
 	ExitCode int    `json:"exit_code,omitempty"`
 
+	// Artifact fields (Plan 139, Codex CRITICAL #1). When type=="artifact",
+	// Kind and Path are required. Used by architect (kind=spec / kind=manifest)
+	// and any future role that emits durable file artifacts.
+	Kind string `json:"kind,omitempty"`
+
 	// Cost-bearing fields. Plan 121.
 	TotalCostUSD float64                  `json:"total_cost_usd,omitempty"`
 	Usage        *streamUsage             `json:"usage,omitempty"`
@@ -94,6 +99,18 @@ func (h *cliJobHandle) Wait(ctx context.Context) (*core.JobResult, error) {
 				Severity: core.Severity(msg.Severity),
 				Body:     msg.Body,
 			})
+		case "artifact":
+			// Plan 139 (Codex CRITICAL #1): roles that produce durable
+			// file artifacts (architect → spec + manifest, planner →
+			// plan files) emit `{"type":"artifact","kind":"<kind>","path":"<path>"}`
+			// events. The dispatcher persists these via ArtifactStore.
+			if msg.Kind != "" && msg.Path != "" {
+				result.Artifacts = append(result.Artifacts, core.Artifact{
+					ID:   core.NewID(),
+					Kind: msg.Kind,
+					Path: msg.Path,
+				})
+			}
 		case "done":
 			result.ExitCode = msg.ExitCode
 		}

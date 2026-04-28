@@ -65,11 +65,12 @@ Rules for the manifest:
 - Phase skeletons are granular enough for the planner to elaborate without
   guessing about scope boundaries.
 
-After writing both files, emit JSON:
-```json
-{
-  "spec_path": "docs/specs/<date>-<slug>.md",
-  "manifest_path": "docs/plans/<slug>-manifest.yaml",
-  "notes": "Brief summary of key architectural decisions made."
-}
+After writing both files, emit ONE stream-json line per artifact, then a
+done line. The dispatcher's parser populates `JobResult.Artifacts` from
+each `{"type":"artifact",...}` event:
+
+```jsonl
+{"type":"artifact","kind":"spec","path":"docs/specs/<date>-<slug>.md"}
+{"type":"artifact","kind":"manifest","path":"docs/plans/<slug>-manifest.yaml"}
+{"type":"done","exit_code":0}
 ```
