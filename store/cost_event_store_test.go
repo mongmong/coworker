@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -149,5 +150,103 @@ func TestCostEventStore_RollsBackEventOnProjectionFailure(t *testing.T) {
 	}
 	if len(after) != len(before) {
 		t.Fatalf("event count after failed projection = %d, want %d", len(after), len(before))
+	}
+}
+
+// TestCostEventStore_PayloadIncludesCumulativeAndBudget verifies the
+// cost.delta event payload exposes cumulative_usd and budget_usd so live
+// consumers (TUI, HTTP/SSE clients) can show totals without re-querying
+// the runs row. Plan 130 (I11).
+func TestCostEventStore_PayloadIncludesCumulativeAndBudget(t *testing.T) {
+	db := setupTestDB(t)
+	es := NewEventStore(db)
+	rs := NewRunStore(db, es)
+	js := NewJobStore(db, es)
+	cs := NewCostEventStore(db, es)
+	ctx := context.Background()
+
+	// Seed run with a budget; seed a job.
+	runID := "run_payload_1"
+	budget := 5.0
+	if err := rs.CreateRun(ctx, &core.Run{
+		ID: runID, Mode: "interactive", State: core.RunStateActive,
+		StartedAt: time.Now(),
+		BudgetUSD: &budget,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	jobID := "job_payload_1"
+	if err := js.CreateJob(ctx, &core.Job{
+		ID: jobID, RunID: runID, Role: "developer",
+		State: core.JobStatePending, DispatchedBy: "test", StartedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// First cost sample. Cumulative should equal sample.USD; budget should
+	// match the run's budget.
+	if err := cs.RecordCost(ctx, runID, jobID, core.CostSample{
+		Provider: "anthropic", Model: "claude", USD: 0.0042,
+		TokensIn: 100, TokensOut: 50,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Find the latest cost.delta event and decode the payload.
+	events, err := es.ListEvents(ctx, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var costEvent *core.Event
+	for i := len(events) - 1; i >= 0; i-- {
+		if events[i].Kind == core.EventCostDelta {
+			costEvent = &events[i]
+			break
+		}
+	}
+	if costEvent == nil {
+		t.Fatal("no cost.delta event in log")
+	}
+	var payload struct {
+		Cumulative float64 `json:"cumulative_usd"`
+		BudgetUSD  float64 `json:"budget_usd"`
+		USD        float64 `json:"usd"`
+		TokensIn   int     `json:"tokens_in"`
+		TokensOut  int     `json:"tokens_out"`
+	}
+	if err := json.Unmarshal([]byte(costEvent.Payload), &payload); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	if payload.USD != 0.0042 {
+		t.Errorf("usd = %v, want 0.0042", payload.USD)
+	}
+	if payload.Cumulative != 0.0042 {
+		t.Errorf("cumulative_usd = %v, want 0.0042 (first sample)", payload.Cumulative)
+	}
+	if payload.BudgetUSD != 5.0 {
+		t.Errorf("budget_usd = %v, want 5.0", payload.BudgetUSD)
+	}
+	if payload.TokensIn != 100 || payload.TokensOut != 50 {
+		t.Errorf("tokens = %d/%d, want 100/50", payload.TokensIn, payload.TokensOut)
+	}
+
+	// Second sample: cumulative should grow.
+	if err := cs.RecordCost(ctx, runID, jobID, core.CostSample{
+		Provider: "anthropic", Model: "claude", USD: 0.001,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	events2, _ := es.ListEvents(ctx, runID)
+	var lastPayload struct {
+		Cumulative float64 `json:"cumulative_usd"`
+	}
+	for i := len(events2) - 1; i >= 0; i-- {
+		if events2[i].Kind == core.EventCostDelta {
+			_ = json.Unmarshal([]byte(events2[i].Payload), &lastPayload)
+			break
+		}
+	}
+	if lastPayload.Cumulative != 0.0052 {
+		t.Errorf("second cumulative = %v, want 0.0052", lastPayload.Cumulative)
 	}
 }

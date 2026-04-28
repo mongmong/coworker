@@ -22,15 +22,42 @@ func NewCostEventStore(db *DB, event *EventStore) *CostEventStore {
 }
 
 // RecordCost writes a cost.delta event and the projection row in the same transaction.
+//
+// The event payload includes the per-sample fields (provider, model, tokens,
+// USD) plus `cumulative_usd` (the run's total cost AFTER this sample is
+// applied) and `budget_usd` (the run's configured budget, 0 when unset).
+// TUI and other live consumers read those derived fields directly from the
+// event payload without re-querying the runs row. Plan 130 (I11).
 func (s *CostEventStore) RecordCost(ctx context.Context, runID, jobID string, sample core.CostSample) error {
+	// Pre-read the run's current cost + budget so the event payload can
+	// surface cumulative + budget to live consumers (e.g., TUI). The
+	// transaction below bumps runs.cost_usd; cumulative = pre + sample.USD.
+	var preCost float64
+	var budgetUSD sql.NullFloat64
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT cost_usd, budget_usd FROM runs WHERE id = ?`, runID,
+	).Scan(&preCost, &budgetUSD); err != nil {
+		// Non-fatal: missing run row is a real error, but we still want
+		// the cost write itself to surface it via the FK below. Treat
+		// the read as best-effort.
+		preCost = 0
+	}
+	cumulative := preCost + sample.USD
+	budget := 0.0
+	if budgetUSD.Valid {
+		budget = budgetUSD.Float64
+	}
+
 	payload, err := json.Marshal(map[string]any{
-		"run_id":     runID,
-		"job_id":     jobID,
-		"provider":   sample.Provider,
-		"model":      sample.Model,
-		"tokens_in":  sample.TokensIn,
-		"tokens_out": sample.TokensOut,
-		"usd":        sample.USD,
+		"run_id":         runID,
+		"job_id":         jobID,
+		"provider":       sample.Provider,
+		"model":          sample.Model,
+		"tokens_in":      sample.TokensIn,
+		"tokens_out":     sample.TokensOut,
+		"usd":            sample.USD,
+		"cumulative_usd": cumulative,
+		"budget_usd":     budget,
 	})
 	if err != nil {
 		return fmt.Errorf("marshal cost.delta: %w", err)
