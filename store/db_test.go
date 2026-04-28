@@ -1,6 +1,8 @@
 package store
 
 import (
+	"context"
+	"database/sql"
 	"testing"
 )
 
@@ -77,6 +79,53 @@ func TestOpen_ForeignKeysEnabled(t *testing.T) {
 	}
 	if fkEnabled != 1 {
 		t.Errorf("foreign_keys = %d, want 1", fkEnabled)
+	}
+}
+
+// TestOpen_PerConnectionPragmas verifies that foreign_keys and
+// busy_timeout are set on EVERY pooled connection, not just the first
+// one used at Open. Plan 139 (Codex CRITICAL #5) — without DSN-encoded
+// PRAGMAs, fresh pooled connections silently lost FK enforcement.
+//
+// We force the pool to acquire two distinct connections by holding the
+// first conn open while we ask for a second.
+func TestOpen_PerConnectionPragmas(t *testing.T) {
+	tmp := t.TempDir()
+	db, err := Open(tmp + "/state.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	// Allow up to 4 connections so we can get a fresh one.
+	db.SetMaxOpenConns(4)
+
+	ctx := context.Background()
+	conn1, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("Conn1: %v", err)
+	}
+	defer conn1.Close()
+
+	conn2, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("Conn2: %v", err)
+	}
+	defer conn2.Close()
+
+	for i, conn := range []*sql.Conn{conn1, conn2} {
+		var fk, busy int
+		if err := conn.QueryRowContext(ctx, "PRAGMA foreign_keys").Scan(&fk); err != nil {
+			t.Fatalf("conn%d foreign_keys: %v", i+1, err)
+		}
+		if fk != 1 {
+			t.Errorf("conn%d foreign_keys = %d, want 1 (PRAGMA must apply per-connection)", i+1, fk)
+		}
+		if err := conn.QueryRowContext(ctx, "PRAGMA busy_timeout").Scan(&busy); err != nil {
+			t.Fatalf("conn%d busy_timeout: %v", i+1, err)
+		}
+		if busy != 5000 {
+			t.Errorf("conn%d busy_timeout = %d, want 5000ms", i+1, busy)
+		}
 	}
 }
 

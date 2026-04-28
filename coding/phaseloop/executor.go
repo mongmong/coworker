@@ -220,6 +220,7 @@ func (e *PhaseExecutor) runLoop(
 		}
 		devResult, err := e.Dispatcher.Orchestrate(ctx, &coding.DispatchInput{
 			RoleName: devRole,
+			RunID:    runID, // Plan 139: attach to workflow run
 			Inputs:   devInputs,
 		})
 		if err != nil {
@@ -391,6 +392,7 @@ func (e *PhaseExecutor) fanOut(
 			log.Info("dispatching reviewer/tester", "role", roleName)
 			result, err := e.Dispatcher.Orchestrate(gCtx, &coding.DispatchInput{
 				RoleName: roleName,
+				RunID:    runID, // Plan 139: attach to workflow run
 				Inputs:   copyInputs(inputs),
 			})
 			if err != nil {
