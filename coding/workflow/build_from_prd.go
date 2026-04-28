@@ -229,6 +229,11 @@ func (w *BuildFromPRDWorkflow) RunPhasesForPlan(
 	// when no registry is set or when the registry returns nil (stage not
 	// registered).
 	if w.StageRegistry != nil {
+		// phase-dev: first entry wins; multi-developer per phase is out of
+		// scope. Empty → use PhaseExecutor's default ("developer"). Plan 131.
+		if devRoles := w.StageRegistry.RolesForStage("phase-dev"); len(devRoles) > 0 {
+			w.PhaseExecutor.DeveloperRole = devRoles[0]
+		}
 		if roles := w.StageRegistry.RolesForStage("phase-review"); roles != nil {
 			w.PhaseExecutor.ReviewerRoles = roles
 		}
@@ -237,6 +242,9 @@ func (w *BuildFromPRDWorkflow) RunPhasesForPlan(
 		// (no override; default applies) and an empty non-nil slice when
 		// registered with no roles (disabled).
 		w.PhaseExecutor.TesterRoles = w.StageRegistry.RolesForStage("phase-test")
+		// phase-ship is structurally different: Shipper does git+gh, not
+		// role dispatch. Customizing the ship stage is deferred until
+		// Shipper itself supports a role-based shape.
 	}
 
 	// Propagate WorkDir to PhaseExecutor for applies_when evaluation.

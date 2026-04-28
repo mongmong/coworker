@@ -21,10 +21,23 @@ type Role struct {
 // When present, the phase loop evaluates the condition before dispatching.
 // If the condition evaluates to false, the role is skipped and a
 // job.skipped event is emitted instead.
+//
+// Multiple predicates AND together: every non-empty predicate must hold for
+// the role to fire. Empty (nil/zero) predicates are ignored.
 type RoleAppliesWhen struct {
 	// ChangesTouch is a list of glob patterns. The role fires only if the
 	// current git diff touches at least one file matching any pattern.
 	ChangesTouch []string `yaml:"changes_touch,omitempty"`
+
+	// CommitMsgContains is a regex pattern. The role fires only if the
+	// most recent commit message in WorkDir matches the pattern. Plan 131.
+	CommitMsgContains string `yaml:"commit_msg_contains,omitempty"`
+
+	// PhaseIndexIn is a phase-index range expression: a single integer
+	// ("3"), a closed range ("0-3"), or a comma-separated list of either
+	// ("0-3,7,9-11"). The role fires only if the current phase index is
+	// in the set. Plan 131.
+	PhaseIndexIn string `yaml:"phase_index_in,omitempty"`
 }
 
 // RoleInputs declares the required and optional inputs for a role.
