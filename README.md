@@ -1,34 +1,52 @@
 # coworker
 
-`coworker` is a local-first runtime for coordinating CLI coding agents as typed workers.
+`coworker` is a local-first runtime for coordinating CLI coding agents (Claude Code, Codex, OpenCode) as role-typed workers. It is driven either by a PRD (autopilot) or by direct user interaction, with strict workflow enforcement through a supervisor role.
 
-Today, the implemented path is a **thin end-to-end ephemeral invoke flow**:
+Design spec: [`docs/specs/000-coworker-runtime-design.md`](docs/specs/000-coworker-runtime-design.md). Architecture decisions: [`docs/architecture/decisions.md`](docs/architecture/decisions.md). Latest comprehensive audit: [`docs/reviews/2026-04-27-comprehensive-audit.md`](docs/reviews/2026-04-27-comprehensive-audit.md).
 
-1. load a role from YAML
-2. render a prompt template
-3. invoke a CLI agent
-4. parse stream-JSON findings
-5. persist runs, jobs, findings, and events to SQLite
+The best way to try it is the tutorial in [docs/tutorial.md](docs/tutorial.md).
 
-The best way to try it is the tutorial in [docs/tutorial.md](/home/chris/workshop/coworker/docs/tutorial.md).
+## What works today (V1)
 
-## Current Status
+**Runtime + persistence**
+- SQLite event log + projection tables (`runs`, `jobs`, `plans`, `checkpoints`, `findings`, `artifacts`, `dispatches`, `workers`, `attention`, `supervisor_events`, `cost_events`).
+- Event-log-before-state writes (`EventStore.WriteEventThenRow`).
+- Findings immutability (SQL trigger).
+- Pure-Go SQLite (`modernc.org/sqlite`) — single static binary, no cgo.
 
-What works today:
+**Agents**
+- `agent.CliAgent` — shells out to a CLI binary, parses stream-json.
+- `agent.OpenCodeHTTPAgent` — REST + SSE against an OpenCode server.
+- `agent.ReplayAgent` — replays recorded transcripts in tests.
 
-- `coworker invoke <role>`
-- bundled role loading from `coding/roles/`
-- bundled prompt loading from `coding/prompts/`
-- SQLite persistence in `.coworker/state.db`
-- event-log-before-state persistence for runs, jobs, and findings
+**Dispatch + workflow**
+- `coding.Dispatcher` with role loading, prompt rendering, supervisor evaluation, retry-with-feedback, cost capture (Claude USD direct, Codex tokens-only).
+- `phaseloop.PhaseExecutor` developer → reviewer/tester fan-out → dedupe → fix-loop with `applies_when` filtering (changes_touch / commit_msg_contains / phase_index_in).
+- `workflow.BuildFromPRDWorkflow` for the autopilot path; `shipper.Shipper` opens the PR.
+- `stages.StageRegistry` for `policy.workflow_overrides` (phase-dev / phase-review / phase-test).
 
-What is not built yet:
+**MCP server** — full `orch_*` tool surface: `next_dispatch`, `job_complete`, `attention_*`, `checkpoint_*`, `findings_list`, `artifact_*`, `register`/`heartbeat`/`deregister`, `run_status`/`run_inspect`/`role_invoke`.
 
-- multi-agent scheduling
-- persistent worker registry / leasing
-- TUI control plane
-- bulletin-board routing
-- integrated OpenCode HTTP runtime
+**HTTP/SSE server** — read-only events stream + run/job/attention REST. Binds 127.0.0.1 by default.
+
+**CLI commands** — `daemon`, `run <prd.md>`, `session`, `init`, `invoke <role>`, `record-human-edit`, `watch`, `dashboard`, `status`, `logs <job-id> [--follow]`, `inspect <job-id>`, `advance`, `rollback <id>`, `edit <path>`, `version`, `plugin install`, `config inspect`.
+
+**Plugins** — `plugins/coworker-{claude,codex,opencode}/` with skills, commands, and settings for each CLI.
+
+**Test layers** — unit (next to source), integration with mocks (`tests/integration/`), replay (`tests/replay/<scenario>/`, gated by `COWORKER_REPLAY=1`), live E2E (`tests/live/`, gated by build tag `live` + `COWORKER_LIVE=1`).
+
+**Build & dist** — `make release` cross-compiles linux/amd64, linux/arm64, darwin/amd64, darwin/arm64.
+
+## Deferred to V1.1+
+
+- Codex USD pricing (per-model price table).
+- OpenCode cost capture (no token data in the SSE stream).
+- Runtime budget enforcement (`runs.budget_usd` is recorded but not enforced).
+- TUI attention auto-refresh (events not yet emitted; HTTP polling works).
+- `redo` CLI command (use `invoke <role>` with explicit inputs).
+- HTTP endpoint authentication (loopback default; LAN exposure requires `--http-bind 0.0.0.0`).
+- Phase-loop replay scenarios in `tests/replay/` (single-role scenarios are shipped).
+- Filesystem watch on `coworker edit` (manual `record-human-edit` works).
 
 ## Prerequisites
 
