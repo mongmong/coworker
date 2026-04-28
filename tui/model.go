@@ -66,13 +66,17 @@ type attentionRow struct {
 	options  []string
 }
 
-// CostPayload is the JSON payload of a cost.delta event.
+// CostPayload is the JSON payload of a cost.delta event. Field names match
+// the producer at store.CostEventStore.RecordCost. Plan 130 (I11) reconciled
+// the previously-divergent field names.
 type CostPayload struct {
 	RunID      string  `json:"run_id"`
 	JobID      string  `json:"job_id"`
-	InputTok   int     `json:"input_tok"`
-	OutputTok  int     `json:"output_tok"`
-	CostUSD    float64 `json:"cost_usd"`
+	Provider   string  `json:"provider"`
+	Model      string  `json:"model"`
+	TokensIn   int     `json:"tokens_in"`
+	TokensOut  int     `json:"tokens_out"`
+	USD        float64 `json:"usd"`
 	Cumulative float64 `json:"cumulative_usd"`
 	BudgetUSD  float64 `json:"budget_usd"`
 }
